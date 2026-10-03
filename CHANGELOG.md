@@ -20,19 +20,23 @@
   to the reference arithmetic) and sparse attention (0110: 30% faster than the chunk programs); 4-bit decode tiles for
   full GLM's shapes (0111). Prefill 655 / 656 / 638 tok/s at 8k / 16k / 32k (boot p10, 2026-10-03; first boot 151 /
   140).
-- Decode: RoCE one-shot all-gathers by default (COMM=roce, +10%), the DSpark speculator by default (DRAFTER=dspark,
-  0114, MTP head off): code 39.5-40.4, prose 29.1-30.2 tok/s (boot p17, sampled, 3 runs each; MTP + NCCL: 33.0-34.5 /
-  27.6-28.1), the same replies (exact checks 12/12).
-- Context parallelism (CP=1, 0112-0113): each Spark keeps every third token's caches, exact top-k selection across
-  the Sparks, attention partials merged by log-sum-exp in rank order. Boot p19 (450k window, fp8): exact 12/12,
-  needles correct to 235,660 tokens, prefill ~250 tok/s; boot cp655 (655,360 window, fp8, eager decode): prose
-  23.8-25.1, code 29.6-30.1 tok/s.
+- Decode: RoCE one-shot all-gathers by default (COMM=roce, +10%), Red Hat AI's DSpark speculator by default
+  (DRAFTER=dspark, 0114, MTP head off; the drafter adapted from vllm-project/speculators and vLLM): code 39.5-40.4,
+  prose 29.1-30.2 tok/s (boot p17, sampled, 3 runs each; MTP + NCCL: 33.0-34.5 / 27.6-28.1), the same replies (exact
+  checks 12/12).
+- Context parallelism (CP=1, 0112-0113; the scheme after drowzeys' TensorFold fork, our own kernels): each Spark keeps
+  every third token's caches, exact top-k selection across the Sparks, attention partials merged by log-sum-exp in
+  rank order. Boot p19 (450k window, fp8): exact 12/12, needles correct to 235,660 tokens, prefill ~250 tok/s; boot
+  cp655 (655,360 window, fp8, eager decode): prose 23.8-25.1, code 29.6-30.1 tok/s.
 - 4-bit latent cache (KV=fp4, 0115): e2m1 codes, an e4m3 scale per 16 values and a power-of-two row scale, 304 bytes
   a row (fp8: 528). First quality probe against fp8 (greedy): 30 short questions 29/30 (fp8 27/30), 27/30 replies
   identical, 8-key recall 8/8 at 64k and 128k. Not the default yet: a larger evaluation is in progress.
 - Draft costs measured on text, the verify profile fixed (0116, 0119); DSpark sampling filter (0117); static scratch
   for captured CP decode windows (0118); CP windows within the top-k skip selection (0120); a RoCE timeout inside a
   replayed graph is reported (0121).
+- A stopped request (client gone, stop string) ends on every rank within a round instead of decoding to max_tokens
+  (0122, the GLM-5.3-Flash recipe's fix for its issue #38); CPU test `tests/cpu/test_stop_vote.py`.
+- `tools/quality.py`: a fixed quality suite with paired comparison; results of the 4-bit KV cache in the README.
 - Captured decode windows under CP (TF_GLM_CP_GRAPHS=1, off by default) cost ~2.9 GiB on each Spark. At 655k with fp8
   that left spark3 under the memory guard's 3 GiB during a long prompt: the guard stopped it and the other ranks
   waited (the "hang" seen with graphs on). With fp4, boot fp4g655 (KV=fp4 CP=1 TF_GLM_CP_GRAPHS=1, 655,360 window,

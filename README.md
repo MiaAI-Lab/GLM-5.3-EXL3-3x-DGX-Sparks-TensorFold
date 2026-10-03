@@ -1,8 +1,9 @@
 # GLM-5.3 EXL3 on three DGX Sparks with TensorFold
 
-Serve **GLM-5.3** (zai-org's full model: 78 layers of MLA with DeepSeek sparse attention, 256 routed experts, an MTP
-head) from three NVIDIA DGX Sparks with [TensorFold](https://github.com/ashhart/TensorFold), as an OpenAI-compatible
-API on port 8888. The checkpoint is Mia's AI Lab's EXL3 quantization,
+Serve **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)** (zai-org's full model: 78 layers of MLA with DeepSeek
+sparse attention, 256 routed experts, an MTP head) from three NVIDIA DGX Sparks with
+[TensorFold](https://github.com/ashhart/TensorFold), as an OpenAI-compatible API on port 8888. The checkpoint is
+Mia's AI Lab's EXL3 quantization,
 [`Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold`](https://huggingface.co/Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold):
 routed experts at 2.75 bits a weight on average (each expert at its own width, 2 to 4 bits), everything else BF16,
 ~273 GiB in all, ~86 GiB on each Spark.
@@ -32,9 +33,70 @@ TensorFold v0.6.0 with the patches in `patches/`, applied with `patch -p0` in fi
   - `0103-glm-full-forward`: plain pre-norm residuals, the indexer's top-k reused on "shared" layers, the MoE with
     mixed-width experts, the MTP head, CUDA graphs a token bucket, kept-prompt snapshots.
   - `0104-glm-full-engine`: the `glm_moe_dsa` family, the startup memory estimate of these caches and buffers.
+- **0105-0122**: speed, context and fixes:
+  - prefill: 2,048-row prompt chunks (0105); drowzeys' EXL3 prompt-expert kernels, deterministic mode (0106, credited
+    in `CREDITS.md`); the hyper-connection rows split between the ranks (0107); our own prompt kernels for the routed
+    experts (0108, MPE) and the sparse attention (0110, MSA); 4-bit decode tiles for full GLM's shapes (0111).
+  - decode: the MTP cost chain (0109, off by default); the RedHatAI DSpark speculator (0114, default; 0117 its
+    sampling filter); draft costs measured on text (0116, 0119).
+  - context: context parallelism, each Spark keeping every third token's caches (0112-0113, 0118, 0120); a 4-bit
+    latent cache (0115, `KV=fp4`).
+  - fixes: a RoCE timeout inside a replayed graph is reported (0121); a stopped request (client gone, stop string)
+    ends on every rank within a round (0122, the Flash recipe's fix for its issue #38).
 
-Replies are exact in TensorFold's sense: a drafted reply (MTP and prompt-lookup drafts) equals the `"draft": false`
+Replies are exact in TensorFold's sense: a drafted reply (DSpark, MTP or prompt-lookup drafts) equals the `"draft": false`
 serial reply, and sending requests together does not change any reply. One request decodes at a time; others queue.
+
+## Results
+
+Measured on three DGX Sparks (GB10) with the checkpoint
+[`Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold`](https://huggingface.co/Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold), one
+request at a time. Each figure names its boot; figures from one boot are single runs unless a range is given.
+
+### Speed
+
+| | Measured | Boot and settings |
+| --- | --- | --- |
+| Decode, code | 39.5-40.4 tok/s (3 runs) | p17: defaults (RoCE, DSpark, FP8 KV, 163,840-token window), sampled |
+| Decode, prose | 29.1-30.2 tok/s (3 runs) | p17 |
+| Decode with NCCL instead of RoCE | code 33.0-34.5, prose 27.6-28.1 tok/s | p15 vs NCCL boots: RoCE is ~+10% |
+| Prefill | 655 / 656 / 638 tok/s at 8k / 16k / 32k tokens | p10 |
+| Long-context mode, 655,360-token window (experimental) | decode code 39.9-40.1, prose 29.8-30.4 tok/s (3 runs); prefill ~220-245 tok/s | fp4g655: `KV=fp4 CP=1 TF_GLM_CP_GRAPHS=1`, `OVERHEAD_GIB=10` |
+| Same window, FP8 KV, graphs off | decode code 29.6-30.1, prose 23.8-25.1 tok/s | cp655: `CP=1`, eager decode |
+
+Decode speed depends on the text: speculative drafts land more often on predictable text. On worked arithmetic
+(thinking on) the drafter's acceptance was 87% and a request averaged ~45 tok/s, with bursts above 70.
+
+### Exactness and long context
+
+- Drafted and concurrent replies equal serial ones: 12/12 on every boot listed here (`tools/exact.py`).
+- Needle (`tools/needle.py`): correct at 9.9k, 94k and 314k tokens (fp4g655); to 235,660 tokens (p19, `CP=1`, FP8 KV,
+  450k window).
+
+### Quality of the 4-bit KV cache (`KV=fp4`)
+
+Fixed, seeded suite with checkable answers (`tools/quality.py`; greedy), boot fp4g655:
+
+| Category | Score | Notes |
+| --- | --- | --- |
+| Short questions, thinking off | 124/150 | misses are letter-level tasks (reverse a string, count letters, binary) |
+| Word problems, thinking on | 40/40 | |
+| Chained arithmetic (10 steps), thinking on | 39/40 | one slip in the last addition |
+| Ledger tracking (25 transfers), thinking on | 35/40 | the 5 misses ran past 12,288 tokens; every finished reply was right |
+| Python tasks run against hidden tests | 25/25 | |
+| Recall of 16 keys, 4 corrected later (latest value counts) | 7/7 items, 112/112 keys, 0 stale | at ~39k, ~157k and ~314k tokens |
+
+Earlier probe against FP8 KV (greedy, 30 short questions and 8-key recall, without context parallelism): FP4 29/30,
+FP8 27/30, 27/30 replies identical; recall 8/8 at 64k and 128k for both. A paired FP8-vs-FP4 run of the suite above is
+next; until then `KV=fp8` stays the default.
+
+### Memory
+
+- Captured decode windows under context parallelism cost ~2.9 GiB on each Spark. With FP8 KV at a 655k window that
+  left spark3 under the memory guard's 3 GiB during a long prompt: the guard stopped it and the other ranks waited.
+  FP4 KV frees ~3.6 GiB a Spark at that window, which is what makes fp4g655 fit.
+- fp4g655's lowest free memory on spark3 was 3.30 GiB, during a 314k-token prefill: too thin a margin for a default
+  until the prompt path's peak memory comes down (in progress).
 
 ## Requirements
 
@@ -151,5 +213,16 @@ commits are named after the patches, and checks that all of `patches/` on a fres
 ## License and credits
 
 Apache License 2.0 for this project's own work ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) has the third-party
-notices, [`CREDITS.md`](CREDITS.md) everyone this builds on. The checkpoint is under the GLM-5.3 License (Z.ai), which
-ships with it. Made by Mia's AI Lab.
+notices, [`CREDITS.md`](CREDITS.md) everyone this builds on. The checkpoint derives from Z.ai's
+[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) and is under the GLM-5.3 License, which ships with it; the DSpark
+speculator is Red Hat AI's
+([`RedHatAI/GLM-5.3-speculator.dspark`](https://huggingface.co/RedHatAI/GLM-5.3-speculator.dspark), glm-5.3
+license). Neither is part of this repository.
+
+Built on [TensorFold](https://github.com/ashhart/TensorFold) v0.6.0 (Ash Hart and the TensorFold contributors;
+Apache 2.0, MIT for code written before v0.6.0). Patch 0106 carries drowzeys' EXL3 prompt-expert kernels and the
+context parallelism of 0112-0113 follows their scheme, both from
+[drowzeys/TensorFold](https://github.com/drowzeys/TensorFold) (Apache 2.0); the DSpark drafter (0113-0114) is adapted
+from [vllm-project/speculators](https://github.com/vllm-project/speculators) and
+[vLLM](https://github.com/vllm-project/vllm) (Apache 2.0); patches 0001-0068 carry the GLM-5.3-Flash recipe's
+credits (b12x, jayleaton/glm53-tensorfold-spark and others). Made by Mia's AI Lab.

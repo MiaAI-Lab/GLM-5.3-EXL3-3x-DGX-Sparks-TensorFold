@@ -13,10 +13,12 @@ TensorFold
   MIT notice (below). TensorFold's NOTICE reads: "TensorFold / Copyright 2026 TensorFold contributors /
   https://github.com/ashhart/TensorFold".
   The files in patches/ modify TensorFold v0.6.0 source; scripts/prepare.sh applies them to TensorFold's installed
-  package when it builds the image (patches 0001-0068 are the GLM-5.3-Flash recipe's v1.4 patches, by the same lab). The changes in patches/ are this project's work under Apache-2.0 (except the
-  parts credited below); the TensorFold code they modify, and quote as diff context, stays under TensorFold's
-  licenses: Apache-2.0, and for code written before 0.6.0 also its MIT notice (TensorFold's LICENSES/MIT.txt), so keep
-  TensorFold's NOTICE and this copyright and permission notice with any copy of a patched tree:
+  package when it builds the image (patches 0001-0068 are the GLM-5.3-Flash recipe's v1.4 patches, by the same lab:
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold). The changes in patches/ are this
+  project's work under Apache-2.0 (except the parts credited below); the TensorFold code they modify, and quote as
+  diff context, stays under TensorFold's licenses: Apache-2.0, and for code written before 0.6.0 also its MIT notice
+  (TensorFold's LICENSES/MIT.txt), so keep TensorFold's NOTICE and this copyright and permission notice with any copy
+  of a patched tree:
 
     Copyright (c) 2026 TensorFold contributors
 
@@ -101,35 +103,42 @@ drowzeys/TensorFold (a TensorFold fork)
   https://github.com/drowzeys/TensorFold (branch glm-moe-dsa-tp4, commit befd47d)
   By drowzeys. Apache License, Version 2.0.
   patches/0106-glm-full-prompt-experts.patch: tensorfold/cuda/exl3/prompt_experts.cu, prompt_experts.cpp and
-  prompt_experts.py are that fork's files, modified: a pairs mode (the down kernel stores each routed pair's
+  prompt_experts.py are that fork's files (by drowzeys; their design adapted, as their header says, from the
+  GLM-5.3-Flash recipe's prompt kernels), modified: a pairs mode (the down kernel stores each routed pair's
   unweighted output row into a [pairs, D] buffer, without zeroing or atomics; the caller adds the slots in slot
   order), the extension renamed, the trellis row stride taken from the expert width (TensorFold v0.6.0 has no
-  gu_stride). Their headers say what changed.
+  gu_stride), an fp16 buffer that may be lent (PromptScratch's xd). The headers of prompt_experts.cu and
+  prompt_experts.py say what changed.
 
 vllm-project/speculators and vLLM
   https://github.com/vllm-project/speculators (commit 36a19ca), https://github.com/vllm-project/vllm (commit 5f30fc7)
   Copyright the vLLM project contributors. Apache License, Version 2.0.
-  patches/0114-glm-full-dspark.patch: tensorfold/families/glm5_next/cuda/dspark.py adapts the DSpark drafter's
-  forward (taps -> fc -> hidden_norm, the block of anchor and mask tokens, the Markov bias W2 W1[prev], the confidence
-  head) from speculators' src/speculators/models/dspark and dflash, and vLLM's qwen3_dspark.py and
-  v1/worker/gpu/spec_decode/dspark; rewritten on TensorFold's DFlash2 kernels, split over the ranks.
+  patches/0113-glm-full-context-parallel.patch adds tensorfold/families/glm5_next/cuda/dspark.py (0114 wires it in,
+  0117 adds its sampling filter); it adapts the DSpark drafter's forward (taps -> fc -> hidden_norm, the block of
+  anchor and mask tokens, the Markov bias W2 W1[prev], the confidence head) from speculators'
+  src/speculators/models/dspark and dflash, and vLLM's qwen3_dspark.py and v1/worker/gpu/spec_decode/dspark; rewritten
+  on TensorFold's DFlash2 kernels, split over the ranks. Its header lists the files and functions.
 
 drowzeys/TensorFold (context parallelism)
-  patches/0113-glm-full-context-parallel.patch (tensorfold/families/glm5_next/cuda/dcp.py, forward.dsa_full_cp):
-  the scheme of that fork's glm_moe_dsa/cuda/fused.py (select, _attn_dcp, _merge_lse, _dcp_combine); the code is ours.
+  https://github.com/drowzeys/TensorFold (branch glm-moe-dsa-tp4, commit befd47d), by drowzeys, Apache-2.0.
+  patches/0112-glm-full-cp-caches.patch and patches/0113-glm-full-context-parallel.patch
+  (tensorfold/families/glm5_next/cuda/dcp.py, forward.dsa_full_cp): the scheme of that fork's
+  glm_moe_dsa/cuda/fused.py (select, _attn_dcp, _merge_lse, _dcp_combine); no code is taken from it, the code is ours.
 
 The DSpark speculator (downloaded by scripts/prepare.sh with DRAFTER=dspark; not included in this repository)
-  RedHatAI/GLM-5.3-speculator.dspark, by Red Hat AI, under the GLM-5.3 license (as the model it drafts for).
+  RedHatAI/GLM-5.3-speculator.dspark (https://huggingface.co/RedHatAI/GLM-5.3-speculator.dspark), by Red Hat AI,
+  under the glm-5.3 license its model card names (the model it drafts for).
 
-Contributions to this project (Apache-2.0, through its issues and pull requests)
-  patches/0054-glm-image-prompt-reuse.patch: by abhicnv007 (issue #11), with two review changes by MiaAI-Lab.
-  patches/0057-server-thinking-alias.patch: from Alexbob0's pull request #25, extended by MiaAI-Lab.
+Contributions to the GLM-5.3-Flash recipe (Apache-2.0, through its issues and pull requests)
+  patches/0054-glm-image-prompt-reuse.patch: by abhicnv007 (issue #11), with two review changes by Mia's AI Lab.
+  patches/0057-server-thinking-alias.patch: from Alexbob0's pull request #25, extended by Mia's AI Lab.
   patches/0060-glm-keep-thinking.patch: by kky42 (pull request #23).
 
 Model files (downloaded from Hugging Face by scripts/prepare.sh; not included in this repository or its image)
-  The checkpoint, Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold, derives from zai-org's GLM-5.3, licensed by Z.AI under
-  the GLM-5.3 License (its LICENSE file ships with the checkpoint; it requires keeping Z.AI's copyright and permission
-  notice, and sets conditions for large "Model as a Service" operators: read it before use).
+  The checkpoint, Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold, derives from zai-org's GLM-5.3
+  (https://huggingface.co/zai-org/GLM-5.3), licensed by Z.AI under the GLM-5.3 License (its LICENSE file ships with
+  the checkpoint; it requires keeping Z.AI's copyright and permission notice, and sets conditions for large "Model as
+  a Service" operators: read it before use).
 
 Third-party software in the image
   The image scripts/prepare.sh builds is based on the GLM-5.3-Flash recipe's published image, itself on NVIDIA's
