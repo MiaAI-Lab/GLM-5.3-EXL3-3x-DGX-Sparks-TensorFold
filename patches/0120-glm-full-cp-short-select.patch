@@ -1,0 +1,58 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index b32fd52..9e2ef78 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -813,8 +813,9 @@ class GlmEngine:
+ 
+             w.meta["cp"] = self.cp
+             w.meta["cp_heads"] = max(split_sizes(int(cfg.heads), world, 1))
+-            if os.environ.get("TF_GLM_CP_GRAPHS", "1") == "0":
+-                graphs = False                       # TF_GLM_CP_GRAPHS=0: eager decode windows
++            # TF_GLM_CP_GRAPHS=1: captured decode windows (off by default: a long-context window hung, being debugged)
++            if os.environ.get("TF_GLM_CP_GRAPHS", "0") == "0":
++                graphs = False
+             if rank == 0:
+                 print(f"[tensorfold] context parallelism: each of the {world} ranks keeps every {world}th token's "
+                       f"caches; {'captured' if graphs else 'eager'} decode windows, no kept prompt states",
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 904d0bd..9052f4e 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -906,6 +906,15 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+         with prof.timed("dsa: indexer update"):
+             mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
+             dsa_full.index_write(b.ikr[:R, :c.index_dim], ix.ln_w, ix.ln_b, keys, pos_dev, freq, cp=G, rank=rank)
++    # every row sees at most the top-k tokens (a window within the dense limit): the selection keeps them all,
++    # ascending, so a rank's list is all its visible local slots (what select_merge gives): no scores, candidates
++    # or gather. Index keys are still written for later sparse rows.
++    within = ((host_pos + R <= c.index_topk) if host_pos is not None else sparse_np is None) and \
++        c.dense_limit <= c.index_topk
++    if ix is not None and keys is not None and within:
++        with prof.timed("dsa: select tokens"):
++            b.topk = cp_all_visible(w, b, R, pos_dev, G, rank, c.index_topk)
++    elif ix is not None and keys is not None:
+         with prof.timed("dsa: select tokens"):
+             mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+             dsa_full.index_q_rope(b.qi[:R], c.index_heads, pos_dev, freq)
+@@ -995,6 +1004,21 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+ CP_PROMPT_ROWS = 512       # context parallelism: a prompt chunk's rows a query gather / partials exchange takes
+ 
+ 
++def cp_all_visible(w: Weights, b: Buffers, R: int, pos_dev: torch.Tensor, G: int, rank: int, k: int):
++    """Context parallelism's lists for rows that see at most k tokens: every visible local slot of the rank,
++    ascending (slot t holds position t G + rank, visible to row r at pos + r when t G + rank <= pos + r), and their
++    counts; on the device (captured windows read pos_dev)."""
++
++    sc = getattr(b, "cp_all", None)
++    if sc is None or sc[0].shape[0] < b.rows:
++        ar = torch.arange(k, dtype=torch.int32, device=pos_dev.device)
++        sc = b.cp_all = (ar.expand(b.rows, k).contiguous(), torch.arange(b.rows, dtype=torch.int32,
++                                                                          device=pos_dev.device))
++    slots, rows = sc
++    counts = torch.clamp((pos_dev.to(torch.int32) + rows[:R] + (G - rank)) // G, min=0).to(torch.int32)
++    return slots[:R], counts
++
++
+ class CpScratch:
+     """Context parallelism's per-window buffers for a decode buffer's rows (allocated once, before any capture, so
+     captured windows reuse them instead of each graph keeping its own): candidates, the gathered candidates, local

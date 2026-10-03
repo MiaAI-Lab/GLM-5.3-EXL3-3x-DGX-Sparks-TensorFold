@@ -1,0 +1,8 @@
+# Copy to scripts/local.sh (not in git) and fill in this setup's values; scripts/config.sh reads it first.
+WORKER=user@192.0.2.2          # ssh target of rank 1 (key-based: ssh-copy-id user@192.0.2.2)
+WORKER2=user@192.0.2.3         # ssh target of rank 2
+# FABRIC_PEER=192.0.2.12       # a worker's CX7 address, when WORKER is reached over another network (FABRIC_PEER2)
+# NFS_PATH=/                   # the head's export as the workers mount it: / for an NFSv4 fsid=0 root that is the
+#                              # Hugging Face cache (default: HF_CACHE itself)
+# NFS_SERVER=192.0.2.21        # the head's address the workers mount from (default: its address on each one's cable)
+# MODEL_ID=... MODEL_REVISION=...   # another checkpoint, or a pinned revision

@@ -1,0 +1,76 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 6302462..b32fd52 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -320,6 +320,27 @@ def mtp_round_costs(costs: dict, most: int) -> tuple[float, ...]:
+ CALIBRATION = os.environ.get("TF_GLM_CALIBRATION", "raw").strip()
+ 
+ 
++CALIBRATION_TEXT = (
++    "The engine measures how long a verify window takes for each number of rows. It feeds an ordinary passage, so "
++    "the experts each row picks overlap the way real text does.\n\n```python\ndef merge(a, b):\n    out = []\n"
++    "    i = j = 0\n    while i < len(a) and j < len(b):\n        if a[i] <= b[j]:\n            out.append(a[i]); i += 1\n"
++    "        else:\n            out.append(b[j]); j += 1\n    return out + a[i:] + b[j:]\n```\n\nRivers carry silt "
++    "to the sea, where it settles into deltas that shift with every flood and every dry season.")
++
++
++def calibration_tokens(model_dir) -> list[int] | None:
++    """CALIBRATION_TEXT through the checkpoint's tokenizer (the same ids on every rank), or None."""
++
++    if model_dir is None:
++        return None
++    try:
++        from tokenizers import Tokenizer
++
++        return Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json")).encode(CALIBRATION_TEXT).ids
++    except Exception:                                    # noqa: BLE001  no tokenizer: random tokens as before
++        return None
++
++
+ def round_costs(costs: dict) -> tuple[float, ...]:
+     """ms of a DFlash2 round of k drafts, k = 0 .. len(verify) - 1: the verify window of k + 1 rows, the block and a
+     kept row's context update, as draft_sim's Costs(verify, block, 0.0, taps_row).round_ms(k, 1, True)."""
+@@ -855,6 +876,7 @@ class GlmEngine:
+         if self.drafter is not None:
+             if graphs:
+                 self.drafter.capture()
++        self.model_dir = Path(model_dir)
+         self.costs = self._calibrate()
+         if rank == 0:
+             c = self.costs
+@@ -915,11 +937,17 @@ class GlmEngine:
+         e, st = self.e, self.e.st
+         rng = np.random.default_rng(0)
+         vocab = self.w.cfg.vocab
++        # the context and every timed window from one fixed text (each window a prefix of the same continuation):
++        # random tokens route every row to different experts, overstating a window's expert union and so its cost
++        text = calibration_tokens(getattr(self, "model_dir", None))
+ 
+         def tokens(n: int) -> list[int]:
++            if text is not None and 64 + n <= len(text):
++                return list(text[64:64 + n])
+             return [int(t) for t in rng.integers(0, vocab, n)]
+ 
+-        prefill(e, tokens(64), None, mtp=True, drafter=self.drafter)
++        prefill(e, list(text[:64]) if text is not None and len(text) >= 64 + 16 else
++                [int(t) for t in rng.integers(0, vocab, 64)], None, mtp=True, drafter=self.drafter)
+         hidden = e.pbuf.fnormed[:8].clone()                 # rows for timing the draft steps
+         one, six = tokens(1), tokens(6)
+         start = st.mtp_len
+@@ -971,6 +999,8 @@ class GlmEngine:
+             from . import prof
+             from .forward import chunks_for, compute, stage
+ 
++            enabled = prof.ENABLED
++            prof.ENABLED = True                          # both switches: timed sections need ENABLED and active
+             for r in (1, 2, 3, 4, 8):
+                 w_ = tokens(r)
+                 for rep in range(3):
+@@ -980,6 +1010,7 @@ class GlmEngine:
+                     compute(e.w, e.st, e.buf, R, nch=chunks_for(e.st, R), host_pos=e.st.pos)
+                     prof.active = False
+                     rewind()
++                prof.ENABLED = enabled if r == 8 else True
+                 if self.rank == 0:
+                     top = sorted(prof.totals.items(), key=lambda kv: -kv[1])[:12]
+                     print(f"[tensorfold] verify profile, {r} rows: " +

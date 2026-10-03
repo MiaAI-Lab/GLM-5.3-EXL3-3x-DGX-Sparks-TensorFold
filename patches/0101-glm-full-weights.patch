@@ -1,0 +1,313 @@
+diff --git tensorfold/families/glm5_next/cuda/weights.py tensorfold/families/glm5_next/cuda/weights.py
+index b768c7d..04e21d6 100644
+--- tensorfold/families/glm5_next/cuda/weights.py
++++ tensorfold/families/glm5_next/cuda/weights.py
+@@ -56,6 +56,14 @@ class Config:
+     group_size: int
+     bits: int
+     quant: str = "mlx"         # "mlx" (affine 4-bit everywhere) or "exl3" (EXL3 routed experts, BF16 elsewhere)
++    # full GLM-5.3 (model_type glm_moe_dsa): MLA + DSA on every layer, plain residuals (no hyper-connections, no KDA),
++    # RoPE on 64 of the 256 query/key dims, the indexer on "full" layers only (``index_kinds``; "shared" layers reuse
++    # the previous full layer's top-k), per-token index keys (no pooling: kpool 1), EXL3 experts of mixed widths
++    full: bool = False
++    rope: int = 0              # qk_rope_head_dim: the MLA's rotary dims (last of a query head; the indexer's first)
++    rope_theta: float = 0.0
++    index_kinds: tuple = ()    # per layer "full" (runs the indexer) or "shared" (the last full layer's top-k)
++    prefix: str = "model.language_model."     # the decoder's tensor names (full GLM-5.3: "model.")
+ 
+     @classmethod
+     def read(cls, model_dir: str | Path) -> "Config":
+@@ -66,6 +74,8 @@ class Config:
+         if want == "float32":
+             raise ValueError("tensorfold_activation_dtype float32 is the Mac engine; the CUDA engine stays bf16")
+         t = dict(raw.get("text_config") or raw)
++        if t.get("model_type") == "glm_moe_dsa":
++            return cls._read_full(raw, t)
+         lin = dict(t.get("linear_attn_config") or {})
+         quant = raw.get("quantization") or raw.get("quantization_config") or {}
+         eos = t.get("eos_token_id", raw.get("eos_token_id"))
+@@ -96,6 +106,53 @@ class Config:
+             bits=int(quant.get("bits", 4)), quant=str(quant.get("quant_method") or "mlx").lower(),
+         )
+ 
++    @classmethod
++    def _read_full(cls, raw: dict, t: dict) -> "Config":
++        """Full GLM-5.3's config.json (``GlmMoeDsaConfig``): every layer DSA, its indexer types as transformers derives
++        them (indexer_types, else index_topk_pattern, else index_topk_freq / index_skip_topk_offset)."""
++
++        quant = raw.get("quantization_config") or raw.get("quantization") or {}
++        n = int(t["num_hidden_layers"])
++        eos = t.get("eos_token_id")
++        eos = tuple(int(e) for e in eos) if isinstance(eos, list) else (int(eos),)
++        dense = int(t.get("first_k_dense_replace", 3))
++        mlp_kinds = list(t.get("mlp_layer_types") or ["dense"] * dense + ["sparse"] * (n - dense))
++        rope = dict(t.get("rope_parameters") or t.get("rope_scaling") or {})
++        if rope.get("rope_type", "default") not in ("default", None):
++            raise ValueError(f"full GLM-5.3: rope_type {rope.get('rope_type')!r} (the CUDA engine runs default RoPE)")
++        if int(t.get("n_group", 1)) != 1 or int(t.get("topk_group", 1)) != 1:
++            raise ValueError("full GLM-5.3: grouped routing (n_group > 1) is not supported")
++        if str(t.get("scoring_func", "sigmoid")) != "sigmoid" or not t.get("rope_interleave", True) or \
++                not t.get("indexer_rope_interleave", True):
++            raise ValueError("full GLM-5.3: sigmoid routing and interleaved RoPE (model and indexer) expected")
++        return cls(
++            hidden=int(t["hidden_size"]), layers=n, vocab=int(t["vocab_size"]), eps=float(t["rms_norm_eps"]),
++            heads=int(t["num_attention_heads"]), q_lora=int(t["q_lora_rank"]), kv_lora=int(t["kv_lora_rank"]),
++            qk_dim=int(t["qk_nope_head_dim"]) + int(t["qk_rope_head_dim"]), v_dim=int(t["v_head_dim"]),
++            lin_heads=0, lin_dim=128, conv=4, lower=-5.0,
++            experts=int(t["n_routed_experts"]), top_k=int(t["num_experts_per_tok"]),
++            moe_width=int(t["moe_intermediate_size"]),
++            shared_width=int(t["moe_intermediate_size"]) * int(t.get("n_shared_experts", 1)),
++            dense_width=int(t["intermediate_size"]), routed_scale=float(t["routed_scaling_factor"]),
++            norm_topk=bool(t.get("norm_topk_prob", True)), streams=1, hc_iters=0, hc_eps=0.0,
++            index_heads=int(t.get("index_n_heads", 32)), index_dim=int(t.get("index_head_dim", 128)),
++            index_topk=int(t.get("index_topk", 2048)), kpool=1, limit=float("inf"),
++            kinds=["dsa"] * n, mlp_kinds=["moe" if k == "sparse" else "dense" for k in mlp_kinds], eos=eos,
++            mtp_layers=int(t.get("num_nextn_predict_layers", 0)), group_size=64, bits=0,
++            quant=str(quant.get("quant_method") or "bf16").lower(), full=True, rope=int(t["qk_rope_head_dim"]),
++            rope_theta=float(rope.get("rope_theta", t.get("rope_theta", 10000.0))),
++            index_kinds=tuple(index_kinds(t, n)), prefix="model.",
++        )
++
++    @property
++    def nope(self) -> int:
++        """qk_nope_head_dim: a query head's dims before its rotary ones (a kv_b head's key rows)."""
++        return self.qk_dim - self.rope
++
++    @property
++    def lin_layers(self) -> int:
++        return sum(1 for k in self.kinds if k == "kda")
++
+     @property
+     def dense_limit(self) -> int:
+         """Largest context (tokens) where DSA's top-k selection keeps every visible key (dense attention)."""
+@@ -103,6 +160,24 @@ class Config:
+         return self.index_topk + self.kpool - 1
+ 
+ 
++def index_kinds(t: dict, layers: int) -> list[str]:
++    """Each layer's indexer type ("full" or "shared") as transformers' GlmMoeDsaConfig derives it."""
++
++    kinds = t.get("indexer_types")
++    if kinds is None:
++        pattern = t.get("index_topk_pattern")
++        if pattern is not None:
++            kinds = [{"F": "full", "S": "shared"}[c] for c in pattern] if isinstance(pattern, str) else list(pattern)
++        else:
++            freq = max(int(t.get("index_topk_freq", 1) or 1), 1)
++            offset = int(t.get("index_skip_topk_offset", 2))
++            kinds = ["full" if max(i - offset + 1, 0) % freq == 0 else "shared" for i in range(layers)]
++    kinds = [str(k) for k in kinds]
++    if len(kinds) != layers or any(k not in ("full", "shared") for k in kinds) or (kinds and kinds[0] != "full"):
++        raise ValueError(f"indexer types: {layers} of full / shared starting with full, not {kinds}")
++    return kinds
++
++
+ @dataclass
+ class HCW:
+     fn: torch.Tensor          # [24, S*D] bf16
+@@ -143,8 +218,8 @@ class IndexW:
+     qb: Q4
+     ln_w: torch.Tensor
+     ln_b: torch.Tensor
+-    gate: torch.Tensor
+-    ape: torch.Tensor
++    gate: torch.Tensor | None = None      # GLM-5.3-Flash's pooling gates and position bias (full GLM-5.3: none)
++    ape: torch.Tensor | None = None
+ 
+ 
+ @dataclass
+@@ -235,7 +310,8 @@ class Weights:
+                 seen.add(t.data_ptr())
+                 total += t.numel() * t.element_size()
+             elif isinstance(t, (Q4, B16, F8, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW,
+-                                IndexW, latent.AbsorbW, latent.AbsorbQ4, latent.AbsorbF8)):
++                                IndexW, latent.AbsorbW, latent.AbsorbQ4, latent.AbsorbF8)) or \
++                    type(t).__name__ == "Exl3RoutedExperts":
+                 for v in vars(t).values():
+                     add(v)
+             elif isinstance(t, (list, tuple)):
+@@ -262,6 +338,8 @@ def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cud
+     from .tp import Layout
+ 
+     cfg = Config.read(model_dir)
++    if cfg.full:
++        return load_full(model_dir, cfg, rank=rank, world=world, device=device, mtp=mtp)
+     lay = Layout.from_config(cfg, rank, world)
+     if cfg.quant not in ("mlx", "exl3"):
+         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
+@@ -462,3 +540,175 @@ def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cud
+         rd.close()
+     torch.cuda.empty_cache()
+     return w
++
++
++def expert_tensor_names(prefix: str, layer: int, experts: int) -> list[str]:
++    """A full GLM-5.3 layer's routed expert tensors in the order ``load_full`` reads them."""
++
++    p = prefix + f"layers.{layer}.mlp."
++    return [p + f"experts.{e}.{proj}.{x}" for proj in ("gate_proj", "up_proj", "down_proj") for e in range(experts)
++            for x in ("trellis", "suh", "svh")]
++
++
++def pack_experts(parts: dict, experts: int, dev, codebook: str = "mcg"):
++    """A layer's routed experts from {(proj, e): (trellis, suh, svh)} CPU tensors (this rank's slices, each at its own
++    width): every trellis copied into one int16 buffer on the device (one allocation a layer instead of 768), the
++    universal kernels' pointer tables over its slices (``tensorfold.cuda.exl3.experts.prepare``)."""
++
++    from tensorfold.cuda.exl3 import experts as generic
++
++    order = [(proj, e) for proj in ("gate_proj", "up_proj", "down_proj") for e in range(experts)]
++    sizes = [parts[k][0].numel() for k in order]
++    buf = torch.empty((sum(sizes),), dtype=torch.int16, device=dev)
++    views, at = {}, 0
++    for k, n in zip(order, sizes):
++        t = parts[k][0]
++        if t.dtype != torch.int16:
++            t = t.view(torch.int16)
++        v = buf[at:at + n].view(t.shape)
++        v.copy_(t, non_blocking=False)
++        views[k] = v
++        at += n
++
++    def triples(proj):
++        return [(views[(proj, e)], parts[(proj, e)][1].to(dev), parts[(proj, e)][2].to(dev)) for e in range(experts)]
++
++    ex = generic.prepare(triples("gate_proj"), triples("up_proj"), triples("down_proj"), codebook, device=dev)
++    ex.keep[:] = [buf]                    # the views' storage (the pointer tables point into it)
++    if ex.suh_g.shape == ex.suh_u.shape and torch.equal(ex.suh_g, ex.suh_u):
++        ex.suh_u = ex.suh_g               # gate and up share their input rotation (the checkpoint's are identical)
++    return ex
++
++
++def load_full(model_dir: str | Path, cfg: Config, *, rank: int, world: int, device: str = "cuda",
++              mtp: bool = True) -> Weights:
++    """Rank ``rank`` of ``world`` of full GLM-5.3 (``glm_moe_dsa``): EXL3 routed experts of mixed widths (the universal
++    grouped kernels), BF16 elsewhere as TF_GLM_DENSE holds it; heads, expert blocks (rotated by layer), the dense
++    MLP's and shared expert's widths and the head's rows split by ``tp.Layout``; the indexer on full layers only."""
++
++    from .split import RankReader
++    from .tp import Layout
++
++    lay = Layout.from_config(cfg, rank, world)
++    if cfg.quant != "exl3":
++        raise ValueError(f"full GLM-5.3's CUDA engine reads EXL3 checkpoints (routed experts), not {cfg.quant}")
++    if not latent.ENABLED:
++        raise ValueError("full GLM-5.3 needs the latent cache (TF_GLM_LATENT=1)")
++    dev = torch.device(device)
++    rd = RankReader(model_dir, rank, world)
++    P = cfg.prefix
++    HL = lay.heads
++    fp8 = dense_kind() in ("fp8", "q4")
++    dense, dense_stack = (make_f8, stack_f8) if fp8 else (make_b16, stack_b16)
++    if dense_kind() == "q4":
++        from .qmm import make_dense_q4, stack_dense_q4
++
++        big, big_stack = make_dense_q4, stack_dense_q4
++    else:
++        big, big_stack = dense, dense_stack
++    if kvb_kind() != "bf16":
++        raise ValueError("full GLM-5.3 holds kv_b in bf16 (TF_GLM_KVB=bf16): its key rows are padded for the "
++                         "absorb kernels")
++
++    def t(name: str, dtype: torch.dtype | None = None) -> torch.Tensor:
++        x = rd.get(P + name)
++        if dtype is not None:
++            x = x.to(dtype)
++        return x.to(dev)
++
++    def q4(name: str):
++        return big(t(name + ".weight"))
++
++    def stack(names: list[str]):
++        return big_stack([t(n + ".weight") for n in names])
++
++    nope, rope, vd = cfg.nope, cfg.rope, cfg.v_dim
++
++    def dsa(i: int, indexed: bool) -> DSAW:
++        """Layer i's attention; ``indexed``: it runs the indexer (a full layer, and the MTP layer, whose
++        index_share_for_mtp_iteration shares its top-k between the MTP head's chained steps, not with the trunk)."""
++        p = f"layers.{i}.self_attn."
++        proj = stack([p + "q_a_proj", p + "kv_a_proj_with_mqa"])
++        w = t(p + "kv_b_proj.weight").view(HL, nope + vd, cfg.kv_lora)
++        # the key rows padded to the query head's width with zero rows (the rotary dims'), so absorb_q reads the whole
++        # query head and the rotary part multiplies zeros: the same sums, exactly
++        wk = torch.zeros((HL, cfg.qk_dim, cfg.kv_lora), dtype=torch.bfloat16, device=dev)
++        wk[:, :nope].copy_(w[:, :nope])
++        absorb = latent.AbsorbW(wk, w[:, nope:].contiguous())
++        del w
++        ix = None
++        if indexed:
++            ix = IndexW(stack([p + "indexer.wk", p + "indexer.weights_proj"]), q4(p + "indexer.wq_b"),
++                        t(p + "indexer.k_norm.weight"), t(p + "indexer.k_norm.bias"))
++        return DSAW(proj, t(p + "q_a_layernorm.weight"), t(p + "kv_a_layernorm.weight"), q4(p + "q_b_proj"), None,
++                    None, q4(p + "o_proj"), HL, ix, absorb)
++
++    def mlp(p: str) -> MLPW:
++        gu = stack([p + "gate_proj", p + "up_proj"])
++        return MLPW(gu, q4(p + "down_proj"), gu.n // 2)
++
++    def names(i: int) -> list[str]:
++        if i > cfg.layers or (i == cfg.layers and not (mtp and cfg.mtp_layers)):
++            return []
++        if i < cfg.layers and cfg.mlp_kinds[i] != "moe":
++            return []
++        return expert_tensor_names(P, i, cfg.experts)
++
++    def moe(i: int) -> MoEW:
++        p = f"layers.{i}.mlp."
++        router = t(p + "gate.weight", torch.bfloat16).contiguous()
++        bias = t(p + "gate.e_score_correction_bias", torch.float32).contiguous()
++        parts = {}
++        for proj in ("gate_proj", "up_proj", "down_proj"):
++            for e in range(cfg.experts):
++                n = P + p + f"experts.{e}.{proj}."
++                parts[(proj, e)] = (rd.get(n + "trellis"), rd.get(n + "suh"), rd.get(n + "svh"))
++        ex = pack_experts(parts, cfg.experts, dev)
++        del parts
++        return MoEW(router, bias, ex, mlp(p + "shared_experts."))
++
++    events: list = []
++    gpu = dev.type == "cuda"             # CPU: the tests' tiny checkpoints
++
++    def layer(i: int, mtp_layer: bool = False) -> LayerW:
++        if gpu and len(events) >= 2:
++            events.pop(0).synchronize()
++        rd.prefetch(names(i), None)
++        rd.prefetch(names(i + 1), None)
++        lw = LayerW(i, "dsa", None, None, t(f"layers.{i}.input_layernorm.weight"),
++                    t(f"layers.{i}.post_attention_layernorm.weight"))
++        lw.dsa = dsa(i, mtp_layer or cfg.index_kinds[i] == "full")
++        if not mtp_layer and cfg.mlp_kinds[i] == "dense":
++            lw.mlp = mlp(f"layers.{i}.mlp.")
++        else:
++            lw.moe = moe(i)
++        if gpu and i % 8 == 7:
++            torch.cuda.empty_cache()
++        if gpu:
++            events.append(torch.cuda.current_stream().record_event())
++        return lw
++
++    v0, v1 = lay.vocab_offset, lay.vocab_offset + lay.vocab
++    # the embedding split by vocabulary rows as lm_head is (``forward.embed_rows``): a third of 1.77 GiB a rank
++    embed = rd.get(P + "embed_tokens.weight")[v0:v1].to(torch.bfloat16).contiguous().to(dev)
++    try:
++        built = [layer(i) for i in range(cfg.layers)]
++        raw = rd.get("lm_head.weight")[v0:v1].to(dev)
++        head = dense(raw)
++        draft_head = draft_quantize4(raw) if mtp and cfg.mtp_layers else None
++        del raw
++        mtpw = None
++        if cfg.mtp_layers and mtp:
++            i = cfg.layers
++            mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), q4(f"layers.{i}.eh_proj"),
++                        t(f"layers.{i}.shared_head.norm.weight"), layer(i, mtp_layer=True))
++        w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head, tp=lay)
++        w.meta.update(layers=list(range(cfg.layers)), embed_offset=v0)
++        from .dsa_full import inv_freq
++
++        w.meta["rope_freq"] = inv_freq(cfg.rope, cfg.rope_theta, dev)
++    finally:
++        rd.close()
++    if gpu:
++        torch.cuda.empty_cache()
++    return w

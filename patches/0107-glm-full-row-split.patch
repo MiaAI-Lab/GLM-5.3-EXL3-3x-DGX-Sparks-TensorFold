@@ -1,0 +1,155 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index eaeab1f..e51fe0d 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -498,17 +498,18 @@ class GlmEngine:
+                       "transport), larger ones over NCCL", flush=True)
+         cfg = Config.read(model_dir)
+         if cfg.full:
+-            # full GLM-5.3 (glm_moe_dsa): one request at a time with its MTP head; GLM-5.3-Flash's DFlash2 drafter,
+-            # image tower and prompt row split (its hyper-connection glue) do not apply
++            # full GLM-5.3 (glm_moe_dsa): one request at a time with its MTP head; GLM-5.3-Flash's DFlash2 drafter
++            # and image tower do not apply. The prompt row split (TF_GLM_HC_SPLIT) runs its plain-residual glue
++            # (``hcsplit``: the residual add and the next RMSNorm on own rows), without the fronts (OVERLAP=2)
+             if parallel != 1:
+                 raise ValueError("full GLM-5.3 serves one request at a time on CUDA (--parallel 1)")
+             if drafter is not None:
+                 raise ValueError("full GLM-5.3 drafts with its MTP head; DFlash2 (--drafter) is GLM-5.3-Flash's")
+             if vision:
+                 raise ValueError("full GLM-5.3 is a text model (no --vision)")
+-            if self.split.split or self.split.code() != SplitSettings().code():
+-                raise ValueError("TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP split GLM-5.3-Flash's hyper-connection "
+-                                 "glue; full GLM-5.3 has none: leave them unset")
++            if self.split.fronts:
++                raise ValueError("TF_GLM_PREFILL_OVERLAP=2 (the blocks' fronts during the swaps) is GLM-5.3-Flash's; "
++                                 "full GLM-5.3 takes 0 or 1")
+         # Without --context the window stays dense, attending every key without indexer work.
+         explicit = context is not None if context_explicit is None else bool(context_explicit)
+         from . import LATENT
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 90dd540..d2bb752 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -465,15 +465,15 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
+     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
+ 
+ 
+-def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None, site: tuple | None = None
+-             ) -> torch.Tensor | None:
++def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None, site: tuple | None = None,
++             whole: bool = False) -> torch.Tensor | None:
+     """``fill(lo, hi)`` writes rows lo .. hi of this rank's fp32 partial b.part; returns every rank's partials
+     [world, R, D] (``gather``), or None while a prompt chunk runs row-split (TF_GLM_HC_SPLIT), which exchanges them
+     and runs hc_post itself (``hcsplit.HcSplit``)."""
+ 
+     sp = b.split
+     if sp is not None and sp.active:
+-        sp.partial(fill)
++        sp.partial(fill, whole)
+         return None
+     fill(0, R)
+     if site is not None and l2pf.ACTIVE is not None:      # TF_GLM_L2PF: the next reads into L2 during the gather
+@@ -899,7 +899,9 @@ def moe_full_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tenso
+             with prof.timed("moe: combine"):
+                 glue.combine_shared(y.view(z - a, slots, c.hidden), b.sy[a:z], b.wts[a:z], b.part[a:z])
+ 
+-    return partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"))
++    # whole: the routed experts of a row split's pieces in one call (the prompt kernels lose more on ~400-row calls
++    # than the pieces' overlap wins)
++    return partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"), whole=True)
+ 
+ 
+ EXL3_BLOCK_ROWS = 2176    # a whole prompt chunk (2,048 rows and the split's pad): 2,176 x 9 x 4 bytes = 77 KiB
+@@ -1091,8 +1093,11 @@ def split_layer_steps(w: Weights, st: State, b: Buffers, R: int, nch: int | None
+     try:
+         Rp = sp.Rp                               # R, or R + 1 with a zero pad row for an odd chunk
+         first, h = layers[0], layers[0].attn_hc
+-        glue.hc_pre(b.x[:Rp], h.fn, h.base, h.scale, first.in_norm, b.normed[:Rp], b.xs[:Rp], b.post[:Rp],
+-                    b.comb[:Rp], b.hcpart[:Rp], c.eps, c.hc_eps, c.hc_iters, prompt=True)
++        if c.full:                               # full GLM-5.3: the first block's RMSNorm on every row
++            glue.rmsnorm(b.x[:Rp], first.in_norm, c.eps, b.normed[:Rp], b.xs[:Rp])
++        else:
++            glue.hc_pre(b.x[:Rp], h.fn, h.base, h.scale, first.in_norm, b.normed[:Rp], b.xs[:Rp], b.post[:Rp],
++                        b.comb[:Rp], b.hcpart[:Rp], c.eps, c.hc_eps, c.hc_iters, prompt=True)
+         done = None                              # rows whose front the glue already ran (TF_GLM_PREFILL_OVERLAP=2)
+         for i, layer in enumerate(layers):
+             if mixer is not None:
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+index 79b4f8c..a6856f4 100644
+--- tensorfold/families/glm5_next/cuda/hcsplit.py
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -9,6 +9,10 @@ peer's, so both ranks hold the next block's full input. The residual streams (b.
+ DFlash2 taps and the final stream mean (b.hidden) are computed on own rows and swapped like the normed rows. Every
+ glue kernel is row-independent and the partial sum order is unchanged, so every bit is the unsplit path's.
+ 
++Full GLM-5.3 (a plain residual, no hyper-connections): the glue is the unsplit path's residual add (every rank's
++partial, rank 0 first) and the next block's RMSNorm, on own rows; each link then carries a share of a partial out and
++a share of the normed rows (bf16) back instead of a whole fp32 partial. No fronts (TF_GLM_PREFILL_OVERLAP=2).
++
+ The group sums b.xs of the normed rows are not swapped: no prompt-chunk matmul reads them (4-bit projections of a
+ prompt chunk run ``prefill_matmul``, BF16 and FP8 ones ignore them). The tests compare split and unsplit states bit
+ for bit, so a later reader would show up there.
+@@ -276,11 +280,22 @@ class HcSplit:
+         theirs = self.theirs() + off
+         self.w.comm.exchange([t[mine:mine + n] for t in outs], [t[theirs:theirs + n] for t in outs], self.peer)
+ 
+-    def partial(self, fill: Callable[[int, int], None]) -> None:
++    def partial(self, fill: Callable[[int, int], None], whole: bool = False) -> None:
+         """This rank's fp32 partial rows (``fill(lo, hi)`` writes b.part[lo:hi]), the peers' rows sent to them and
+-        their partials of this rank's rows received (``got``)."""
++        their partials of this rank's rows received (``got``). ``whole``: one fill of every row, then the pieces'
++        swaps (a block whose kernels lose more on short row ranges than the overlap wins: full GLM-5.3's MoE)."""
+ 
+         mine = self.mine()
++        if whole and self.stream is not None and not self.gather:
++            fill(0, self.R)
++            main = torch.cuda.current_stream()
++            self.ev_fill[0].record(main)
++            with torch.cuda.stream(self.stream):
++                self.stream.wait_event(self.ev_fill[0])
++                for j in range(len(self.pieces)):
++                    self._swap_partial(j)
++                    self.ev_part[j].record(self.stream)
++            return
+         if self.stream is None or (self.world > 2 and self.gather):
+             fill(0, self.R)
+             if self.stream is None:
+@@ -317,6 +332,17 @@ class HcSplit:
+         b = self.b
+         x = b.x[lo:hi]
+         own = b.part[lo:hi]
++        if self.w.cfg.full:                            # a plain residual: x + the partials, rank 0 first
++            if self.gather:
++                glue.residual_add(x, x, self.got[0][:, lo:hi].contiguous())
++            elif self.world == 2:
++                g0, g1 = (own, self.got[j]) if self.rank == 0 else (self.got[j], own)
++                glue.residual_add(x, x, torch.stack((g0, g1)))
++            else:
++                block = self.got[j]
++                block[self.rank].copy_(own)
++                glue.residual_add(x, x, block)
++            return
+         if self.world == 2:
+             got = self.got[j]
+             g0, g1 = (own, got) if self.rank == 0 else (got, own)
+@@ -341,7 +367,8 @@ class HcSplit:
+         b, c = self.b, self.w.cfg
+         mine = self.mine()
+         main = torch.cuda.current_stream()
+-        outs = [b.taps[slot] for slot in taps] + ([b.hidden] if final else []) + ([b.normed] if hc is not None else [])
++        normed = hc is not None or (c.full and norm is not None)     # full GLM-5.3: the next block's RMSNorm
++        outs = [b.taps[slot] for slot in taps] + ([b.hidden] if final else []) + ([b.normed] if normed else [])
+         for j, (off, n) in enumerate(self.pieces):
+             lo, hi = mine + off, mine + off + n
+             if self.stream is not None:
+@@ -352,7 +379,9 @@ class HcSplit:
+                 glue.stream_mean(x, b.taps[slot][lo:hi])
+             if final:
+                 glue.stream_mean(x, b.hidden[lo:hi])
+-            if hc is not None:
++            if c.full and norm is not None:
++                glue.rmsnorm(x, norm, c.eps, b.normed[lo:hi], b.xs[lo:hi])
++            elif hc is not None:
+                 glue.hc_pre(x, hc.fn, hc.base, hc.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
+                             b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=True)
+             if self.stream is None:

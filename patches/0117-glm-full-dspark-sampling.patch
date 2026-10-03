@@ -1,0 +1,51 @@
+diff --git tensorfold/families/glm5_next/cuda/dspark.py tensorfold/families/glm5_next/cuda/dspark.py
+index 2c4bbc7..99c621d 100644
+--- tensorfold/families/glm5_next/cuda/dspark.py
++++ tensorfold/families/glm5_next/cuda/dspark.py
+@@ -188,6 +188,35 @@ def memory(c: DSparkConfig, rank: int, world: int, *, quant: str = "q4", capacit
+     return {"weights": weights, "kv": kvcache, "fixed": fixed, "device": weights + kvcache + fixed, "host": host}
+ 
+ 
++# TF_GLM_DSPARK_NOISE: the weight of the target's keyed noise in a sampled draft (DFlash2's 0.7 by default; 1.0 when
++# the drafter's scores are the target's); TF_GLM_DSPARK_FILTER=1 (default): a sampled draft only among the candidates
++# the target's own rule could pick (``exact_sampling.choose_rows``: top_k, then top_p, then min_p, over the drafter's
++# scores): a draft from the tail is a draft the target never takes. Drafts only propose: replies are unchanged.
++DSPARK_NOISE = float(__import__("os").environ.get("TF_GLM_DSPARK_NOISE", "") or NOISE)
++DSPARK_FILTER = __import__("os").environ.get("TF_GLM_DSPARK_FILTER", "1") != "0"
++
++
++def target_kept(score: np.ndarray, ids: np.ndarray, s) -> np.ndarray:
++    """Which of a slot's candidates the target's sampling rule keeps, judged on the drafter's scores (already over the
++    temperature): ``choose_rows``' order (score descending, id ascending), top_k, the top_p prefix, min_p."""
++
++    n = score.shape[0]
++    order = np.lexsort((ids, -score))
++    k = max(1, min(int(s.top_k) if s.top_k else n, n))
++    order = order[:k]
++    sc = score[order].astype(np.float64)
++    if 0.0 < s.top_p < 1.0:
++        probs = np.exp(sc - sc.max())
++        probs /= probs.sum()
++        keep = int((np.cumsum(probs) < s.top_p).sum()) + 1
++        order, sc = order[:keep], sc[:keep]
++    if s.min_p > 0.0:
++        order = order[sc >= sc[0] + s.min_log]
++    kept = np.zeros(n, dtype=bool)
++    kept[order] = True
++    return kept
++
++
+ # -- kernels ------------------------------------------------------------------------------------------------------
+ @triton.jit
+ def _block_attn_kernel(Q, K, V, OUT, POS, W, scale, N: tl.constexpr, MP: tl.constexpr, NH: tl.constexpr,
+@@ -506,7 +535,9 @@ class Drafter(_DFlash2):
+         for d in range(depth):
+             emb = self.markov_embed(prev)
+             score = (values[d] + self.markov_bias(tokens[d], emb)) / temp
+-            pick = score + NOISE * noise[d] if noise is not None else score
++            pick = score + DSPARK_NOISE * noise[d] if noise is not None else score
++            if sampled and DSPARK_FILTER:
++                pick = np.where(target_kept(score, tokens[d], sampling), pick, -np.inf)
+             j = int(np.argmax(pick))
+             if self.conf_h is not None:
+                 z = float(hconf[d]) + self.conf_b

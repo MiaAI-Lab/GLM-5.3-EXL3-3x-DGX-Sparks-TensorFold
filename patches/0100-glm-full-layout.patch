@@ -1,0 +1,154 @@
+diff --git tensorfold/families/glm5_next/cuda/split.py tensorfold/families/glm5_next/cuda/split.py
+index a973b31..81afd27 100644
+--- tensorfold/families/glm5_next/cuda/split.py
++++ tensorfold/families/glm5_next/cuda/split.py
+@@ -30,7 +30,7 @@ COL = (
+     r"\.self_attn\.o_proj\.",
+ )
+ REP = (
+-    r"^lm_head\.", r"embed_tokens\.", r"^model\.language_model\.norm\.weight$",
++    r"^lm_head\.", r"embed_tokens\.", r"^model\.language_model\.norm\.weight$", r"^model\.norm\.weight$",
+     r"_layernorm\.weight$", r"\.hc_(attn|ffn)_(fn|base|scale)$", r"\.mlp\.gate\.(weight|e_score_correction_bias)$",
+     r"\.self_attn\.indexer\.", r"\.self_attn\.(q_a_proj|kv_a_proj_with_mqa)\.", r"\.self_attn\.(f_a|g_a)_proj\.",
+     r"\.self_attn\.o_norm\.weight$", r"\.(eh_proj)\.", r"\.(enorm|hnorm)\.weight$", r"\.shared_head\.norm\.weight$",
+@@ -148,7 +148,9 @@ def rank_cut(layout, name: str, shape: list[int], kind: str) -> tuple[int, int]
+         if layout.world == 2:                             # a family the config does not size: halves, as ever
+             return None
+         raise ValueError(f"{name}: split ({kind}) but the config sizes no tensor-parallel family for it")
+-    return layout.cut(family, shape[AXIS[kind]])
++    from .tp import layer_of
++
++    return layout.cut(family, shape[AXIS[kind]], layer_of(name))
+ 
+ 
+ def torch_dtype(dtype: str):
+diff --git tensorfold/families/glm5_next/cuda/tp.py tensorfold/families/glm5_next/cuda/tp.py
+index 5eec3b1..63dfcd8 100644
+--- tensorfold/families/glm5_next/cuda/tp.py
++++ tensorfold/families/glm5_next/cuda/tp.py
+@@ -11,6 +11,12 @@ Families (the split checkpoint tensors, ``split.ROW`` / ``COL`` / EXL3 rules):
+   moe     a routed expert's intermediate (EXL3: whole 128-column Hadamard blocks)        unit 128
+   shared  the shared expert's intermediate                                              unit 128
+   vocab   lm_head rows                                                                  unit 64
++
++Full GLM-5.3 (``glm_moe_dsa``, ``rotate``): a family's remainder goes to rank (layer + offset) % world instead of the
++lowest ranks, so the 6/5/5 blocks of 256 routed experts' 16 Hadamard blocks a layer move round the ranks: each holds
++a third of the routed bytes (~77.6 GiB of 233) instead of rank 0 holding 6/16 (87 GiB). A layer's slowest rank is
++the one with 6 either way; the shared expert's extra block sits one rank further on (``ROTATE``), so no rank holds
++both a layer's extra routed and extra shared block. Buffers every rank sizes alike take ``largest``.
+ """
+ 
+ from __future__ import annotations
+@@ -21,6 +27,7 @@ from dataclasses import dataclass, field
+ from tensorfold.cuda.shares import parts
+ 
+ UNITS = {"heads": 1, "lin": 1, "dense": 128, "moe": 128, "shared": 128, "vocab": 64}
++ROTATE = {"moe": 0, "shared": 1}      # full GLM-5.3: the families whose remainder rotates by layer, and their offsets
+ SIZES = (2, 3, 4)                     # the engine's tensor-parallel sizes
+ 
+ _LAYER = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+@@ -44,6 +51,7 @@ class Layout:
+     world: int
+     totals: dict = field(hash=False)
+     kinds: tuple = ()                  # per layer "kda" / "dsa" (an o_proj's family); past them: the MTP layer (dsa)
++    rotate: bool = False               # full GLM-5.3: ROTATE's families put their remainder on rank (layer + offset)
+ 
+     def __post_init__(self) -> None:
+         if not 0 <= self.rank < self.world:
+@@ -58,7 +66,10 @@ class Layout:
+         names = {"heads": "heads", "lin": "lin_heads", "dense": "dense_width", "moe": "moe_width",
+                  "shared": "shared_width", "vocab": "vocab"}
+         totals = {f: int(getattr(cfg, a)) for f, a in names.items() if getattr(cfg, a, None) is not None}
+-        return cls(int(rank), int(world), totals, tuple(getattr(cfg, "kinds", ()) or ()))
++        if not getattr(cfg, "lin_layers", True):           # full GLM-5.3: no KDA heads to split
++            totals.pop("lin", None)
++        return cls(int(rank), int(world), totals, tuple(getattr(cfg, "kinds", ()) or ()),
++                   bool(getattr(cfg, "full", False)))
+ 
+     @classmethod
+     def from_text(cls, t: dict, rank: int, world: int) -> "Layout":
+@@ -78,34 +89,44 @@ class Layout:
+             totals.update(moe=moe, shared=moe * int(t.get("n_shared_experts", 1)))
+         if "vocab_size" in t:
+             totals["vocab"] = int(t["vocab_size"])
+-        return cls(int(rank), int(world), totals, kinds)
++        return cls(int(rank), int(world), totals, kinds, is_full(t))
+ 
+-    def sizes(self, family: str) -> list[int]:
+-        return split_sizes(self.totals[family], self.world, UNITS[family])
++    def sizes(self, family: str, layer: int | None = None) -> list[int]:
++        """Every rank's share of ``family`` (of ``layer``: rotated for full GLM-5.3's ROTATE families)."""
++        out = split_sizes(self.totals[family], self.world, UNITS[family])
++        if self.rotate and family in ROTATE and layer is not None and layer >= 0:
++            k = (int(layer) + ROTATE[family]) % self.world
++            out = out[-k:] + out[:-k] if k else out
++        return out
+ 
+-    def size(self, family: str) -> int:
+-        return self.sizes(family)[self.rank]
++    def size(self, family: str, layer: int | None = None) -> int:
++        """This rank's share; without ``layer`` a rotated family's largest (what buffers are sized by)."""
++        if layer is None and self.rotate and family in ROTATE:
++            return self.largest(family)
++        return self.sizes(family, layer)[self.rank]
+ 
+-    def start(self, family: str) -> int:
+-        return sum(self.sizes(family)[:self.rank])
++    def start(self, family: str, layer: int | None = None) -> int:
++        return sum(self.sizes(family, layer)[:self.rank])
+ 
+     def largest(self, family: str) -> int:
+         """The largest share any rank holds (rank 0's): what a buffer every rank sizes alike must take."""
+         return max(self.sizes(family))
+ 
+-    def cut(self, family: str, length: int) -> tuple[int, int]:
++    def cut(self, family: str, length: int, layer: int | None = None) -> tuple[int, int]:
+         """This rank's [start, stop) of an axis of ``length`` elements holding ``family``'s total (rows of a weight,
+-        packed words, trellis tiles, group scales)."""
++        packed words, trellis tiles, group scales); ``layer``: the tensor's layer (a rotated family needs it)."""
+ 
+-        total, a = self.totals[family], self.start(family)
+-        b = a + self.size(family)
++        if self.rotate and family in ROTATE and layer is None:
++            raise ValueError(f"{family} rotates by layer: cut needs the tensor's layer")
++        total, a = self.totals[family], self.start(family, layer)
++        b = a + self.sizes(family, layer)[self.rank]
+         if (a * length) % total or (b * length) % total:
+             raise ValueError(f"rank {self.rank} of {self.world}: [{a}, {b}) of {family}'s {total} is not whole on an "
+                              f"axis of {length}")
+         return a * length // total, b * length // total
+ 
+     def at(self, rank: int) -> "Layout":
+-        return Layout(rank, self.world, self.totals, self.kinds)
++        return Layout(rank, self.world, self.totals, self.kinds, self.rotate)
+ 
+     # the per-rank widths the engine sizes its weights and buffers by
+     @property
+@@ -114,7 +135,7 @@ class Layout:
+ 
+     @property
+     def lin_heads(self) -> int:
+-        return self.size("lin")
++        return self.size("lin") if "lin" in self.totals else 0      # full GLM-5.3: no KDA layers
+ 
+     @property
+     def dense(self) -> int:
+@@ -149,6 +170,18 @@ class Layout:
+         return None
+ 
+ 
++def layer_of(name: str) -> int | None:
++    """The decoder layer a checkpoint tensor belongs to (None: not a layer's)."""
++    m = _LAYER.search(name)
++    return int(m.group(1)) if m else None
++
++
++def is_full(t: dict) -> bool:
++    """Whether a text config is full GLM-5.3's (``glm_moe_dsa``: MLA + DSA on every layer, no KDA, no
++    hyper-connections), whose layout rotates (``Layout.rotate``)."""
++    return t.get("model_type") == "glm_moe_dsa"
++
++
+ def split_sizes(total: int, world: int, unit: int) -> list[int]:
+     """Each rank's share of a family's ``total``: halves at two ranks whenever the total is even (the two-rank
+     engine's split, whatever the unit), else whole ``unit``s as even as they go (``shares.parts``)."""

@@ -1,0 +1,647 @@
+diff --git tensorfold/families/glm5_next/cuda/dsa_full.py tensorfold/families/glm5_next/cuda/dsa_full.py
+new file mode 100644
+index 0000000..051aa07
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/dsa_full.py
+@@ -0,0 +1,395 @@
++"""Full GLM-5.3's DSA pieces beside GLM-5.3-Flash's: interleaved RoPE on the MLA's 64 rotary dims (queries and the
++shared rotary key a token), and DeepSeek-V3.2's indexer with per-token keys (no pooling): LayerNorm'd keys with RoPE
++on their first 64 dims, scores sum_h w_h relu(scale q_h . k_t), the top 2048 tokens a row (ties to the lower token),
++ascending. Every kernel computes each row alone (its own query, keys up to its position and the cache), so a verify
++window's rows keep the serial step's bits; positions come from the device (CUDA graphs).
++
++RoPE follows transformers' ``apply_rotary_pos_emb_interleave``: pairs (x[2i], x[2i + 1]) rotate by angle
++pos * theta^(-2i / dim) and come out half-split, [x_even cos - x_odd sin | x_odd cos + x_even sin]; queries and keys
++alike, so their dot products are the interleaved ones. The angle is fp32(pos) * inv_freq (inv_freq as transformers
++computes it, fp32), cos and sin rounded to bf16 as transformers hands them to the bf16 model, products in fp32."""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++TOPK = 2048          # tokens a sparse row attends (index_topk)
++SELECT_ROWS = 128    # a prompt chunk's rows whose fp32 token scores are held at once ([rows, tokens])
++BT = 64              # tokens a score tile takes (the tile sets a row's bits: fixed)
++ROW_G = 128          # programs a decode row's scores take at most (speed only)
++MIN_BUCKET = 4096    # the fewest token columns a decode window scores (a power of two: CUDA graphs' buckets)
++
++
++def inv_freq(dim: int, theta: float, device) -> torch.Tensor:
++    """transformers' default RoPE inverse frequencies for ``dim`` rotary dims: fp32 [dim / 2]."""
++
++    exps = torch.arange(0, dim, 2, dtype=torch.int64).to(torch.float32) / dim
++    return (1.0 / (float(theta) ** exps)).to(torch.float32).to(device)
++
++
++@triton.jit
++def _rotate(x_even, x_odd, pos, FREQ, HALF: tl.constexpr):
++    """Pairs (x_even[i], x_odd[i]) at position ``pos`` -> (first half, second half) of the half-split rotated row,
++    fp32 (cos / sin rounded to bf16 first, as transformers' rotary embedding hands them to a bf16 model)."""
++    i = tl.arange(0, HALF)
++    ang = pos.to(tl.float32) * tl.load(FREQ + i)
++    c = tl.cos(ang).to(tl.bfloat16).to(tl.float32)
++    s = tl.sin(ang).to(tl.bfloat16).to(tl.float32)
++    return x_even * c - x_odd * s, x_odd * c + x_even * s
++
++
++@triton.jit
++def _q_rope(Q, q_stride, head_stride, OUT, POS, FREQ, H: tl.constexpr, OFF: tl.constexpr, HALF: tl.constexpr):
++    """Program (row, head): the head's rotary dims Q[r, h, OFF:OFF + 2 HALF] (interleaved pairs) at position
++    pos + r -> OUT[r, h, :] (half-split, bf16)."""
++    r = tl.program_id(0)
++    h = tl.program_id(1)
++    pos = tl.load(POS) + r
++    i = tl.arange(0, HALF)
++    base = Q + r * q_stride + h * head_stride + OFF
++    xe = tl.load(base + 2 * i).to(tl.float32)
++    xo = tl.load(base + 2 * i + 1).to(tl.float32)
++    a, b = _rotate(xe, xo, pos, FREQ, HALF)
++    out = OUT + (r * H + h) * (2 * HALF)
++    tl.store(out + i, a.to(tl.bfloat16))
++    tl.store(out + HALF + i, b.to(tl.bfloat16))
++
++
++def q_rope(q: torch.Tensor, out: torch.Tensor, pos: torch.Tensor, freq: torch.Tensor, offset: int) -> torch.Tensor:
++    """q [R, H, qk] bf16 (any row stride, heads contiguous blocks of qk) whose dims offset .. offset + rope are the
++    rotary ones -> out [R, H, rope] bf16, rotated at positions pos + r (``pos``: device [1])."""
++
++    R, H = q.shape[0], q.shape[1]
++    half = freq.numel()
++    if out.shape[0] < R or out.shape[1] != H or out.shape[2] != 2 * half or not out.is_contiguous():
++        raise ValueError(f"q_rope: out {tuple(out.shape)} for {R} rows of {H} heads, {2 * half} rotary dims")
++    if q.stride(2) != 1:
++        raise ValueError("q_rope: a head's dims must be contiguous")
++    if R:
++        _q_rope[(R, H)](q, q.stride(0), q.stride(1), out, pos, freq, H=H, OFF=int(offset), HALF=half, num_warps=1)
++    return out
++
++
++@triton.jit
++def _qi_rope(QI, q_stride, POS, FREQ, D: tl.constexpr, HALF: tl.constexpr):
++    """Program (row, head): the head's first 2 HALF dims of QI[r, h D:(h + 1) D] rotated in place at pos + r
++    (interleaved pairs in, half-split out; the program reads the pairs before it writes them)."""
++    r = tl.program_id(0)
++    h = tl.program_id(1)
++    pos = tl.load(POS) + r
++    i = tl.arange(0, HALF)
++    base = QI + r * q_stride + h * D
++    xe = tl.load(base + 2 * i).to(tl.float32)
++    xo = tl.load(base + 2 * i + 1).to(tl.float32)
++    a, b = _rotate(xe, xo, pos, FREQ, HALF)
++    tl.store(base + i, a.to(tl.bfloat16))
++    tl.store(base + HALF + i, b.to(tl.bfloat16))
++
++
++def index_q_rope(qi: torch.Tensor, heads: int, pos: torch.Tensor, freq: torch.Tensor) -> torch.Tensor:
++    """The indexer's queries qi [R, heads * D] (wq_b's output, bf16) with RoPE on each head's first rotary dims, in
++    place, at positions pos + r (transformers' GlmMoeDsaIndexer: q_rot first, then q_pass)."""
++
++    R = qi.shape[0]
++    D = qi.shape[1] // heads
++    if qi.stride(1) != 1 or qi.dtype != torch.bfloat16 or 2 * freq.numel() > D:
++        raise ValueError("index_q_rope: bf16 rows of heads x dims, unit stride")
++    if R:
++        _qi_rope[(R, heads)](qi, qi.stride(0), pos, freq, D=D, HALF=freq.numel(), num_warps=1)
++    return qi
++
++
++@triton.jit
++def _k_rope_write(K, k_stride, KR, POS, BASE, FREQ, HALF: tl.constexpr, SEG: tl.constexpr):
++    """Row r: its rotary key K[r, :2 HALF] (interleaved pairs) rotated at its position -> cache row (half-split).
++    SEG: position and extent base per row (POS[r], BASE[r]); else pos + r from POS[0]."""
++    r = tl.program_id(0)
++    if SEG:
++        pos = tl.load(POS + r)
++        row = tl.load(BASE + r).to(tl.int64) + pos.to(tl.int64)
++    else:
++        pos = tl.load(POS) + r
++        row = pos.to(tl.int64)
++    i = tl.arange(0, HALF)
++    xe = tl.load(K + r * k_stride + 2 * i).to(tl.float32)
++    xo = tl.load(K + r * k_stride + 2 * i + 1).to(tl.float32)
++    a, b = _rotate(xe, xo, pos, FREQ, HALF)
++    tl.store(KR + row * (2 * HALF) + i, a.to(tl.bfloat16))
++    tl.store(KR + row * (2 * HALF) + HALF + i, b.to(tl.bfloat16))
++
++
++def k_rope_write(k: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, freq: torch.Tensor) -> None:
++    """k [R, rope] bf16 rows (any row stride): each row's rotary key, rotated at pos + r, into cache [slots, rope]
++    (bf16) row pos + r."""
++
++    half = freq.numel()
++    if k.shape[1] < 2 * half or k.stride(1) != 1 or cache.dtype != torch.bfloat16 or cache.shape[1] != 2 * half:
++        raise ValueError(f"k_rope_write: rows of {k.shape[1]} into a cache of {tuple(cache.shape)}")
++    if k.shape[0]:
++        _k_rope_write[(k.shape[0],)](k, k.stride(0), cache, pos, pos, freq, HALF=half, SEG=False, num_warps=1)
++
++
++@triton.jit
++def _index_write(KR, k_stride, LNW, LNB, IK, POS, FREQ, eps, D: tl.constexpr, HALF: tl.constexpr):
++    """Row r: LayerNorm(k_raw[r, :D]) (fp32 statistics, weight and bias), rounded to bf16 as the bf16 LayerNorm
++    returns it, then RoPE on its first 2 HALF dims at position pos + r -> IK[pos + r] (bf16)."""
++    r = tl.program_id(0)
++    pos = tl.load(POS) + r
++    src = KR + r * k_stride
++    d = tl.arange(0, D)
++    x = tl.load(src + d).to(tl.float32)
++    mean = tl.sum(x, axis=0) / D
++    xc = x - mean
++    rstd = 1.0 / tl.sqrt(tl.sum(xc * xc, axis=0) / D + eps)
++    y = xc * rstd * tl.load(LNW + d).to(tl.float32) + tl.load(LNB + d).to(tl.float32)
++    row = IK + pos.to(tl.int64) * D
++    tl.store(row + d, y.to(tl.bfloat16), mask=d >= 2 * HALF)           # the dims past the rotary ones
++    i = tl.arange(0, HALF)
++    e, o = 2 * i, 2 * i + 1
++    ye = (tl.load(src + e).to(tl.float32) - mean) * rstd * tl.load(LNW + e).to(tl.float32) + tl.load(LNB + e).to(tl.float32)
++    yo = (tl.load(src + o).to(tl.float32) - mean) * rstd * tl.load(LNW + o).to(tl.float32) + tl.load(LNB + o).to(tl.float32)
++    a, b = _rotate(ye.to(tl.bfloat16).to(tl.float32), yo.to(tl.bfloat16).to(tl.float32), pos, FREQ, HALF)
++    tl.store(row + i, a.to(tl.bfloat16))
++    tl.store(row + HALF + i, b.to(tl.bfloat16))
++
++
++def index_write(k_raw: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor, keys: torch.Tensor, pos: torch.Tensor,
++                freq: torch.Tensor, eps: float = 1e-6) -> None:
++    """Window rows' index keys: k_raw [R, >= D] (wk's output, any row stride) -> LayerNorm -> RoPE on the first
++    rotary dims -> keys [slots, D] bf16 rows pos .. pos + R - 1."""
++
++    D = keys.shape[1]
++    if keys.dtype != torch.bfloat16 or not keys.is_contiguous() or k_raw.stride(1) != 1 or k_raw.shape[1] < D:
++        raise ValueError("index_write: bf16 key rows, contiguous")
++    if k_raw.shape[0]:
++        _index_write[(k_raw.shape[0],)](k_raw, k_raw.stride(0), ln_w, ln_b, keys, pos, freq, float(eps), D=D,
++                                        HALF=freq.numel(), num_warps=1)
++
++
++@triton.jit
++def _scores(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, scale, wscale, H: tl.constexpr, HP: tl.constexpr,
++            D: tl.constexpr, BTT: tl.constexpr, RB: tl.constexpr, G: tl.constexpr):
++    """Program (RB rows, g): token blocks g, g + G, .. of the RB rows' scores s_t = sum_h w_h relu(scale qi_h . k_t)
++    for t <= the row's position, -inf for later columns up to NT. Each row's dot takes its own keys (masked to its
++    visible tokens) on the same [HP, BTT] tile whatever RB, G or R: the same bits a row."""
++    rb = tl.program_id(0)
++    g = tl.program_id(1)
++    P = tl.load(POS)
++    d = tl.arange(0, D)
++    hh = tl.arange(0, HP)
++    hok = hh < H
++    last = tl.minimum(P + tl.minimum((rb + 1) * RB, R), NT)              # the block's most visible columns
++    nb = (NT + BTT - 1) // BTT
++    for tb in range(g, nb, G):
++        t = tb * BTT + tl.arange(0, BTT)
++        if tb * BTT >= last:
++            for i in tl.static_range(RB):
++                r = rb * RB + i
++                if r < R:
++                    tl.store(OUT + r * o_stride + t, float("-inf"), mask=t < NT)
++        else:
++            k = tl.load(KEYS + t[:, None].to(tl.int64) * D + d[None, :], mask=(t < last)[:, None],
++                        other=0.0).to(tl.bfloat16)                                                    # [BTT, D]
++            for i in tl.static_range(RB):
++                r = rb * RB + i
++                if r < R:
++                    n = P + r + 1
++                    q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None],
++                                other=0.0).to(tl.bfloat16)
++                    kr = tl.where((t < n)[:, None], k, 0.0)
++                    dots = tl.dot(q, tl.trans(kr))                                                    # [HP, BTT]
++                    w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
++                    sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
++                    tl.store(OUT + r * o_stride + t, tl.where(t < n, sc, float("-inf")), mask=t < NT)
++
++
++@triton.jit
++def _order_key(s):
++    """A float32 score as a uint32 whose unsigned order is the scores' order (-0 counted as +0)."""
++    bits = (s + 0.0).to(tl.int32, bitcast=True)
++    return (bits ^ ((bits >> 31) | -2147483648)).to(tl.uint32, bitcast=True)
++
++
++@triton.jit
++def _select(S, s_stride, TOK, CNT, POS, NT, K: tl.constexpr, BLOCK: tl.constexpr):
++    """Program r: the K best of the row's first min(NT, max(pos + r + 1, K)) scores by a radix select (8 bits a
++    pass), ties to the lower token, written ascending into TOK[r] (int32); CNT[r] = K when the row sees more than K
++    tokens (sparse), else 0 (the row keeps dense attention and nothing reads its list)."""
++    r = tl.program_id(0).to(tl.int64)
++    row = S + r * s_stride
++    vis = tl.load(POS) + r + 1
++    NP = tl.minimum(NT, tl.maximum(vis, K))
++    bins = tl.arange(0, 256)
++    prefix = tl.zeros((), dtype=tl.uint32)
++    fixed = tl.zeros((), dtype=tl.uint32)
++    need = K
++    for p in tl.static_range(4):
++        hist = tl.zeros((256,), dtype=tl.int32)
++        for c in range(0, NP, BLOCK):
++            i = c + tl.arange(0, BLOCK)
++            ok = i < NP
++            u = _order_key(tl.load(row + i, mask=ok, other=0.0))
++            match = ok & ((u & fixed) == prefix)
++            hist += tl.histogram(((u >> (24 - 8 * p)) & 0xFF).to(tl.int32), 256, mask=match)
++        at_or_above = tl.sum(hist, 0) - tl.cumsum(hist, 0) + hist
++        digit = tl.max(tl.where(at_or_above >= need, bins, 0), 0)
++        need -= tl.sum(tl.where(bins > digit, hist, 0), 0)
++        prefix = prefix | (digit.to(tl.uint32) << (24 - 8 * p))
++        fixed = fixed | (tl.full((), 0xFF, tl.uint32) << (24 - 8 * p))
++    written = 0
++    equal_seen = 0
++    for c in range(0, NP, BLOCK):
++        i = c + tl.arange(0, BLOCK)
++        ok = i < NP
++        u = _order_key(tl.load(row + i, mask=ok, other=0.0))
++        eq = (ok & (u == prefix)).to(tl.int32)
++        take = (ok & (u > prefix)) | ((eq == 1) & (tl.cumsum(eq, 0) - eq + equal_seen < need))
++        tk = take.to(tl.int32)
++        tl.store(TOK + r * K + written + tl.cumsum(tk, 0) - tk, i.to(tl.int32), mask=take)
++        written += tl.sum(tk, 0)
++        equal_seen += tl.sum(eq, 0)
++    tl.store(CNT + r, tl.where(vis > K, K, 0).to(tl.int32))
++
++
++def bucket(pos: int, R: int, capacity: int) -> int:
++    """Token columns a decode window at ``pos`` scores: its visible tokens rounded up to a power of two (at least
++    MIN_BUCKET), at most the capacity: the few sizes CUDA graphs are captured for."""
++    return min(int(capacity), max(MIN_BUCKET, 1 << (int(pos) + int(R) - 1).bit_length()))
++
++
++def buckets(capacity: int) -> list[int]:
++    """Every ``bucket`` a sparse decode window can take (positions past TOPK) in a cache of ``capacity`` tokens."""
++    out, b = [], MIN_BUCKET
++    while b < capacity:
++        out.append(b)
++        b *= 2
++    return out + [int(capacity)]
++
++
++def _wscale(H: int) -> float:
++    return 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 as the Flash engine writes it
++
++
++def score(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos_dev: torch.Tensor, R: int, NT: int,
++          out: torch.Tensor, rows_per_program: int = 1) -> torch.Tensor:
++    """fp32 scores [R, NT] (``out``'s first NT columns of each row) of R rows at positions pos .. pos + R - 1."""
++
++    H = wts.shape[1]
++    D = keys.shape[1]
++    if qi.shape[1] != H * D or not qi.is_contiguous() or wts.stride(1) != 1 or keys.dtype != torch.bfloat16:
++        raise ValueError("index scores: contiguous index queries [R, H * D], unit-stride weights, bf16 keys")
++    rb = int(rows_per_program)
++    g = min(ROW_G, triton.cdiv(NT, BT)) if rb == 1 else 1
++    grid = (triton.cdiv(R, rb), g if rb == 1 else triton.cdiv(NT, BT))
++    if rb == 1:
++        _scores[grid](qi, wts, wts.stride(0), keys, out, out.stride(0), pos_dev, R, NT, D ** -0.5, _wscale(H), H=H,
++                      HP=max(16, triton.next_power_of_2(H)), D=D, BTT=BT, RB=1, G=g, num_warps=4)
++    else:
++        # prompt rows: a program a (row block, token block); G = 1 with the grid's second axis the token block
++        _scores_blocks[grid](qi, wts, wts.stride(0), keys, out, out.stride(0), pos_dev, R, NT, D ** -0.5, _wscale(H),
++                             H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BTT=BT, RB=rb, num_warps=4)
++    return out
++
++
++@triton.jit
++def _scores_blocks(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, scale, wscale, H: tl.constexpr,
++                   HP: tl.constexpr, D: tl.constexpr, BTT: tl.constexpr, RB: tl.constexpr):
++    """_scores for prompt rows, program (RB rows, one token block): the same per-row tile and masks."""
++    rb = tl.program_id(0)
++    tb = tl.program_id(1)
++    P = tl.load(POS)
++    d = tl.arange(0, D)
++    hh = tl.arange(0, HP)
++    hok = hh < H
++    last = tl.minimum(P + tl.minimum((rb + 1) * RB, R), NT)
++    t = tb * BTT + tl.arange(0, BTT)
++    if tb * BTT >= last:
++        for i in tl.static_range(RB):
++            r = rb * RB + i
++            if r < R:
++                tl.store(OUT + r * o_stride + t, float("-inf"), mask=t < NT)
++        return
++    k = tl.load(KEYS + t[:, None].to(tl.int64) * D + d[None, :], mask=(t < last)[:, None], other=0.0).to(tl.bfloat16)
++    for i in tl.static_range(RB):
++        r = rb * RB + i
++        if r < R:
++            n = P + r + 1
++            q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
++            kr = tl.where((t < n)[:, None], k, 0.0)
++            dots = tl.dot(q, tl.trans(kr))
++            w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
++            sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
++            tl.store(OUT + r * o_stride + t, tl.where(t < n, sc, float("-inf")), mask=t < NT)
++
++
++def select(scores: torch.Tensor, pos_dev: torch.Tensor, NT: int, tokens: torch.Tensor, counts: torch.Tensor,
++           k: int = TOPK) -> None:
++    """Each row's k best tokens (ascending) and count (k, or 0 for a row that sees k tokens or fewer)."""
++
++    R = scores.shape[0]
++    if R == 0:
++        return
++    block, warps = (4096, 8) if NT > 1024 else (1024, 4)
++    _select[(R,)](scores, scores.stride(0), tokens, counts, pos_dev, NT, K=k, BLOCK=block, num_warps=warps)
++
++
++def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos: int | None, R: int,
++                  pos_dev: torch.Tensor, *, bucket_cols: int | None = None, prompt: bool = False,
++                  k: int = TOPK) -> tuple[torch.Tensor, torch.Tensor]:
++    """The DSA selection of R rows at positions pos .. pos + R - 1 over per-token keys [slots, D]: tokens [R, k]
++    int32 ascending and counts [R] (k for rows that see more than k tokens, else 0). Decode windows score
++    ``bucket_cols`` columns (a captured graph's bucket; default ``bucket``), prompt chunks (``prompt``) their visible
++    columns in blocks of SELECT_ROWS rows."""
++
++    dev = qi.device
++    cap = keys.shape[0]
++    tokens = torch.empty((R, k), dtype=torch.int32, device=dev)
++    counts = torch.empty((R,), dtype=torch.int32, device=dev)
++    if not prompt:
++        NT = int(bucket_cols) if bucket_cols is not None else bucket(pos, R, cap)
++        scores = torch.empty((R, NT), dtype=torch.float32, device=dev)
++        score(qi, wts, keys, pos_dev, R, NT, scores)
++        select(scores, pos_dev, NT, tokens, counts, k)
++        return tokens, counts
++    NT = min(cap, -(-(int(pos) + R) // BT) * BT)
++    B = min(R, SELECT_ROWS)
++    buf = torch.empty((B * NT,), dtype=torch.float32, device=dev)
++    for a in range(0, R, B):
++        n = min(B, R - a)
++        at = pos_dev if a == 0 else pos_dev + a
++        s = buf[:n * NT].view(n, NT)
++        score(qi[a:a + n], wts[a:a + n], keys, at, n, NT, s, rows_per_program=4)
++        select(s, at, NT, tokens[a:a + n], counts[a:a + n], k)
++    return tokens, counts
++
++
++# -- the embedding split by vocabulary rows over the ranks -------------------------------------------------------------
++
++@triton.jit
++def _embed_part(IDS, W, OUT, lo, hi, D: tl.constexpr, BLOCK: tl.constexpr):
++    """Row r, block c: token IDS[r]'s embedding row as fp32 when this rank holds it (lo <= id < hi), else zeros."""
++    r = tl.program_id(0)
++    c = tl.program_id(1)
++    d = c * BLOCK + tl.arange(0, BLOCK)
++    tok = tl.load(IDS + r).to(tl.int64)
++    mine = (tok >= lo) & (tok < hi)
++    row = tl.where(mine, tok - lo, 0)
++    v = tl.load(W + row * D + d, mask=mine & (d < D), other=0.0).to(tl.float32)
++    tl.store(OUT + r * D + d, v, mask=d < D)
++
++
++def embed_part(ids: torch.Tensor, table: torch.Tensor, offset: int, out: torch.Tensor) -> torch.Tensor:
++    """Full GLM-5.3's embedding split by vocabulary rows (as lm_head is): this rank's rows [offset, offset + n) of the
++    table (bf16 [n, D]); out [R, D] fp32 gets the rows of the tokens it holds and zeros for the rest. Every token is one
++    rank's, so the ranks' parts summed (``forward.gather``) are the bf16 rows exactly."""
++
++    R, D = out.shape
++    if table.dtype != torch.bfloat16 or table.shape[1] != D or out.dtype != torch.float32 or not out.is_contiguous():
++        raise ValueError("embed_part: a bf16 table slice and contiguous fp32 rows of its width")
++    if R:
++        block = min(1024, triton.next_power_of_2(D))
++        _embed_part[(R, triton.cdiv(D, block))](ids, table, out, int(offset), int(offset) + table.shape[0], D=D,
++                                                BLOCK=block, num_warps=4)
++    return out
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+index 16358c9..ddcb177 100644
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -410,14 +410,18 @@ def latent_write(lat: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor) -> N
+ # --------------------------------------------------------------------------------------------- attention ---
+ 
+ @triton.jit
+-def _tile(q, kv, ks, m, l, o, valid, SCALE: tl.constexpr, FP8: tl.constexpr):
++def _tile(q, kv, ks, m, l, o, valid, SCALE: tl.constexpr, FP8: tl.constexpr, qp=None, kr=None,
++          ROPE: tl.constexpr = 0):
+     """One key tile for HB heads of one row: kv [KT, 512] is both key and value (the latent). FP8: kv holds a
+     quantized cache's codes (exact in bf16) and ks [KT] their power-of-two scales, folded into the scores and the
+     probabilities (exactly: scaling by a power of two rounds nothing), so the arithmetic is this tile's on the
+-    dequantized rows."""
++    dequantized rows. ROPE (full GLM-5.3): the rotary queries qp [HB, ROPE] and keys kr [KT, ROPE] (bf16, never
++    quantized) add their dots to the scores before the scale; 0 compiles it out (GLM-5.3-Flash)."""
+     scores = tl.dot(q, tl.trans(kv)).to(tl.float32)
+     if FP8:
+         scores = scores * ks[None, :]
++    if ROPE:
++        scores = scores + tl.dot(qp, tl.trans(kr)).to(tl.float32)
+     scores = scores * SCALE
+     scores = tl.where(valid[None, :], scores, float("-inf"))
+     tile_m = tl.max(scores, 1)
+@@ -434,11 +438,14 @@ def _tile(q, kv, ks, m, l, o, valid, SCALE: tl.constexpr, FP8: tl.constexpr):
+ 
+ 
+ @triton.jit
+-def _tile_v(q, kv, vv, ks, m, l, o, valid, SCALE: tl.constexpr, FP8: tl.constexpr):
++def _tile_v(q, kv, vv, ks, m, l, o, valid, SCALE: tl.constexpr, FP8: tl.constexpr, qp=None, kr=None,
++            ROPE: tl.constexpr = 0):
+     """_tile with the values a column slice vv [KT, VB] of the keys kv [KT, 512]."""
+     scores = tl.dot(q, tl.trans(kv)).to(tl.float32)
+     if FP8:
+         scores = scores * ks[None, :]
++    if ROPE:
++        scores = scores + tl.dot(qp, tl.trans(kr)).to(tl.float32)
+     scores = scores * SCALE
+     scores = tl.where(valid[None, :], scores, float("-inf"))
+     tile_m = tl.max(scores, 1)
+@@ -456,9 +463,11 @@ def _tile_v(q, kv, vv, ks, m, l, o, valid, SCALE: tl.constexpr, FP8: tl.constexp
+ 
+ @triton.jit
+ def _dense_chunks(QA, LC, LS, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr, CH: tl.constexpr,
+-                  SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++                  SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr,
++                  QP=None, KR=None, ROPE: tl.constexpr = 0):
+     """Program (row, head block, chunk): causal attention of HB heads of row r over keys [c CH, (c + 1) CH); cache
+-    rows RS elements apart (FP8: codes, their scales through LS)."""
++    rows RS elements apart (FP8: codes, their scales through LS). ROPE: rotary queries QP [R, H, ROPE] and the rotary
++    key cache KR [slots, ROPE] (bf16) join the scores (``_tile``)."""
+     r = tl.program_id(0)
+     hb = tl.program_id(1)
+     c = tl.program_id(2)
+@@ -473,12 +482,20 @@ def _dense_chunks(QA, LC, LS, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.conste
+     limit = P + r                                                     # keys 0 .. P + r are visible to row r
+     if start <= limit:
+         q = tl.load(QA + (r * H + hh[:, None]) * LW + k[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
++        qp = None
++        if ROPE:
++            j = tl.arange(0, ROPE)
++            qp = tl.load(QP + (r * H + hh[:, None]) * ROPE + j[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
+         for t in range(CH // KTT):
+             ki = start + t * KTT + tl.arange(0, KTT)
+             ok = ki <= limit
+             kv = tl.load(LC + ki[:, None].to(tl.int64) * RS + k[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
+             ks = row_scales(LS, ki.to(tl.int64), ok, LW, RS) if FP8 else None
+-            m, l, o = _tile(q, kv, ks, m, l, o, ok, SCALE, FP8)
++            kr = None
++            if ROPE:
++                kr = tl.load(KR + ki[:, None].to(tl.int64) * ROPE + j[None, :], mask=ok[:, None],
++                             other=0.0).to(tl.bfloat16)
++            m, l, o = _tile(q, kv, ks, m, l, o, ok, SCALE, FP8, qp, kr, ROPE)
+     base = (c * R + r) * H + hh
+     tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
+     tl.store(PM + base, m, mask=hok)
+@@ -488,7 +505,7 @@ def _dense_chunks(QA, LC, LS, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.conste
+ @triton.jit
+ def _sparse_chunks(QA, LC, LS, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr,
+                    CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, RS: tl.constexpr,
+-                   FP8: tl.constexpr):
++                   FP8: tl.constexpr, QP=None, KR=None, ROPE: tl.constexpr = 0):
+     """Program (row, head block, chunk): HB heads of row r over its selected tokens [c CH, (c + 1) CH) in list order."""
+     r = tl.program_id(0)
+     hb = tl.program_id(1)
+@@ -502,13 +519,20 @@ def _sparse_chunks(QA, LC, LS, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.c
+     o = tl.zeros((HBT, LW), tl.float32)
+     if c * CH < n:
+         q = tl.load(QA + (r * H + hh[:, None]) * LW + k[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
++        qp = None
++        if ROPE:
++            j = tl.arange(0, ROPE)
++            qp = tl.load(QP + (r * H + hh[:, None]) * ROPE + j[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
+         for t in range(CH // KTT):
+             idx = c * CH + t * KTT + tl.arange(0, KTT)
+             ok = idx < n
+             tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
+             kv = tl.load(LC + tok[:, None] * RS + k[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
+             ks = row_scales(LS, tok, ok, LW, RS) if FP8 else None
+-            m, l, o = _tile(q, kv, ks, m, l, o, ok, SCALE, FP8)
++            kr = None
++            if ROPE:
++                kr = tl.load(KR + tok[:, None] * ROPE + j[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++            m, l, o = _tile(q, kv, ks, m, l, o, ok, SCALE, FP8, qp, kr, ROPE)
+     base = (c * R + r) * H + hh
+     tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
+     tl.store(PM + base, m, mask=hok)
+@@ -540,7 +564,8 @@ def _onepass_scales(LS, tok, t0, n, LW: tl.constexpr, RS: tl.constexpr, KTT: tl.
+ @triton.jit
+ def _sparse_onepass(QA, LC, LS, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr,
+                     SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, SPLIT: tl.constexpr,
+-                    STAGES: tl.constexpr, PREFETCH: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++                    STAGES: tl.constexpr, PREFETCH: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr,
++                    QP=None, KR=None, ROPE: tl.constexpr = 0):
+     """Prompt rows, program (row, head group, latent slice): HBT heads of row r over all its selected tokens in one
+     online softmax, KTT-key tiles in list order (_tile's math), straight to OUT[r, h] bf16: no partials, no merge.
+     PREFETCH: tile t + 1's gather is issued into registers before tile t's dots (a load blocks only at first use),
+@@ -562,6 +587,10 @@ def _sparse_onepass(QA, LC, LS, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr,
+     k = tl.arange(0, LW)
+     v = vs * VB + tl.arange(0, VB)
+     q = tl.load(QA + (r * H + hh[:, None]) * LW + k[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
++    qp = None
++    if ROPE:
++        j = tl.arange(0, ROPE)
++        qp = tl.load(QP + (r * H + hh[:, None]) * ROPE + j[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
+     m = tl.full((HBT,), float("-inf"), tl.float32)
+     l = tl.zeros((HBT,), tl.float32)
+     o = tl.zeros((HBT, VB), tl.float32)
+@@ -578,11 +607,14 @@ def _sparse_onepass(QA, LC, LS, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr,
+             kv_next = _onepass_rows(LC, tok_next, t0 + KTT, n, k, RS, KTT)
+             ks_next = _onepass_scales(LS, tok_next, t0 + KTT, n, LW, RS, KTT, FP8)
+             tok_after = _onepass_ids(row, t0 + 2 * KTT, n, KTT)
++            kr = None
++            if ROPE:
++                kr = tl.load(KR + tok[:, None] * ROPE + j[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
+             if SPLIT == 1:
+-                m, l, o = _tile(q, kv.to(tl.bfloat16), ks, m, l, o, ok, SCALE, FP8)
++                m, l, o = _tile(q, kv.to(tl.bfloat16), ks, m, l, o, ok, SCALE, FP8, qp, kr, ROPE)
+             else:
+                 vv = tl.load(LC + tok[:, None] * RS + v[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
+-                m, l, o = _tile_v(q, kv.to(tl.bfloat16), vv, ks, m, l, o, ok, SCALE, FP8)
++                m, l, o = _tile_v(q, kv.to(tl.bfloat16), vv, ks, m, l, o, ok, SCALE, FP8, qp, kr, ROPE)
+             tok = tok_next
+             kv = kv_next
+             ks = ks_next
+@@ -593,11 +625,14 @@ def _sparse_onepass(QA, LC, LS, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr,
+             tok = _onepass_ids(row, t0, n, KTT)
+             kv = _onepass_rows(LC, tok, t0, n, k, RS, KTT)
+             ks = _onepass_scales(LS, tok, t0, n, LW, RS, KTT, FP8)
++            kr = None
++            if ROPE:
++                kr = tl.load(KR + tok[:, None] * ROPE + j[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
+             if SPLIT == 1:
+-                m, l, o = _tile(q, kv.to(tl.bfloat16), ks, m, l, o, ok, SCALE, FP8)
++                m, l, o = _tile(q, kv.to(tl.bfloat16), ks, m, l, o, ok, SCALE, FP8, qp, kr, ROPE)
+             else:
+                 vv = tl.load(LC + tok[:, None] * RS + v[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
+-                m, l, o = _tile_v(q, kv.to(tl.bfloat16), vv, ks, m, l, o, ok, SCALE, FP8)
++                m, l, o = _tile_v(q, kv.to(tl.bfloat16), vv, ks, m, l, o, ok, SCALE, FP8, qp, kr, ROPE)
+     tl.store(OUT + (r * H + hh[:, None]) * LW + v[None, :], (o / l[:, None]).to(tl.bfloat16), mask=hok[:, None])
+ 
+ 
+@@ -657,8 +692,23 @@ class LatentScratch:
+         self.dummy = torch.zeros((1,), dtype=torch.int32, device=device)
+ 
+ 
++def _rope_args(qp: torch.Tensor | None, rope: torch.Tensor | None, R: int, H: int):
++    """(QP, KR, ROPE) kernel arguments: full GLM-5.3's rotary queries [R, H, rope] and rotary key cache [slots, rope]
++    (bf16, contiguous), or none (GLM-5.3-Flash: ROPE 0)."""
++    if qp is None and rope is None:
++        return None, None, 0
++    if qp is None or rope is None:
++        raise ValueError("latent attention: rotary queries and the rotary key cache go together")
++    n = rope.shape[1]
++    if (qp.shape[0] < R or qp.shape[1] != H or qp.shape[2] != n or not qp.is_contiguous() or not rope.is_contiguous()
++            or rope.dtype != torch.bfloat16):
++        raise ValueError(f"latent attention: rotary queries {tuple(qp.shape)} for {R} x {H}, cache {tuple(rope.shape)}")
++    return qp, rope, n
++
++
+ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: LatentScratch, *, scale: float,
+-              nch: int, out: torch.Tensor, hb: int | None = None) -> torch.Tensor:
++              nch: int, out: torch.Tensor, hb: int | None = None, qp: torch.Tensor | None = None,
++              rope: torch.Tensor | None = None) -> torch.Tensor:
+     """Dense causal attention of qa [R, H, 512] over the cache through pos + R - 1, visiting nch 512-key chunks (empty ones skipped) -> out [R, H, 512].
+ 
+     Row r's programs read only its query, keys 0 .. pos + r and its own partials, so the first rows of a window
+@@ -672,15 +722,17 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: Laten
+     if hb not in (HB, HB_WIDE):
+         raise ValueError(f"latent attention: {hb} heads a tile, not {HB} or {HB_WIDE}")
+     vals, scl, rs, fp8 = _cache_parts(cache, LW)
++    QP, KR, ROPE = _rope_args(qp, rope, R, H)
+     _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, pos, s.po[:n * LW], s.pm[:n], s.pl[:n], R, H=H, LW=LW,
+-                                                CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, RS=rs, FP8=fp8, num_warps=8,
+-                                                num_stages=chunk_stages())
++                                                CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, RS=rs, FP8=fp8, QP=QP, KR=KR,
++                                                ROPE=ROPE, num_warps=8, num_stages=chunk_stages())
+     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
+     return out
+ 
+ 
+ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
+-                     out: torch.Tensor, scale: float) -> None:
++                     out: torch.Tensor, scale: float, qp: torch.Tensor | None = None,
++                     rope: torch.Tensor | None = None) -> None:
+     """Attention of rows with counts > 0 over their selected tokens (ascending, -1 padded), written into out; other rows are left alone."""
+     R, H, LW = qa.shape
+     W = tokens.shape[1]
+@@ -691,9 +743,10 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
+     pl = torch.empty((n,), dtype=torch.float32, device=qa.device)
+     hb = head_block(R)
+     vals, scl, rs, fp8 = _cache_parts(cache, LW)
++    QP, KR, ROPE = _rope_args(qp, rope, R, H)
+     _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, tokens, counts, po, pm, pl, R, W=W, H=H, LW=LW,
+-                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, RS=rs, FP8=fp8, num_warps=8,
+-                                                 num_stages=chunk_stages())
++                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, RS=rs, FP8=fp8, QP=QP, KR=KR,
++                                                 ROPE=ROPE, num_warps=8, num_stages=chunk_stages())
+     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
+ 
+ 
+@@ -707,7 +760,8 @@ ONEPASS_LAUNCH = (8, 1, True)
+ 
+ 
+ def sparse_onepass(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
+-                   out: torch.Tensor, scale: float, *, tile: tuple | None = None, launch: tuple | None = None) -> None:
++                   out: torch.Tensor, scale: float, *, tile: tuple | None = None, launch: tuple | None = None,
++                   qp: torch.Tensor | None = None, rope: torch.Tensor | None = None) -> None:
+     """sparse_attention for a prompt chunk's rows: one program a row (and head group) walks every selected token in
+     one online softmax and writes out[r] directly, no fp32 partials; rows with counts 0 are left alone. Other bits
+     than sparse_attention's (one chain instead of merged 512-token chunks), the same for any chunking of the rows.
+@@ -721,10 +775,11 @@ def sparse_onepass(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor,
+     hbt, kt, split = tile or ONEPASS_TILE
+     warps, stages, prefetch = launch or ONEPASS_LAUNCH
+     hbt = max(16, min(hbt, triton.next_power_of_2(H)))            # tensor-core tiles need 16 rows
++    QP, KR, ROPE = _rope_args(qp, rope, R, H)
+     _sparse_onepass[(R, triton.cdiv(H, hbt), split)](qa, vals, scl, tokens, counts, out, W=tokens.shape[1], H=H,
+                                                      LW=LW, SCALE=scale, HBT=hbt, KTT=kt, SPLIT=split, STAGES=stages,
+-                                                     PREFETCH=bool(prefetch), RS=rs, FP8=fp8, num_warps=warps,
+-                                                     num_stages=1 if prefetch else stages)
++                                                     PREFETCH=bool(prefetch), RS=rs, FP8=fp8, QP=QP, KR=KR, ROPE=ROPE,
++                                                     num_warps=warps, num_stages=1 if prefetch else stages)
+ 
+ 
+ def chunks_for(length: int) -> int:

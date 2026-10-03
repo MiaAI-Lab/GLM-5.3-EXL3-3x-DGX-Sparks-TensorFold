@@ -1,0 +1,263 @@
+diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
+index 8256956..d43245c 100644
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -332,6 +332,97 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
+     return Geometry(bytes_at, reserve, minimum_slots)
+ 
+ 
++FULL_SELECT_ROWS = 128      # full GLM-5.3: a prompt chunk's rows whose fp32 token scores are held at once
++FULL_TOPK_MIN_BUCKET = 4096  # ... and the fewest token columns a decode window's selection scores (dsa_full)
++
++
++def full_counts(t: dict, mtp: bool) -> tuple[int, int]:
++    """Full GLM-5.3: (attention layers with caches, layers with an indexer) on a rank, the MTP layer's included."""
++    from tensorfold.families.glm5_next.cuda.weights import index_kinds
++
++    layers = int(t["num_hidden_layers"])
++    full = sum(1 for k in index_kinds(t, layers) if k == "full")
++    return layers + int(mtp), full + int(mtp)
++
++
++def full_token_bytes(t: dict, kv: str = "bf16", mtp: bool = True) -> int:
++    """Full GLM-5.3's cache bytes a token on every rank (MLA's cache is the same on all ranks): per attention layer
++    its latent row (bf16, or TF_GLM_KV=fp8's codes, scale and pad) and its rotary key (bf16), per indexer its
++    per-token index key (bf16)."""
++    layers, indexers = full_counts(t, mtp)
++    lw, rope, idx = int(t["kv_lora_rank"]), int(t["qk_rope_head_dim"]), int(t.get("index_head_dim", 128))
++    return layers * (mla_row_bytes(lw, kv) + 2 * rope) + indexers * 2 * idx
++
++
++def full_buffer_bytes(t: dict, rows: int, *, world: int, share, capacity: int, prefill: bool,
++                      prompt_split_k: bool) -> int:
++    """What ``forward.Buffers(w, rows, capacity, prefill=...)`` allocates on a rank of full GLM-5.3 (its tensors'
++    bytes, written out from the class; tests/cpu/test_full_memory.py checks the two agree)."""
++    D, V = int(t["hidden_size"]), share("vocab", int(t["vocab_size"]))
++    HL = share("heads", int(t["num_attention_heads"]))
++    ql, lw, rope = int(t["q_lora_rank"]), int(t["kv_lora_rank"]), int(t["qk_rope_head_dim"])
++    qk, vd = int(t["qk_nope_head_dim"]) + rope, int(t["v_head_dim"])
++    ih, idim = int(t.get("index_n_heads", 32)), int(t.get("index_head_dim", 128))
++    dl, ml = share("dense", int(t["intermediate_size"])), share("moe", int(t["moe_intermediate_size"]))
++    sl = share("shared", int(t["moe_intermediate_size"]) * int(t.get("n_shared_experts", 1)))
++    E, slots = int(t["n_routed_experts"]), int(t["num_experts_per_tok"]) + 1
++    R, P = rows, rows * slots
++    part_rows = min(rows, MLA_PROMPT_ATT_ROWS) if prefill else rows
++    chunks = -(-(min(capacity, 2560) + rows) // 512)
++    total = R * 8                                                         # ids (device and pinned host)
++    total += chunks * part_rows * HL * (lw + 2) * 4 + 2 * R * HL * lw * 2  # latent partials, absorbed q, attended
++    total += R * D * 2 * 4 + R * (D // 64) * 4 + R * 4 * (1 + 1 + 16 * 32)  # hin, x, normed, hidden (+ xs, hc)
++    total += R * (ql + lw + rope) * 2 + R * HL * rope * 2 + R * ql * 2 + R * (ql // 64) * 4 + R * lw * 2
++    total += R * (lw // 64) * 4 + 2 * R * HL * qk * 2 + R * HL * vd * 2 + R * (HL * vd // 64) * 4
++    total += R * (idim + ih) * 2 + R * idim * 4 + R * ih * idim * 2       # indexer rows
++    total += R * 3 * dl * 2 + R * (dl // 64) * 4                          # dense MLP
++    total += R * E * 4 + 2 * R * slots * 4 + P * ml * 2                    # routing, eact
++    cfg_gu, cfg_d = 4, 1                                                   # the universal kernels' K splits (GLM's)
++    total += 2 * P * D * 2 + P * ml * 2 + max(2 * cfg_gu * ml, cfg_d * D) * P * 4 + P * D * 4   # their scratch
++    total += min(P, E) * 4 * (1 + R) + 4
++    total += R * 3 * sl * 2 + R * (sl // 64) * 4 + R * D * 4               # shared expert
++    total += P * 4 + (P + 64) * 3 * 4 * 2 + P * 4 + (-(-P // 1024)) * (E + 1) * 4   # the (unused) grouping plan
++    total += R * D * 4 + world * R * D * 4                                  # partials and their gather
++    total += (4 if prefill and not prompt_split_k else 8 * R * 16384 * 4)  # split-K partials
++    total += 2 * R * D * 2 + R * (D // 64) * 4 + (1 if prefill else R) * V * 2   # final norm, logits
++    total += R * D * 2 * 4 + R * (2 * D // 64) * 4                         # MTP rows
++    return total
++
++
++def full_transient_bytes(t: dict, rows: int, capacity: int, *, prefill: bool, share) -> int:
++    """A window's selection and sparse attention scratch at the cache's capacity: fp32 token scores (a prompt chunk's
++    FULL_SELECT_ROWS rows at once; a decode window's rows over its bucket, at most the capacity), the token lists,
++    and a decode window's sparse attention partials (prompt chunks attend in one pass)."""
++    HL = share("heads", int(t["num_attention_heads"]))
++    lw, topk = int(t["kv_lora_rank"]), int(t.get("index_topk", 2048))
++    cols = max(capacity, FULL_TOPK_MIN_BUCKET)
++    scores = (min(rows, FULL_SELECT_ROWS) if prefill else rows) * cols * 4
++    lists = rows * (topk + 1) * 4
++    partials = 0 if prefill else -(-topk // 512) * rows * HL * (lw + 2) * 4
++    return scores + lists + partials
++
++
++def mla_full_geometry(t: dict, world: int, reserve: int, *, share, decode_rows: int, mtp_rows: int,
++                      prefill_rows: int, kv: str = "bf16", mtp: bool = True, prompt_split_k: bool = False,
++                      minimum_slots: int = 2560) -> Geometry:
++    """Full GLM-5.3's caches and buffers on a rank at a capacity of cache slots: the decode window's buffers (and the
++    MTP head's), the prompt chunk's, the per-token caches (``full_token_bytes``), and the largest transient
++    selection and attention scratch of either kind of window."""
++
++    def bytes_at(capacity: int) -> int:
++        b = full_buffer_bytes(t, decode_rows, world=world, share=share, capacity=capacity, prefill=False,
++                              prompt_split_k=prompt_split_k)
++        if mtp:
++            b += full_buffer_bytes(t, mtp_rows, world=world, share=share, capacity=capacity, prefill=False,
++                                   prompt_split_k=prompt_split_k)
++        b += full_buffer_bytes(t, prefill_rows, world=world, share=share, capacity=capacity, prefill=True,
++                               prompt_split_k=prompt_split_k)
++        b += max(full_transient_bytes(t, prefill_rows, capacity, prefill=True, share=share),
++                 full_transient_bytes(t, decode_rows, capacity, prefill=False, share=share))
++        return b + capacity * full_token_bytes(t, kv, mtp)
++    return Geometry(bytes_at, reserve, minimum_slots)
++
++
+ def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool, prefill_rows: int = PREFILL_ROWS,
+                       onepass: bool = False, share=None) -> int:
+     """A prompt chunk's transient bytes: token selection (fp32 pool scores, chosen pools, token lists), then sparse
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index a6332ba..eaeab1f 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -391,13 +391,31 @@ def mtp_head(drafter: bool, serial_only: bool, layers: int, value: str | None =
+     return value == "1" and bool(layers)
+ 
+ 
+-def without_mtp(transform, layers: int):
+-    """A startup weight transform that leaves out the MTP layer's tensors (``layers.<num_hidden_layers>.``)."""
++def without_mtp(transform, layers: int, decoder: str = "model.language_model."):
++    """A startup weight transform that leaves out the MTP layer's tensors (``layers.<num_hidden_layers>.``;
++    ``decoder``: the decoder's tensor prefix, ``weights.Config.prefix``)."""
+ 
+-    prefix = f"model.language_model.layers.{layers}."
++    prefix = f"{decoder}layers.{layers}."
+     return lambda name, info: (0, 0) if name.startswith(prefix) else transform(name, info)
+ 
+ 
++def full_weights(transform, cfg, lay):
++    """Full GLM-5.3's startup weight transform on top of ``split_weights``' (and TF_GLM_DENSE's): a layer's kv_b key
++    rows are held padded with zero rows over the rotary dims (``weights.load_full``), rope x kv_lora bf16 values a
++    local head more; the embedding is split by vocabulary rows (``forward.embed_rows``)."""
++
++    pad = lay.heads * cfg.rope * cfg.kv_lora * 2
++
++    def out(name: str, info: dict) -> tuple[int, int]:
++        total, extra = transform(name, info)
++        if total and name.endswith("self_attn.kv_b_proj.weight"):
++            total += pad
++        if total and name == cfg.prefix + "embed_tokens.weight":   # split by vocabulary rows, as lm_head
++            total = lay.vocab * int(info["shape"][1]) * 2
++        return total, extra
++    return out
++
++
+ def bell_key(rank: int, n: int) -> str:
+     """The store key that wakes follower ``rank`` for request ``n`` (rank 1's is the two-rank engine's name)."""
+ 
+@@ -479,6 +497,18 @@ class GlmEngine:
+                 print(f"[tensorfold] all-gathers up to {roce.max_bytes >> 10} KiB over RoCE ({via}; b12x's RoCEnante "
+                       "transport), larger ones over NCCL", flush=True)
+         cfg = Config.read(model_dir)
++        if cfg.full:
++            # full GLM-5.3 (glm_moe_dsa): one request at a time with its MTP head; GLM-5.3-Flash's DFlash2 drafter,
++            # image tower and prompt row split (its hyper-connection glue) do not apply
++            if parallel != 1:
++                raise ValueError("full GLM-5.3 serves one request at a time on CUDA (--parallel 1)")
++            if drafter is not None:
++                raise ValueError("full GLM-5.3 drafts with its MTP head; DFlash2 (--drafter) is GLM-5.3-Flash's")
++            if vision:
++                raise ValueError("full GLM-5.3 is a text model (no --vision)")
++            if self.split.split or self.split.code() != SplitSettings().code():
++                raise ValueError("TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP split GLM-5.3-Flash's hyper-connection "
++                                 "glue; full GLM-5.3 has none: leave them unset")
+         # Without --context the window stays dense, attending every key without indexer work.
+         explicit = context is not None if context_explicit is None else bool(context_explicit)
+         from . import LATENT
+@@ -524,8 +554,12 @@ class GlmEngine:
+         self.kv = kv
+         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
+         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers) and parallel == 1   # multi: DFlash2
++        if cfg.full:
++            if kvb != "bf16":
++                raise ValueError("full GLM-5.3 holds kv_b in bf16 (TF_GLM_KVB=bf16)")
++            weights_estimate = full_weights(weights_estimate, cfg, lay)
+         if not self.mtp_on:
+-            weights_estimate = without_mtp(weights_estimate, cfg.layers)
++            weights_estimate = without_mtp(weights_estimate, cfg.layers, cfg.prefix)
+         # rows a prompt chunk runs at once: TF_GLM_PREFILL_ROWS (both ranks alike), more amortizes each chunk's expert
+         # weight decode over more tokens and costs buffer memory
+         if prefill_rows is None:
+@@ -558,6 +592,13 @@ class GlmEngine:
+         def geometry(text):
+             from tensorfold.cuda.capacity import Geometry
+ 
++            if cfg.full:
++                from tensorfold.cuda.geometry import mla_full_geometry
++
++                return mla_full_geometry(text, world, MAX_ROWS, share=share, decode_rows=MAX_ROWS,
++                                         mtp_rows=min(MTP_ROWS, MAX_ROWS), prefill_rows=prompt_buffer_rows, kv=kv,
++                                         mtp=self.mtp_on, prompt_split_k=dense_kind() not in ("q4",),
++                                         minimum_slots=DENSE_CAPACITY)
+             g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT,
+                              prefill_rows=prompt_buffer_rows,
+                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
+diff --git tensorfold/families/glm_moe_dsa/__init__.py tensorfold/families/glm_moe_dsa/__init__.py
+new file mode 100644
+index 0000000..e116d37
+--- /dev/null
++++ tensorfold/families/glm_moe_dsa/__init__.py
+@@ -0,0 +1,69 @@
++"""GLM-5.3 (model_type ``glm_moe_dsa``, zai-org's full model): a CUDA engine over three DGX Sparks, the GLM-5.3-Flash
++CUDA engine with full GLM-5.3's layers (``glm5_next/cuda``, ``weights.Config.full``): MLA with RoPE and DSA on all
++78 layers (the indexer on the "full" ones, its top-k reused on the "shared" ones), plain residuals, EXL3 routed
++experts of mixed widths (the universal grouped kernels), MTP drafts. No Mac engine."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any
++
++MODEL_TYPES = ("glm_moe_dsa",)
++TITLE = "GLM-5.3"
++LANES = False
++MODELS = ("Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold",)
++QUANT_METHODS = {"cuda": ("exl3",)}
++CUDA_TP = (3, 4)                       # GPUs (one per machine): ~86 GiB of weights a rank at three
++SCOPE = "glm53_routed_experts_only"    # EXL3 routed experts (any width a tensor, mcg codebook), BF16 elsewhere
++
++
++def check(model_dir: str | Path) -> None:
++    """Refuse what the CUDA engine does not read: anything but EXL3 routed experts with the mcg codebook and BF16
++    elsewhere (each expert matrix's width comes from its own trellis)."""
++
++    from tensorfold.families import OWN_MODEL_HELP, describe_quantization, quant_method, read_config
++
++    config = read_config(model_dir)
++    if quant_method(config) != "exl3":
++        raise ValueError(f"GLM-5.3's CUDA engine reads EXL3 checkpoints ({MODELS[0]}); this one has "
++                         f"{describe_quantization(config)}. {OWN_MODEL_HELP}")
++    q = config.get("quantization_config") or config.get("quantization") or {}
++    if q.get("codebook", "mcg") != "mcg" or q.get("scope", SCOPE) != SCOPE:
++        raise ValueError(f"GLM-5.3's CUDA engine reads EXL3 routed experts with the mcg codebook and BF16 elsewhere "
++                         f"({MODELS[0]}); this one has codebook {q.get('codebook')!r}, scope {q.get('scope')!r}. "
++                         f"{OWN_MODEL_HELP}")
++    print("[tensorfold] GLM-5.3 runs on three NVIDIA GPUs with 128 GB each (three DGX Sparks): serve with --tp 3 on "
++          "each, the checkpoint readable on all three", flush=True)
++
++
++def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
++                master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None, **options: Any):
++    """The N-rank engine (N = 3 or 4) with MTP drafts (exact: drafted replies equal serial ones), or serial decoding
++    with --no-drafts."""
++
++    tp = int(tp)
++    if tp not in CUDA_TP:
++        raise ValueError(f"GLM-5.3 needs {' or '.join(map(str, CUDA_TP))} GPUs, one per machine: run the same "
++                         "`tensorfold serve` command with --tp N --rank R --master ADDRESS on each (rank 0 last)")
++    if not master:
++        raise ValueError(f"--tp {tp} needs --master: rank 0's address on the link between the machines")
++    if not 0 <= int(rank) < tp:
++        raise ValueError(f"--rank {rank}: 0 to {tp - 1} with --tp {tp}")
++    if drafter and not no_drafts:
++        raise ValueError("GLM-5.3 drafts with its MTP head: pass no --drafter")
++    if options.get("vision"):
++        raise ValueError("GLM-5.3 is a text model: no --vision")
++    from tensorfold.families.glm5_next.cuda.engine import DEFAULT_POLICY, GlmEngine
++
++    policy = DEFAULT_POLICY if mtp_drafts is None else str(int(mtp_drafts))
++    return GlmEngine(Path(model_dir), rank=int(rank), world=tp, master=master, port=int(master_port), policy=policy,
++                     drafter=None, context=options.get("context"), context_explicit=options.get("context_explicit"),
++                     serial_only=bool(no_drafts), parallel=int(options.get("parallel", 1)))
++
++
++def __getattr__(name: str) -> Any:
++    if name == "CUDA_APP":             # GLM-5.3-Flash's server side: the same tokenizer and chat format
++        from tensorfold.families.glm5_next.cuda.app import GlmApp
++
++        return GlmApp
++    raise AttributeError(name)

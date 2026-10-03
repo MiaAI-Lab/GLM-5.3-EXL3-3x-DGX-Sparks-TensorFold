@@ -1,0 +1,17 @@
+diff --git tensorfold/families/glm5_next/cuda/qmm.py tensorfold/families/glm5_next/cuda/qmm.py
+index 074a507..51ea5a0 100644
+--- tensorfold/families/glm5_next/cuda/qmm.py
++++ tensorfold/families/glm5_next/cuda/qmm.py
+@@ -350,7 +350,11 @@ def matmul(x: torch.Tensor, q: Q4 | B16, xs: torch.Tensor | None = None, *, out:
+ # Decode rows (up to 16) of a Q4 matmul on another column tile / warp / stage count (``shared.qmm_cfg``): every
+ # output keeps its chain, so every choice gives the same bits. By per-rank shape (n, k), measured on GB10.
+ DEC_TILES: dict[tuple[int, int], int] = {(4096, 4096): 2, (2048, 4096): 2, (8192, 1536): 2, (4096, 8192): 4,
+-                                         (4096, 1024): 2}
++                                         (4096, 1024): 2,
++                                         # full GLM-5.3 a rank at three (spark2, 1 and 4 rows: 15-28% faster)
++                                         (2624, 6144): 6, (5632, 2048): 6, (5376, 2048): 6, (6144, 5632): 6,
++                                         (6144, 5376): 6, (1536, 6144): 6, (4096, 2048): 6, (6144, 768): 5,
++                                         (1280, 6144): 7, (6144, 4096): 6}
+ _dec_env: tuple[str, dict] = ("", {})
+ 
+ 

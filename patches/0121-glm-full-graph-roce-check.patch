@@ -1,0 +1,16 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 328aa7c..36fe3ea 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -202,6 +202,11 @@ class Engine:
+         if g is not None:
+             self.replays[kind] += 1
+             g.replay()
++            # a RoCE wait that timed out inside a graph is reported here (eager gathers check themselves): the flags
++            # are host-mapped, so this sees an earlier window's failure without a sync
++            check = getattr(self.w.comm, "check", None)
++            if check is not None:
++                check()
+             return self.buf.logits[:R]
+         self.replays["eager"] += 1
+         return compute(self.w, self.st, self.buf, R, nch=chunks_for(self.st, R), host_pos=self.st.pos)

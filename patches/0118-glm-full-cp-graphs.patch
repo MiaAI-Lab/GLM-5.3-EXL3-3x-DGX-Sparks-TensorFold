@@ -1,0 +1,261 @@
+diff --git tensorfold/families/glm5_next/cuda/dcp.py tensorfold/families/glm5_next/cuda/dcp.py
+index b488edc..242b7b2 100644
+--- tensorfold/families/glm5_next/cuda/dcp.py
++++ tensorfold/families/glm5_next/cuda/dcp.py
+@@ -157,7 +157,8 @@ def score_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank: i
+ 
+ 
+ def select_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank: int, G: int, pos_dev: torch.Tensor,
+-                 R: int, *, k: int = TOPK, cols: int | None = None, out: torch.Tensor | None = None) -> torch.Tensor:
++                 R: int, *, k: int = TOPK, cols: int | None = None, out: torch.Tensor | None = None,
++                 buf: torch.Tensor | None = None) -> torch.Tensor:
+     """A rank's candidates for R rows at positions pos .. pos + R - 1 (``pos_dev``: device [1]): int64 [R, k] packed
+     keys (uint64 bits) of its min(k, visible) best local tokens, ascending position, 0 padded. ``cols``: the local
+     columns scored (default all of ``keys``' slots; a decode graph's bucket, ``local_cols``), at least the last row's
+@@ -173,7 +174,8 @@ def select_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank:
+     B = min(R, SELECT_ROWS)
+     if B == 0:
+         return cand
+-    buf = torch.empty((B * NT,), dtype=torch.float32, device=dev)
++    if buf is None or buf.numel() < B * NT:                 # ``buf``: a caller's scratch (captured windows)
++        buf = torch.empty((B * NT,), dtype=torch.float32, device=dev)
+     block, warps = (4096, 8) if NT > 1024 else (1024, 4)
+     for a in range(0, R, B):
+         n = min(B, R - a)
+@@ -272,7 +274,8 @@ def _merge_lse(PO, PM, PL, O, LSE, R, H: tl.constexpr, LW: tl.constexpr, NCH: tl
+ 
+ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Tensor, rope: torch.Tensor | None,
+                       slots: torch.Tensor, counts: torch.Tensor, scale: float, *, o: torch.Tensor | None = None,
+-                      lse: torch.Tensor | None = None, hb: int = latent.HB) -> tuple[torch.Tensor, torch.Tensor]:
++                      lse: torch.Tensor | None = None, hb: int = latent.HB,
++                      parts: tuple | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+     """A rank's partial latent attention: absorbed queries qa [R, H, 512] and rotary queries qp [R, H, 64] (bf16,
+     every head of the rows) over its own selected tokens (``select_merge``: local slots, counts) of its local
+     caches (latent: bf16 [slots, 512] or kv8 FP8 uint8 [slots, 528]; rotary keys rope [slots, 64] bf16) -> o
+@@ -292,9 +295,12 @@ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Te
+     lse = torch.empty((R, H), dtype=torch.float32, device=dev) if lse is None else lse
+     if R == 0:
+         return o, lse
+-    po = torch.empty((n * LW,), dtype=torch.float32, device=dev)
+-    pm = torch.empty((n,), dtype=torch.float32, device=dev)
+-    pl = torch.empty((n,), dtype=torch.float32, device=dev)
++    if parts is not None and parts[0].numel() >= n * LW:     # a caller's chunk partials (captured windows)
++        po, pm, pl = parts[0][:n * LW], parts[1][:n], parts[2][:n]
++    else:
++        po = torch.empty((n * LW,), dtype=torch.float32, device=dev)
++        pm = torch.empty((n,), dtype=torch.float32, device=dev)
++        pl = torch.empty((n,), dtype=torch.float32, device=dev)
+     vals, scl, rs, fp8 = latent._cache_parts(cache, LW)
+     QP, KR, ROPE = latent._rope_args(qp, rope, R, H)
+     latent._sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, slots, counts, po, pm, pl, R, W=W, H=H, LW=LW,
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index a86fe54..328aa7c 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -213,7 +213,7 @@ class Engine:
+         if self.w.cfg.full:
+             from .dsa_full import bucket
+ 
+-            return bucket(pos, R, keys.shape[0])
++            return bucket(pos, R, token_capacity(self.w, keys))
+         return pool_bucket(pos, R, keys.shape[0] - 2)
+ 
+     def mtp(self, next_tokens: Sequence[int], hidden: torch.Tensor) -> torch.Tensor:
+@@ -788,6 +788,14 @@ class DepthPolicy:
+         return max(1, min(self.most, 1 if self.rate < self.low else 2 if self.rate < self.high else 3))
+ 
+ 
++def token_capacity(w, keys: torch.Tensor) -> int:
++    """Full GLM-5.3: the token positions a cache's index-key plane covers (context parallelism: a rank's plane holds
++    every cp-th position and a spare row)."""
++
++    cp = int(w.meta.get("cp", 1))
++    return keys.shape[0] if cp == 1 else (keys.shape[0] - 1) * cp
++
++
+ def copy_room(copies, count: int, out: list[int]) -> int:
+     """Copy drafts a round may propose: the rows still wanted past the pending token (0 without copy drafts)."""
+ 
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index ddcf70e..6302462 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -792,10 +792,12 @@ class GlmEngine:
+ 
+             w.meta["cp"] = self.cp
+             w.meta["cp_heads"] = max(split_sizes(int(cfg.heads), world, 1))
+-            graphs = False                           # context parallelism: eager decode windows for now
++            if os.environ.get("TF_GLM_CP_GRAPHS", "1") == "0":
++                graphs = False                       # TF_GLM_CP_GRAPHS=0: eager decode windows
+             if rank == 0:
+                 print(f"[tensorfold] context parallelism: each of the {world} ranks keeps every {world}th token's "
+-                      "caches; eager decode windows, no kept prompt states", flush=True)
++                      f"caches; {'captured' if graphs else 'eager'} decode windows, no kept prompt states",
++                      flush=True)
+         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
+         self.comm.barrier()
+         self.w = w
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 3a3d367..904d0bd 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -911,13 +911,18 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+             dsa_full.index_q_rope(b.qi[:R], c.index_heads, pos_dev, freq)
+             if host_pos is not None:              # the visible local columns of the window's last row
+                 cols = max(1, dcp.visible_local(host_pos + R - 1, rank, G))
+-            else:                                 # a captured decode window's token bucket, a rank's share of it
++            elif sparse_np is not None:           # a captured decode window's token bucket, a rank's share of it
+                 cols = min(keys.shape[0], -(-int(sparse_np) // G) + 1)
++            else:                                 # a captured window within the dense limit: its local slots
++                cols = min(keys.shape[0], -(-int(c.dense_limit) // G) + 1)
++            sc = cp_scratch(w, b, keys) if not b.prefill else None
+             cand = dcp.select_local(b.qi[:R], b.ikr[:R, c.index_dim:], keys, rank, G, pos_dev, R, k=c.index_topk,
+-                                    cols=cols)
+-            every = torch.empty((G * R * c.index_topk,), dtype=torch.int64, device=cand.device)
++                                    cols=cols, out=sc.cand[:R] if sc else None, buf=sc.sel if sc else None)
++            every = (sc.every[:G * R * c.index_topk] if sc else
++                     torch.empty((G * R * c.index_topk,), dtype=torch.int64, device=cand.device))
+             w.comm.all_gather(cand.reshape(-1), every)
+-            b.topk = dcp.select_merge(every.view(G, R, c.index_topk), rank, G, c.index_topk)
++            b.topk = dcp.select_merge(every.view(G, R, c.index_topk), rank, G, c.index_topk,
++                                      slots=sc.slots[:R] if sc else None, counts=sc.counts[:R] if sc else None)
+     elif b.topk is None:
+         raise RuntimeError(f"layer {layer.index}: a shared indexer layer without a full layer's top-k before it")
+     s = b.lat_s
+@@ -928,34 +933,58 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+     tokens, counts = b.topk
+     HP = int(w.meta["cp_heads"])                      # heads a rank pads to (the largest share)
+     LW, RD = c.kv_lora, c.rope
++    sc = cp_scratch(w, b, keys if keys is not None else lc) if not b.prefill else None
+     with prof.timed("dsa: cp attention"):
+         step = CP_PROMPT_ROWS if b.prefill else R
+         for r0 in range(0, R, step):
+             r1 = min(R, r0 + step)
+             n = r1 - r0
+             # every rank's absorbed and rotary queries, heads padded to HP (zeros), in one gather a part
+-            mine = torch.zeros((n, HP, LW + RD), dtype=torch.bfloat16, device=qa.device)
++            mine = sc.mine[:n] if sc else torch.empty((n, HP, LW + RD), dtype=torch.bfloat16, device=qa.device)
++            mine.zero_()
+             mine[:, :HL, :LW] = qa[r0:r1]
+             mine[:, :HL, LW:] = qp[r0:r1]
+-            allq = torch.empty((G * n * HP * (LW + RD),), dtype=torch.bfloat16, device=qa.device)
++            allq = (sc.allq[:G * n * HP * (LW + RD)] if sc else
++                    torch.empty((G * n * HP * (LW + RD),), dtype=torch.bfloat16, device=qa.device))
+             w.comm.all_gather(mine.reshape(-1), allq)
+-            allq = allq.view(G, n, HP, LW + RD).permute(1, 0, 2, 3).reshape(n, G * HP, LW + RD)
+-            qa_all = allq[:, :, :LW].contiguous()
+-            qp_all = allq[:, :, LW:].contiguous()
+-            o, lse = dcp.attention_partial(qa_all, qp_all, lc, kr, tokens[r0:r1], counts[r0:r1], scale)
++            allq = allq.view(G, n, HP, LW + RD).permute(1, 0, 2, 3)
++            if sc:
++                qa_all, qp_all = sc.qa_all[:n], sc.qp_all[:n]
++                qa_all.view(n, G, HP, LW).copy_(allq[..., :LW])
++                qp_all.view(n, G, HP, RD).copy_(allq[..., LW:])
++            else:
++                allq = allq.reshape(n, G * HP, LW + RD)
++                qa_all = allq[:, :, :LW].contiguous()
++                qp_all = allq[:, :, LW:].contiguous()
++            o, lse = dcp.attention_partial(qa_all, qp_all, lc, kr, tokens[r0:r1], counts[r0:r1], scale,
++                                           o=sc.o[:n] if sc else None, lse=sc.lse[:n] if sc else None,
++                                           parts=sc.parts if sc else None)
+             # each head owner's partials of every rank, rank order (own slot copied); the normalized outputs travel
+             # as bf16 (every rank's alike, its own too: the merge does not depend on who owns the head), the
+             # log-sum-exps as fp32
+-            ob = o.to(torch.bfloat16)
+-            got_o = torch.empty((G, n, HP, LW), dtype=torch.bfloat16, device=qa.device)
+-            got_l = torch.empty((G, n, HP), dtype=torch.float32, device=qa.device)
+-            sends = {p: [ob[:, p * HP:(p + 1) * HP].contiguous(), lse[:, p * HP:(p + 1) * HP].contiguous()]
+-                     for p in range(G) if p != rank}
++            if sc:
++                ob = sc.ob[:n]
++                got_o = sc.got_o[:G * n * HP * LW].view(G, n, HP, LW)
++                got_l = sc.got_l[:G * n * HP].view(G, n, HP)
++                ob.copy_(o)
++                so = sc.send_o[:G * n * HP * LW].view(G, n, HP, LW)
++                sl = sc.send_l[:G * n * HP].view(G, n, HP)
++                so.copy_(ob.view(n, G, HP, LW).permute(1, 0, 2, 3))
++                sl.copy_(lse.view(n, G, HP).permute(1, 0, 2))
++                sends = {p: [so[p], sl[p]] for p in range(G) if p != rank}
++            else:
++                ob = o.to(torch.bfloat16)
++                got_o = torch.empty((G, n, HP, LW), dtype=torch.bfloat16, device=qa.device)
++                got_l = torch.empty((G, n, HP), dtype=torch.float32, device=qa.device)
++                sends = {p: [ob[:, p * HP:(p + 1) * HP].contiguous(), lse[:, p * HP:(p + 1) * HP].contiguous()]
++                         for p in range(G) if p != rank}
+             recvs = {p: [got_o[p], got_l[p]] for p in range(G) if p != rank}
+             got_o[rank].copy_(ob[:, rank * HP:(rank + 1) * HP])
+             got_l[rank].copy_(lse[:, rank * HP:(rank + 1) * HP])
+             w.comm.exchange_all(sends, recvs)
+-            merged = dcp.merge_ranks(got_o.float(), got_l)
++            merged = dcp.merge_ranks(got_o.float() if not sc else
++                                     sc.got_f[:G * n * HP * LW].view(G, n, HP, LW).copy_(got_o), got_l,
++                                     out=sc.merged[:n] if sc else None)
+             ol[r0:r1].copy_(merged[:, :HL])
+     with prof.timed("dsa: expand"):
+         o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
+@@ -964,6 +993,50 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+ 
+ 
+ CP_PROMPT_ROWS = 512       # context parallelism: a prompt chunk's rows a query gather / partials exchange takes
++
++
++class CpScratch:
++    """Context parallelism's per-window buffers for a decode buffer's rows (allocated once, before any capture, so
++    captured windows reuse them instead of each graph keeping its own): candidates, the gathered candidates, local
++    lists, selection scores, gathered queries, partials and their exchange."""
++
++    def __init__(self, w: Weights, rows: int, cols: int, dev) -> None:
++        from . import latent
++
++        c = w.cfg
++        G, HP, k = int(w.meta["cp"]), int(w.meta["cp_heads"]), c.index_topk
++        LW, RD, H = c.kv_lora, c.rope, int(w.meta["cp"]) * int(w.meta["cp_heads"])
++        f32, bf = torch.float32, torch.bfloat16
++        self.cand = torch.empty((rows, k), dtype=torch.int64, device=dev)
++        self.every = torch.empty((G * rows * k,), dtype=torch.int64, device=dev)
++        self.slots = torch.empty((rows, k), dtype=torch.int32, device=dev)
++        self.counts = torch.empty((rows,), dtype=torch.int32, device=dev)
++        self.sel = torch.empty((min(rows, 128) * cols,), dtype=f32, device=dev)
++        self.mine = torch.empty((rows, HP, LW + RD), dtype=bf, device=dev)
++        self.allq = torch.empty((G * rows * HP * (LW + RD),), dtype=bf, device=dev)
++        self.qa_all = torch.empty((rows, H, LW), dtype=bf, device=dev)
++        self.qp_all = torch.empty((rows, H, RD), dtype=bf, device=dev)
++        self.o = torch.empty((rows, H, LW), dtype=f32, device=dev)
++        self.lse = torch.empty((rows, H), dtype=f32, device=dev)
++        n = -(-k // latent.CHUNK) * rows * H
++        self.parts = (torch.empty((n * LW,), dtype=f32, device=dev), torch.empty((n,), dtype=f32, device=dev),
++                      torch.empty((n,), dtype=f32, device=dev))
++        self.ob = torch.empty((rows, H, LW), dtype=bf, device=dev)
++        self.send_o = torch.empty((G * rows * HP * LW,), dtype=bf, device=dev)
++        self.send_l = torch.empty((G * rows * HP,), dtype=f32, device=dev)
++        self.got_o = torch.empty((G * rows * HP * LW,), dtype=bf, device=dev)
++        self.got_l = torch.empty((G * rows * HP,), dtype=f32, device=dev)
++        self.got_f = torch.empty((G * rows * HP * LW,), dtype=f32, device=dev)
++        self.merged = torch.empty((rows, HP, LW), dtype=bf, device=dev)
++
++
++def cp_scratch(w: Weights, b: Buffers, keys: torch.Tensor) -> CpScratch:
++    """``b``'s CpScratch, made at its first window (an eager warm-up, never inside a capture)."""
++
++    sc = getattr(b, "cp_scratch", None)
++    if sc is None:
++        sc = b.cp_scratch = CpScratch(w, b.rows, keys.shape[0], b.x.device)
++    return sc
+ # TF_GLM_MSA (default 1): prompt chunks' sparse attention through Mia's sparse attention kernel (FP8 caches, <= 24
+ # heads a rank); 0: the chunk programs and their merge
+ PROMPT_MSA = os.environ.get("TF_GLM_MSA", "1") != "0"
+diff --git tensorfold/families/glm5_next/cuda/graphs.py tensorfold/families/glm5_next/cuda/graphs.py
+index 9934e88..306ff84 100644
+--- tensorfold/families/glm5_next/cuda/graphs.py
++++ tensorfold/families/glm5_next/cuda/graphs.py
+@@ -60,7 +60,9 @@ class Graphs:
+         if w.cfg.full:                   # full GLM-5.3: per-token keys, a bucket of token columns (dsa_full.bucket)
+             from .dsa_full import buckets
+ 
+-            sizes = buckets(st.index[0][2].shape[0])
++            from .decode import token_capacity
++
++            sizes = buckets(token_capacity(w, st.index[0][2]))
+         else:
+             sizes = pool_buckets(st.index[0][2].shape[0] - 2)
+         saved = list(st.cur)

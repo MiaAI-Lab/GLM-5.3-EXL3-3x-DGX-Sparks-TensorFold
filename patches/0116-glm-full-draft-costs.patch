@@ -1,0 +1,112 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 8dd2c94..ddcf70e 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -315,6 +315,11 @@ def mtp_round_costs(costs: dict, most: int) -> tuple[float, ...]:
+     return tuple(verify[k] + (costs["mtp"] + (k - 1) * costs["mtp_step"] if k else 0.0) for k in range(most + 1))
+ 
+ 
++# TF_GLM_CALIBRATION: how the startup verify costs a width are kept: "raw" (default: the measured fastest of 7, made
++# non-decreasing; the widths' real curve, e.g. a step at 3 rows) or "fit" (a median-slope line, as before)
++CALIBRATION = os.environ.get("TF_GLM_CALIBRATION", "raw").strip()
++
++
+ def round_costs(costs: dict) -> tuple[float, ...]:
+     """ms of a DFlash2 round of k drafts, k = 0 .. len(verify) - 1: the verify window of k + 1 rows, the block and a
+     kept row's context update, as draft_sim's Costs(verify, block, 0.0, taps_row).round_ms(k, 1, True)."""
+@@ -923,7 +928,7 @@ class GlmEngine:
+ 
+         # the verify windows the drafters' rounds use (MTP chains of 3, DFlash2 blocks of 5: the captured graphs);
+         # wider (copied) windows are not the choice's, and their eager launches would bend the fitted line
+-        widest = max(GRAPH_ROWS)
++        widest = max(GRAPH_ROWS + WIDE_GRAPHS)          # TF_GLM_WIDE_GRAPHS=9: a DSpark round's 8 drafts too
+         pieces: dict[str, tuple] = {f"v{r}": (lambda w=tokens(r): e.forward(w), None) for r in range(1, widest + 1)}
+         if self.w.mtp is not None:
+             pieces["m1"] = (lambda: draft(e, hidden[:1], one, st.pos + 1, 1, None), rewind)
+@@ -960,15 +965,38 @@ class GlmEngine:
+         got = torch.empty((self.world * mine.numel(),), dtype=torch.float32, device="cuda")
+         self.comm.all_gather(mine, got)
+         both = dict(zip(names, got.view(self.world, -1).max(dim=0).values.tolist()))
++        if os.environ.get("TF_GLM_PROFILE_VERIFY", "0") == "1":   # lab: where a verify window's width goes, eagerly
++            from . import prof
++            from .forward import chunks_for, compute, stage
++
++            for r in (1, 2, 3, 4, 8):
++                w_ = tokens(r)
++                for rep in range(3):
++                    prof.totals.clear()
++                    prof.active = rep == 2
++                    R = stage(e.w, e.st, e.buf, w_)
++                    compute(e.w, e.st, e.buf, R, nch=chunks_for(e.st, R), host_pos=e.st.pos)
++                    prof.active = False
++                    rewind()
++                if self.rank == 0:
++                    top = sorted(prof.totals.items(), key=lambda kv: -kv[1])[:12]
++                    print(f"[tensorfold] verify profile, {r} rows: " +
++                          ", ".join(f"{k} {v * 1e3:.2f}" for k, v in top) + " (ms, eager, synced)", flush=True)
++
+         e.reset()
+         if self.drafter is not None:
+             self.drafter.reset()
+         rows = list(range(2, widest + 1))
+         ys = [both[f"v{r}"] for r in rows]
+-        slope = statistics.median((ys[j] - ys[i]) / (rows[j] - rows[i]) for i in range(len(rows))
+-                                  for j in range(i + 1, len(rows)))
+-        base = statistics.median(y - slope * r for r, y in zip(rows, ys))
+-        verify = [both["v1"]] + [base + slope * r for r in rows]
++        if CALIBRATION == "fit":                         # the median-slope line through 2 .. widest rows (as before)
++            slope = statistics.median((ys[j] - ys[i]) / (rows[j] - rows[i]) for i in range(len(rows))
++                                      for j in range(i + 1, len(rows)))
++            base = statistics.median(y - slope * r for r, y in zip(rows, ys))
++            verify = [both["v1"]] + [base + slope * r for r in rows]
++        else:                                            # the measured widths, made non-decreasing (fastest of 7 each)
++            verify = [both["v1"]]
++            for y in ys:
++                verify.append(max(verify[-1], y))
+         mtp = both.get("m1", 0.0)
+         return {"verify": verify, "mtp": mtp, "mtp_step": max((both.get("m3", 0.0) - mtp) / 2, 0.0),
+                 "mtp_row": max((both.get("m6", 0.0) - mtp) / 5, 0.0), "block": both.get("block", 0.0),
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 23939cf..3a3d367 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -943,16 +943,19 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+             qa_all = allq[:, :, :LW].contiguous()
+             qp_all = allq[:, :, LW:].contiguous()
+             o, lse = dcp.attention_partial(qa_all, qp_all, lc, kr, tokens[r0:r1], counts[r0:r1], scale)
+-            # each head owner's partials of every rank, rank order (own slot copied)
+-            got_o = torch.empty((G, n, HP, LW), dtype=torch.float32, device=qa.device)
++            # each head owner's partials of every rank, rank order (own slot copied); the normalized outputs travel
++            # as bf16 (every rank's alike, its own too: the merge does not depend on who owns the head), the
++            # log-sum-exps as fp32
++            ob = o.to(torch.bfloat16)
++            got_o = torch.empty((G, n, HP, LW), dtype=torch.bfloat16, device=qa.device)
+             got_l = torch.empty((G, n, HP), dtype=torch.float32, device=qa.device)
+-            sends = {p: [o[:, p * HP:(p + 1) * HP].contiguous(), lse[:, p * HP:(p + 1) * HP].contiguous()]
++            sends = {p: [ob[:, p * HP:(p + 1) * HP].contiguous(), lse[:, p * HP:(p + 1) * HP].contiguous()]
+                      for p in range(G) if p != rank}
+             recvs = {p: [got_o[p], got_l[p]] for p in range(G) if p != rank}
+-            got_o[rank].copy_(o[:, rank * HP:(rank + 1) * HP])
++            got_o[rank].copy_(ob[:, rank * HP:(rank + 1) * HP])
+             got_l[rank].copy_(lse[:, rank * HP:(rank + 1) * HP])
+             w.comm.exchange_all(sends, recvs)
+-            merged = dcp.merge_ranks(got_o, got_l)
++            merged = dcp.merge_ranks(got_o.float(), got_l)
+             ol[r0:r1].copy_(merged[:, :HL])
+     with prof.timed("dsa: expand"):
+         o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+index 34286b5..de91a11 100644
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -699,7 +699,9 @@ def chunk_stages(cache: torch.Tensor | None = None) -> int:
+     loads only, the same bits (1: none, as before; 4 does not fit in shared memory). An FP4 cache's tiles (codes and
+     block scales gathered, then expanded) take at most 2: 3 needs 106,880 bytes, past GB10's 101,376."""
+     stages = int(__import__("os").environ.get("TF_GLM_LATENT_STAGES", "3"))
+-    return min(stages, 2) if cache is not None and kv8.fp4(cache) else stages
++    if cache is not None and (kv8.fp4(cache) or not kv8.quantized(cache)):
++        return min(stages, 2)            # FP4 tiles, and bf16 ones (3 stages of 32-head tiles: 112,640 bytes)
++    return stages
+ 
+ 
+ class LatentScratch:

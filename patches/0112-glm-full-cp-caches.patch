@@ -1,0 +1,190 @@
+diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
+index 643b7c1..cf05261 100644
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -403,12 +403,29 @@ def full_transient_bytes(t: dict, rows: int, capacity: int, *, prefill: bool, sh
+     return scores + lists + partials
+ 
+ 
++def full_cp_bytes(t: dict, rows: int, cp: int, *, prefill: bool, share) -> int:
++    """Context parallelism (TF_GLM_CP, ``cp`` ranks each holding every cp-th token): a window's exchange buffers on a
++    rank: the candidates of every rank [cp, rows, topk] int64, every rank's absorbed queries of every head [rows,
++    heads, 512 + 64] bf16 and the partial outputs and log-sum-exps [cp, rows, heads, 512 + 1] fp32 (a prompt chunk's
++    in blocks of CP_PROMPT_ROWS rows)."""
++    if cp <= 1:
++        return 0
++    heads = int(t["num_attention_heads"])
++    lw, rope, topk = int(t["kv_lora_rank"]), int(t["qk_rope_head_dim"]), int(t.get("index_topk", 2048))
++    r = min(rows, CP_PROMPT_ROWS) if prefill else rows
++    return cp * rows * topk * 8 + r * heads * (lw + rope) * 2 + cp * r * heads * (lw + 1) * 4
++
++
++CP_PROMPT_ROWS = 512        # context parallelism: a prompt chunk's rows a sparse attention exchange takes
++
++
+ def mla_full_geometry(t: dict, world: int, reserve: int, *, share, decode_rows: int, mtp_rows: int,
+                       prefill_rows: int, kv: str = "bf16", mtp: bool = True, prompt_split_k: bool = False,
+-                      minimum_slots: int = 2560) -> Geometry:
++                      minimum_slots: int = 2560, cp: int = 1) -> Geometry:
+     """Full GLM-5.3's caches and buffers on a rank at a capacity of cache slots: the decode window's buffers (and the
+     MTP head's), the prompt chunk's, the per-token caches (``full_token_bytes``), and the largest transient
+-    selection and attention scratch of either kind of window."""
++    selection and attention scratch of either kind of window. ``cp`` > 1 (context parallelism): a rank keeps
++    ceil(capacity / cp) + 1 token rows and scores only those, plus the exchange buffers (``full_cp_bytes``)."""
+ 
+     def bytes_at(capacity: int) -> int:
+         b = full_buffer_bytes(t, decode_rows, world=world, share=share, capacity=capacity, prefill=False,
+@@ -418,9 +435,12 @@ def mla_full_geometry(t: dict, world: int, reserve: int, *, share, decode_rows:
+                                    prompt_split_k=prompt_split_k)
+         b += full_buffer_bytes(t, prefill_rows, world=world, share=share, capacity=capacity, prefill=True,
+                                prompt_split_k=prompt_split_k)
+-        b += max(full_transient_bytes(t, prefill_rows, capacity, prefill=True, share=share),
+-                 full_transient_bytes(t, decode_rows, capacity, prefill=False, share=share))
+-        return b + capacity * full_token_bytes(t, kv, mtp)
++        local = -(-capacity // cp) + (1 if cp > 1 else 0)
++        b += max(full_transient_bytes(t, prefill_rows, local, prefill=True, share=share)
++                 + full_cp_bytes(t, prefill_rows, cp, prefill=True, share=share),
++                 full_transient_bytes(t, decode_rows, local, prefill=False, share=share)
++                 + full_cp_bytes(t, decode_rows, cp, prefill=False, share=share))
++        return b + local * full_token_bytes(t, kv, mtp)
+     return Geometry(bytes_at, reserve, minimum_slots)
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/dsa_full.py tensorfold/families/glm5_next/cuda/dsa_full.py
+index 051aa07..be2ee38 100644
+--- tensorfold/families/glm5_next/cuda/dsa_full.py
++++ tensorfold/families/glm5_next/cuda/dsa_full.py
+@@ -102,9 +102,11 @@ def index_q_rope(qi: torch.Tensor, heads: int, pos: torch.Tensor, freq: torch.Te
+ 
+ 
+ @triton.jit
+-def _k_rope_write(K, k_stride, KR, POS, BASE, FREQ, HALF: tl.constexpr, SEG: tl.constexpr):
++def _k_rope_write(K, k_stride, KR, POS, BASE, FREQ, RANK, HALF: tl.constexpr, SEG: tl.constexpr,
++                  CP: tl.constexpr = 1):
+     """Row r: its rotary key K[r, :2 HALF] (interleaved pairs) rotated at its position -> cache row (half-split).
+-    SEG: position and extent base per row (POS[r], BASE[r]); else pos + r from POS[0]."""
++    SEG: position and extent base per row (POS[r], BASE[r]); else pos + r from POS[0]. CP > 1 (not with SEG): only
++    positions p with p % CP == RANK, at row p // CP."""
+     r = tl.program_id(0)
+     if SEG:
+         pos = tl.load(POS + r)
+@@ -112,6 +114,10 @@ def _k_rope_write(K, k_stride, KR, POS, BASE, FREQ, HALF: tl.constexpr, SEG: tl.
+     else:
+         pos = tl.load(POS) + r
+         row = pos.to(tl.int64)
++        if CP > 1:
++            if row % CP != RANK:
++                return
++            row = row // CP
+     i = tl.arange(0, HALF)
+     xe = tl.load(K + r * k_stride + 2 * i).to(tl.float32)
+     xo = tl.load(K + r * k_stride + 2 * i + 1).to(tl.float32)
+@@ -120,23 +126,32 @@ def _k_rope_write(K, k_stride, KR, POS, BASE, FREQ, HALF: tl.constexpr, SEG: tl.
+     tl.store(KR + row * (2 * HALF) + HALF + i, b.to(tl.bfloat16))
+ 
+ 
+-def k_rope_write(k: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, freq: torch.Tensor) -> None:
++def k_rope_write(k: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, freq: torch.Tensor, cp: int = 1,
++                 rank: int = 0) -> None:
+     """k [R, rope] bf16 rows (any row stride): each row's rotary key, rotated at pos + r, into cache [slots, rope]
+-    (bf16) row pos + r."""
++    (bf16) row pos + r (``cp`` > 1: this rank's positions only, at row p // cp)."""
+ 
+     half = freq.numel()
+     if k.shape[1] < 2 * half or k.stride(1) != 1 or cache.dtype != torch.bfloat16 or cache.shape[1] != 2 * half:
+         raise ValueError(f"k_rope_write: rows of {k.shape[1]} into a cache of {tuple(cache.shape)}")
+     if k.shape[0]:
+-        _k_rope_write[(k.shape[0],)](k, k.stride(0), cache, pos, pos, freq, HALF=half, SEG=False, num_warps=1)
++        _k_rope_write[(k.shape[0],)](k, k.stride(0), cache, pos, pos, freq, int(rank), HALF=half, SEG=False,
++                                     CP=int(cp), num_warps=1)
+ 
+ 
+ @triton.jit
+-def _index_write(KR, k_stride, LNW, LNB, IK, POS, FREQ, eps, D: tl.constexpr, HALF: tl.constexpr):
++def _index_write(KR, k_stride, LNW, LNB, IK, POS, FREQ, eps, RANK, D: tl.constexpr, HALF: tl.constexpr,
++                 CP: tl.constexpr = 1):
+     """Row r: LayerNorm(k_raw[r, :D]) (fp32 statistics, weight and bias), rounded to bf16 as the bf16 LayerNorm
+-    returns it, then RoPE on its first 2 HALF dims at position pos + r -> IK[pos + r] (bf16)."""
++    returns it, then RoPE on its first 2 HALF dims at position pos + r -> IK[pos + r] (bf16). CP > 1: only
++    positions p with p % CP == RANK, at row p // CP."""
+     r = tl.program_id(0)
+     pos = tl.load(POS) + r
++    slot = pos.to(tl.int64)
++    if CP > 1:
++        if slot % CP != RANK:
++            return
++        slot = slot // CP
+     src = KR + r * k_stride
+     d = tl.arange(0, D)
+     x = tl.load(src + d).to(tl.float32)
+@@ -144,7 +159,7 @@ def _index_write(KR, k_stride, LNW, LNB, IK, POS, FREQ, eps, D: tl.constexpr, HA
+     xc = x - mean
+     rstd = 1.0 / tl.sqrt(tl.sum(xc * xc, axis=0) / D + eps)
+     y = xc * rstd * tl.load(LNW + d).to(tl.float32) + tl.load(LNB + d).to(tl.float32)
+-    row = IK + pos.to(tl.int64) * D
++    row = IK + slot * D
+     tl.store(row + d, y.to(tl.bfloat16), mask=d >= 2 * HALF)           # the dims past the rotary ones
+     i = tl.arange(0, HALF)
+     e, o = 2 * i, 2 * i + 1
+@@ -156,7 +171,7 @@ def _index_write(KR, k_stride, LNW, LNB, IK, POS, FREQ, eps, D: tl.constexpr, HA
+ 
+ 
+ def index_write(k_raw: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor, keys: torch.Tensor, pos: torch.Tensor,
+-                freq: torch.Tensor, eps: float = 1e-6) -> None:
++                freq: torch.Tensor, eps: float = 1e-6, cp: int = 1, rank: int = 0) -> None:
+     """Window rows' index keys: k_raw [R, >= D] (wk's output, any row stride) -> LayerNorm -> RoPE on the first
+     rotary dims -> keys [slots, D] bf16 rows pos .. pos + R - 1."""
+ 
+@@ -164,8 +179,8 @@ def index_write(k_raw: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor, key
+     if keys.dtype != torch.bfloat16 or not keys.is_contiguous() or k_raw.stride(1) != 1 or k_raw.shape[1] < D:
+         raise ValueError("index_write: bf16 key rows, contiguous")
+     if k_raw.shape[0]:
+-        _index_write[(k_raw.shape[0],)](k_raw, k_raw.stride(0), ln_w, ln_b, keys, pos, freq, float(eps), D=D,
+-                                        HALF=freq.numel(), num_warps=1)
++        _index_write[(k_raw.shape[0],)](k_raw, k_raw.stride(0), ln_w, ln_b, keys, pos, freq, float(eps), int(rank),
++                                        D=D, HALF=freq.numel(), CP=int(cp), num_warps=1)
+ 
+ 
+ @triton.jit
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+index ddcb177..2e87fbc 100644
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -389,22 +389,30 @@ def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor, *, prompt: bool = False)
+ # ------------------------------------------------------------------------------------------------ caches ---
+ 
+ @triton.jit
+-def _lat_write(LAT, lat_stride, LC, LS, POS, LW: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr):
++def _lat_write(LAT, lat_stride, LC, LS, POS, RANK, LW: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr,
++               CP: tl.constexpr = 1):
+     """Row r -> cache slot pos + r: the bf16 row as it is, or (FP8) its codes and scale (kv8.store_row, a function
+-    of the row alone: prompt chunks and decode windows store the same bytes)."""
++    of the row alone: prompt chunks and decode windows store the same bytes). CP > 1 (context parallelism): only
++    positions p with p % CP == RANK, at slot p // CP."""
+     r = tl.program_id(0)
+-    P = tl.load(POS).to(tl.int64)
++    P = tl.load(POS).to(tl.int64) + r
++    if CP > 1:
++        if P % CP != RANK:
++            return
++        P = P // CP
+     k = tl.arange(0, LW)
+-    kv8.store_row(LC, LS, P + r, tl.load(LAT + r * lat_stride + k).to(tl.float32), LW, RS, FP8)
++    kv8.store_row(LC, LS, P, tl.load(LAT + r * lat_stride + k).to(tl.float32), LW, RS, FP8)
+ 
+ 
+-def latent_write(lat: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor) -> None:
++def latent_write(lat: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, cp: int = 1, rank: int = 0) -> None:
+     """lat [R, latent] bf16 rows into cache slots pos .. pos + R - 1 (pos read on the device); an FP8 cache
+-    (TF_GLM_KV=fp8) takes each row's e4m3 codes and power-of-two scale."""
++    (TF_GLM_KV=fp8) takes each row's e4m3 codes and power-of-two scale. ``cp`` > 1: this rank's positions only
++    (p % cp == rank, at slot p // cp)."""
+     vals, scl, rs, fp8 = kv8.parts(cache)
+     if lat.shape[1] != kv8.width(cache):
+         raise ValueError(f"latent_write: rows of {lat.shape[1]} into a cache of {kv8.width(cache)}")
+-    _lat_write[(lat.shape[0],)](lat, lat.stride(0), vals, scl, pos, LW=lat.shape[1], RS=rs, FP8=fp8, num_warps=4)
++    _lat_write[(lat.shape[0],)](lat, lat.stride(0), vals, scl, pos, int(rank), LW=lat.shape[1], RS=rs, FP8=fp8,
++                                CP=int(cp), num_warps=4)
+ 
+ 
+ # --------------------------------------------------------------------------------------------- attention ---

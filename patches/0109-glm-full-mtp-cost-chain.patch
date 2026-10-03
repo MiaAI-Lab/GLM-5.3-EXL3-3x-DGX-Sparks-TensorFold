@@ -1,0 +1,134 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 7b26d7e..6056e21 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -285,23 +285,38 @@ def absorb(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int]) -> torch
+ 
+ 
+ def draft(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int], position: int, count: int,
+-          sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
+-    """Absorb kept positions and chain drafts until cumulative confidence fails, always keeping the first draft."""
++          sampling: Sampling | None, confidence: float = 0.0, round_ms: Sequence[float] | None = None) -> list[int]:
++    """Absorb kept positions and chain drafts until cumulative confidence fails, always keeping the first draft.
++
++    ``round_ms`` (ms of a round of k drafts, k = 0 ..; ``mtp_round_costs``): the chain grows while the round's
++    expected tokens a ms grow, E(k) = 1 + sum over i <= k of the product of the first i drafts' confidences; it stops
++    before an MTP step that could not raise it even at confidence 1. Drafts only propose: replies are unchanged."""
+ 
+     st = e.st
+     logits = absorb(e, hidden, next_tokens)
+     drafts: list[int] = []
+     n = len(next_tokens)
+     chain = 1.0
++    cost = round_ms is not None and len(round_ms) > 1
++    count = min(count, len(round_ms) - 1) if cost else count
++    expect, best = 1.0, 0.0
+     for j in range(count):
+         probs: list[float] = []
+-        d = e.sample(logits[:1], [position + j], sampling, draft=True, probs=probs if confidence > 0 else None)[0]
++        want = confidence > 0 or cost
++        d = e.sample(logits[:1], [position + j], sampling, draft=True, probs=probs if want else None)[0]
+         if confidence > 0 and j > 0 and chain * probs[0] < confidence:
+             break
++        if cost:
++            rate = (expect + chain * probs[0]) / round_ms[j + 1]
++            if j > 0 and rate <= best:
++                break
++            expect, best = expect + chain * probs[0], max(best, rate)
+         drafts.append(d)
+-        if confidence > 0:
++        if confidence > 0 or cost:
+             chain *= probs[0]
+-            if chain < confidence:            # a further draft could not pass either: skip its MTP step
++            if confidence > 0 and chain < confidence:    # a further draft could not pass either: skip its MTP step
++                break
++            if cost and (j + 2 >= len(round_ms) or (expect + chain) / round_ms[j + 2] <= best):
+                 break
+         if j + 1 < count:
+             prev = e.draft_hidden(n - 1 if j == 0 else 0)
+@@ -741,8 +756,10 @@ class DepthPolicy:
+     where E[tokens] / ms is largest instead. MTP chains ignore ``beta`` and ``round_ms``."""
+ 
+     def __init__(self, most: int = 3, fixed: bool = False, low: float = 0.8, high: float = 0.9,
+-                 confidence: float = 0.0, beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> None:
++                 confidence: float = 0.0, beta: float = 0.0, round_ms: tuple[float, ...] | None = None,
++                 mtp_ms: tuple[float, ...] | None = None) -> None:
+         self.most, self.fixed, self.low, self.high = most, fixed, low, high
++        self.mtp_ms = mtp_ms              # MTP chains: ms of a round of k drafts (``draft``'s cost rule)
+         self.confidence = confidence
+         self.beta, self.round_ms = beta, round_ms
+         self.rate = 0.8
+@@ -790,7 +807,8 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+         drafts = copied
+     else:
+         depth = min(policy.next(0, 0), count - len(out))
+-        drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
++        drafts = (draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence, policy.mtp_ms)
++                  if depth > 0 else [])
+     stages["draft"] += time.perf_counter() - t0
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+         tokens = e.verify_window([out[-1]] + drafts)
+@@ -836,7 +854,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
+         else:                               # a copied round's acceptance does not move the MTP depth
+             depth = min(policy.next(*((0, 0) if was_copy else (len(drafts), keep - 1))), count - len(out))
+             drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
+-                            policy.confidence) if depth > 0 else [])
++                            policy.confidence, policy.mtp_ms) if depth > 0 else [])
+         stages["draft"] += time.perf_counter() - t4
+     late.flush()
+     _sync(w)
+diff --git tensorfold/families/glm5_next/cuda/drafter_choice.py tensorfold/families/glm5_next/cuda/drafter_choice.py
+index 01ad045..707b284 100644
+--- tensorfold/families/glm5_next/cuda/drafter_choice.py
++++ tensorfold/families/glm5_next/cuda/drafter_choice.py
+@@ -105,7 +105,8 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
+         elif arm == "m":
+             backlog = len(m_next)
+             depth = max(1, min(m_policy.next(*last["m"]), room))
+-            drafts = draft(e, m_rows[:backlog], m_next, st.pos + 1, depth, sampling, m_policy.confidence)
++            drafts = draft(e, m_rows[:backlog], m_next, st.pos + 1, depth, sampling, m_policy.confidence,
++                           m_policy.mtp_ms)
+             steps = 1 + st.mtp_drafted
+             m_next = []
+         else:
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index e51fe0d..7cfd3b2 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -297,6 +297,24 @@ def decode_policy(code: list[int], costs: dict | None = None):
+     return DepthPolicy(min(most, MAX_ROWS - 1), fixed=True) if kind == 1 else None
+ 
+ 
++# TF_GLM_MTP_CHAIN: the automatic policy's MTP chains: "fixed" (3 drafts; greedy cut at confidence 0.35, sampled by
++# running acceptance) or "cost" (up to TF_GLM_MTP_COST_MOST drafts, each kept while the round's expected tokens a ms
++# grow, by the startup cost table; ``decode.draft``)
++MTP_CHAIN = os.environ.get("TF_GLM_MTP_CHAIN", "fixed").strip()
++if MTP_CHAIN not in ("fixed", "cost"):
++    raise ValueError(f"TF_GLM_MTP_CHAIN: fixed or cost, not {MTP_CHAIN!r}")
++MTP_COST_MOST = int(os.environ.get("TF_GLM_MTP_COST_MOST", "7"))
++
++
++def mtp_round_costs(costs: dict, most: int) -> tuple[float, ...]:
++    """ms of an MTP round of k drafts, k = 0 .. most: the verify window of k + 1 rows, the first MTP step (with the
++    kept rows' absorb) and k - 1 chained steps."""
++
++    verify = costs["verify"]
++    most = min(most, len(verify) - 1)
++    return tuple(verify[k] + (costs["mtp"] + (k - 1) * costs["mtp_step"] if k else 0.0) for k in range(most + 1))
++
++
+ def round_costs(costs: dict) -> tuple[float, ...]:
+     """ms of a DFlash2 round of k drafts, k = 0 .. len(verify) - 1: the verify window of k + 1 rows, the block and a
+     kept row's context update, as draft_sim's Costs(verify, block, 0.0, taps_row).round_ms(k, 1, True)."""
+@@ -1150,7 +1168,10 @@ class GlmEngine:
+                 stats["draft_dump"] = res.dump_path
+         elif auto:
+             greedy = sampling is None or sampling.temperature <= 0
+-            m_policy = DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
++            if MTP_CHAIN == "cost" and self.costs is not None:     # up to MTP_COST_MOST drafts, cut by E[tokens] / ms
++                m_policy = DepthPolicy(MTP_COST_MOST, fixed=True, mtp_ms=mtp_round_costs(self.costs, MTP_COST_MOST))
++            else:
++                m_policy = DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
+             _, explore, every, margin, sampled_too = policy
+             choice = None
+             if drafter is not None and (greedy or sampled_too):

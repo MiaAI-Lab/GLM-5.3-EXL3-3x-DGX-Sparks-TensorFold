@@ -1,0 +1,536 @@
+diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
+index cf05261..7082dab 100644
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -230,10 +230,12 @@ def _indexed_prefill_row(t: dict, world: int, h: int, hk: int, hd: int, nv: int,
+ 
+ 
+ def mla_row_bytes(width: int, kv: str = "bf16") -> int:
+-    """A GLM DSA cache row of ``width`` values: bf16, or TF_GLM_KV=fp8's e4m3 codes, fp32 scale and 12 pad bytes
+-    (families/glm5_next/cuda/kv8.py)."""
+-    if kv not in ("bf16", "fp8"):
+-        raise ValueError(f"a GLM DSA cache is bf16 or fp8, not {kv!r}")
++    """A GLM DSA cache row of ``width`` values: bf16, TF_GLM_KV=fp8's e4m3 codes, fp32 scale and 12 pad bytes, or
++    fp4's e2m1 codes, an e4m3 scale a block of 16 and the fp32 scale (families/glm5_next/cuda/kv8.py)."""
++    if kv not in ("bf16", "fp8", "fp4"):
++        raise ValueError(f"a GLM DSA cache is bf16, fp8 or fp4, not {kv!r}")
++    if kv == "fp4":
++        return -(-(width // 2 + width // 16 + 4) // 16) * 16
+     return width + 16 if kv == "fp8" else 2 * width
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/dcp.py tensorfold/families/glm5_next/cuda/dcp.py
+index 22c5f42..b488edc 100644
+--- tensorfold/families/glm5_next/cuda/dcp.py
++++ tensorfold/families/glm5_next/cuda/dcp.py
+@@ -30,7 +30,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from . import latent
++from . import kv8, latent
+ from .dsa_full import BT, MIN_BUCKET, ROW_G, SELECT_ROWS, TOPK, _order_key, _wscale
+ 
+ WORLD = 3            # ranks a context-parallel cache is spread over by default
+@@ -298,9 +298,10 @@ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Te
+     vals, scl, rs, fp8 = latent._cache_parts(cache, LW)
+     QP, KR, ROPE = latent._rope_args(qp, rope, R, H)
+     latent._sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, slots, counts, po, pm, pl, R, W=W, H=H, LW=LW,
+-                                                        CH=latent.CHUNK, SCALE=scale, HBT=hb, KTT=latent.KT, RS=rs,
+-                                                        FP8=fp8, QP=QP, KR=KR, ROPE=ROPE, num_warps=8,
+-                                                        num_stages=latent.chunk_stages())
++                                                        CH=latent.CHUNK, SCALE=scale, HBT=hb, KTT=latent.key_tile(cache), RS=rs,
++                                                        FP8=fp8, QP=QP, KR=KR, ROPE=ROPE, FP4=int(kv8.fp4(cache)),
++                                                        num_warps=8,
++                                                        num_stages=latent.chunk_stages(cache))
+     _merge_lse[(R, H)](po, pm, pl, o, lse, R, H=H, LW=LW, NCH=nch, num_warps=4)
+     return o, lse
+ 
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index f02c7bd..8dd2c94 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -592,6 +592,8 @@ class GlmEngine:
+         from .kv8 import KINDS as KV_KINDS, kv_kind
+ 
+         kv = kv_kind()
++        if kv == "fp4" and not cfg.full:
++            raise ValueError("TF_GLM_KV=fp4 is full GLM-5.3's (its latent cache); GLM-5.3-Flash takes bf16 or fp8")
+         if kv != "bf16" and not LATENT:
+             raise ValueError("TF_GLM_KV=fp8 holds the latent cache: it needs TF_GLM_LATENT=1")
+         self.kv = kv
+diff --git tensorfold/families/glm5_next/cuda/kv8.py tensorfold/families/glm5_next/cuda/kv8.py
+index ed7bf56..ff3f74f 100644
+--- tensorfold/families/glm5_next/cuda/kv8.py
++++ tensorfold/families/glm5_next/cuda/kv8.py
+@@ -13,7 +13,15 @@ saved rows, ``row_bytes``) as it is. The scale is 2^(ceil(log2 amax) - SHIFT): t
+ the scale, so a per-row power of two loses nothing to a finer or fp32 scale but the values it pushes below e4m3's
+ normal range (2^-6), under 2^-14 of the row's largest (DeepSeek-V3.2's indexer keeps FP8 keys with per-token ue8m0
+ scales alike). On GLM-5.3-Flash's own kv_a / kv_a_layernorm rows (amax ~3-5x the rms) per-token fp32, per-128-block
+-and fixed per-layer scales all land within 0.001 of this one's 2.65% relative error a row. bf16 caches stay as they were (a bf16 tensor [rows, width]); every kernel tells the two by dtype."""
++and fixed per-layer scales all land within 0.001 of this one's 2.65% relative error a row. bf16 caches stay as they were (a bf16 tensor [rows, width]); every kernel tells the two by dtype.
++
++TF_GLM_KV=fp4 (full GLM-5.3's latent only; Mia's AI Lab): an int8 tensor [rows, width / 2 + width / 16 + 16]: the
++row's e2m1 codes (two a byte, the even value in the low nibble), an e4m3 scale a block of 16 values, the row's fp32
++power-of-two scale (as FP8's: 2^(ceil(log2 amax) - SHIFT)), zeros. A block's scale is its amax / 6 over the row scale,
++rounded to e4m3; its values round to the nearest e2m1 (0, 0.5, 1, 1.5, 2, 3, 4, 6, signed) of the value over the two
++scales. A code times its block scale is exact in bf16, so the readers dequantize to bf16 and fold the row's power of
++two into their fp32 products as with FP8. Lossier than FP8 (about 9 bits a value against 8 + 1 / 32): a quality
++question for the owner, measured before it is used."""
+ 
+ from __future__ import annotations
+ 
+@@ -23,8 +31,9 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-KINDS = ("bf16", "fp8")
++KINDS = ("bf16", "fp8", "fp4")
+ PAD = 16             # bytes after an FP8 row's codes: its fp32 scale, then zeros
++BLOCK4 = 16          # FP4 (TF_GLM_KV=fp4): values sharing an e4m3 block scale
+ SHIFT = 8            # a row's scale: 2^(ceil(log2 amax) - SHIFT), so its codes stay within +-256
+ 
+ 
+@@ -41,7 +50,9 @@ def kv_kind(env=None) -> str:
+ def row_bytes(width: int, kind: str) -> int:
+     """Bytes a cache row of ``width`` values takes."""
+     if kind not in KINDS:
+-        raise ValueError(f"a cache is bf16 or fp8, not {kind!r}")
++        raise ValueError(f"a cache is bf16, fp8 or fp4, not {kind!r}")
++    if kind == "fp4":                    # codes, block scales, the fp32 row scale, zeros to a multiple of 16 bytes
++        return -(-(width // 2 + width // BLOCK4 + 4) // 16) * 16
+     return width + PAD if kind == "fp8" else 2 * width
+ 
+ 
+@@ -51,19 +62,32 @@ def zeros(rows: int, width: int, kind: str, device) -> torch.Tensor:
+         if width % 4:
+             raise ValueError(f"an FP8 cache row needs a width divisible by 4, not {width}")
+         return torch.zeros((rows, width + PAD), dtype=torch.uint8, device=device)
++    if kind == "fp4":                    # int8 marks an FP4 cache (uint8: FP8); the bytes are read as uint8
++        if width % (4 * BLOCK4):
++            raise ValueError(f"an FP4 cache row needs a width divisible by {4 * BLOCK4}, not {width}")
++        return torch.zeros((rows, row_bytes(width, "fp4")), dtype=torch.int8, device=device)
+     return torch.zeros((rows, row_bytes(width, kind) // 2), dtype=torch.bfloat16, device=device)
+ 
+ 
+ def quantized(cache: torch.Tensor) -> bool:
+-    return cache.dtype == torch.uint8
++    return cache.dtype in (torch.uint8, torch.int8)
++
++
++def fp4(cache: torch.Tensor) -> bool:
++    return cache.dtype == torch.int8
+ 
+ 
+ def kind_of(cache: torch.Tensor) -> str:
+-    return "fp8" if quantized(cache) else "bf16"
++    return "fp4" if fp4(cache) else "fp8" if quantized(cache) else "bf16"
+ 
+ 
+ def width(cache: torch.Tensor) -> int:
+     """Values a row of ``cache`` holds."""
++    if fp4(cache):                       # the widest multiple of 64 whose FP4 row takes these bytes
++        w = (cache.shape[-1] * 16 // 9) // 64 * 64
++        while w and row_bytes(w, "fp4") != cache.shape[-1]:
++            w -= 64
++        return w
+     return cache.shape[-1] - PAD if quantized(cache) else cache.shape[-1]
+ 
+ 
+@@ -73,7 +97,9 @@ def parts(cache: torch.Tensor):
+     if not quantized(cache):
+         return cache, cache, cache.shape[-1], False
+     if cache.stride(-1) != 1 or cache.shape[-1] % 16:
+-        raise ValueError("an FP8 cache: contiguous rows of width + 16 bytes")
++        raise ValueError("an FP8 / FP4 cache: contiguous rows of a multiple of 16 bytes")
++    if fp4(cache):                       # the bytes (codes, block scales); the row scale through the fp32 view
++        return cache.view(torch.uint8), cache.view(torch.float32), cache.shape[-1], True
+     return cache.view(torch.float8_e4m3fn), cache.view(torch.float32), cache.shape[-1], True
+ 
+ 
+@@ -135,3 +161,96 @@ def store_row(VALS, SCL, row, x, LW: tl.constexpr, RS: tl.constexpr, FP8: tl.con
+ def row_scales(SCL, rows, ok, LW: tl.constexpr, RS: tl.constexpr):
+     """The scales of cache rows ``rows`` (int64 [N]; 1 where not ok)."""
+     return tl.load(SCL + rows * (RS // 4) + LW // 4, mask=ok, other=1.0)
++
++
++# -- FP4 (TF_GLM_KV=fp4) ----------------------------------------------------------------------------------------------
++E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
++
++
++def _e2m1_codes(y: torch.Tensor) -> torch.Tensor:
++    """fp32 values (already divided by their scales) -> e2m1 codes (sign in bit 3), round to nearest (thresholds at
++    the midpoints, a tie going up), saturating at 6."""
++    a = y.abs()
++    mag = torch.zeros_like(a, dtype=torch.int32)
++    for i, t in enumerate((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)):
++        mag = mag + (a >= t).to(torch.int32)
++    return mag | ((y < 0) & (mag > 0)).to(torch.int32) << 3
++
++
++def quantize_rows4(x: torch.Tensor) -> torch.Tensor:
++    """bf16 (or fp32) rows [n, width] -> an FP4 cache's rows (int8), as the write kernel stores them."""
++    x = x.to(torch.bfloat16).float()
++    n, w = x.shape
++    s = scales(x.abs().amax(dim=1))                                        # the FP8 rule: a power of two
++    inv = ((254 - (s.view(torch.int32) >> 23)) << 23).view(torch.float32)
++    xs = x * inv[:, None]
++    bs = (xs.view(n, w // BLOCK4, BLOCK4).abs().amax(dim=2) / 6.0).to(torch.float8_e4m3fn)
++    bsf = bs.float()
++    y = xs.view(n, w // BLOCK4, BLOCK4) / torch.where(bsf > 0, bsf, torch.ones_like(bsf))[..., None]
++    codes = _e2m1_codes(y.view(n, w)).to(torch.uint8)
++    out = torch.zeros((n, row_bytes(w, "fp4")), dtype=torch.uint8, device=x.device)
++    out[:, :w // 2] = codes[:, 0::2] | (codes[:, 1::2] << 4)
++    out[:, w // 2:w // 2 + w // BLOCK4] = bs.view(torch.uint8)
++    out[:, w // 2 + w // BLOCK4:w // 2 + w // BLOCK4 + 4] = s[:, None].contiguous().view(torch.uint8)
++    return out.view(torch.int8)
++
++
++def dequantize4(cache: torch.Tensor) -> torch.Tensor:
++    """An FP4 cache's rows as fp32 [n, width] (exact: e2m1 values times e4m3 block scales times a power of two)."""
++    c = cache.view(torch.uint8)
++    w = width(cache)
++    lo, hi = (c[..., :w // 2] & 15).long(), (c[..., :w // 2] >> 4).long()
++    codes = torch.stack((lo, hi), dim=-1).reshape(*c.shape[:-1], w)
++    lut = torch.tensor(E2M1 + tuple(-v for v in E2M1), dtype=torch.float32, device=c.device)
++    vals = lut[codes]
++    bs = c[..., w // 2:w // 2 + w // BLOCK4].contiguous().view(torch.float8_e4m3fn).float()
++    s = c[..., w // 2 + w // BLOCK4:w // 2 + w // BLOCK4 + 4].contiguous().view(torch.float32)
++    return (vals.view(*c.shape[:-1], w // BLOCK4, BLOCK4) * bs[..., None]).reshape(*c.shape[:-1], w) * s
++
++
++@triton.jit
++def _e2m1(code):
++    """e2m1 codes (int32, sign in bit 3) -> fp32 values."""
++    m = code & 7
++    e = m >> 1
++    mant = (m & 1).to(tl.float32)
++    mag = tl.where(e == 0, 0.5 * mant, tl.exp2((e - 1).to(tl.float32)) * (1.0 + 0.5 * mant))
++    return tl.where((code & 8) != 0, -mag, mag)
++
++
++@triton.jit
++def store_row4(VALS, SCL, row, x, LW: tl.constexpr, RS: tl.constexpr):
++    """Row ``row`` (int64) of an FP4 cache (VALS: its bytes, uint8; SCL: an fp32 view) <- x fp32 [LW] rounded to bf16
++    first (the bf16 row is what is quantized): codes, block scales, row scale (``quantize_rows4``, bit for bit)."""
++    NB: tl.constexpr = LW // 16
++    xf = x.to(tl.bfloat16).to(tl.float32)
++    s, inv = scale_of(tl.max(tl.abs(xf), 0))
++    xs = tl.reshape(xf * inv, (NB, 16))
++    bs = (tl.max(tl.abs(xs), 1) / 6.0).to(tl.float8e4nv)
++    bsf = bs.to(tl.float32)
++    y = xs / tl.where(bsf > 0, bsf, 1.0)[:, None]
++    a = tl.abs(y)
++    mag = ((a >= 0.25).to(tl.int32) + (a >= 0.75).to(tl.int32) + (a >= 1.25).to(tl.int32) + (a >= 1.75).to(tl.int32)
++           + (a >= 2.5).to(tl.int32) + (a >= 3.5).to(tl.int32) + (a >= 5.0).to(tl.int32))
++    code = mag | (((y < 0) & (mag > 0)).to(tl.int32) << 3)
++    pairs = tl.reshape(code, (LW // 2, 2))
++    lo, hi = tl.split(pairs)
++    byte = (lo | (hi << 4)).to(tl.uint8)
++    j = tl.arange(0, LW // 2)
++    tl.store(VALS + row * RS + j, byte)
++    b = tl.arange(0, NB)
++    tl.store(VALS + row * RS + LW // 2 + b, bs.to(tl.uint8, bitcast=True))
++    tl.store(SCL + row * (RS // 4) + (LW // 2 + NB) // 4, s)
++
++
++@triton.jit
++def load_rows4(VALS, SCL, rows, ok, k, LW: tl.constexpr, RS: tl.constexpr):
++    """FP4 cache rows ``rows`` (int64 [N]) as a bf16 tile [N, LW] (each code times its block scale: exact) and the rows'
++    power-of-two scales [N] (1 where not ok; rows not ok read as zeros)."""
++    byte = tl.load(VALS + rows[:, None] * RS + (k[None, :] // 2), mask=ok[:, None], other=0).to(tl.int32)
++    code = (byte >> ((k[None, :] & 1) * 4)) & 15
++    bs = tl.load(VALS + rows[:, None] * RS + LW // 2 + k[None, :] // 16, mask=ok[:, None], other=0)
++    bsf = bs.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++    tile = (_e2m1(code) * bsf).to(tl.bfloat16)
++    sc = tl.load(SCL + rows * (RS // 4) + (LW // 2 + LW // 16) // 4, mask=ok, other=1.0)
++    return tile, sc
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+index 2e87fbc..34286b5 100644
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -390,7 +390,7 @@ def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor, *, prompt: bool = False)
+ 
+ @triton.jit
+ def _lat_write(LAT, lat_stride, LC, LS, POS, RANK, LW: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr,
+-               CP: tl.constexpr = 1):
++               CP: tl.constexpr = 1, FP4: tl.constexpr = 0):
+     """Row r -> cache slot pos + r: the bf16 row as it is, or (FP8) its codes and scale (kv8.store_row, a function
+     of the row alone: prompt chunks and decode windows store the same bytes). CP > 1 (context parallelism): only
+     positions p with p % CP == RANK, at slot p // CP."""
+@@ -401,7 +401,10 @@ def _lat_write(LAT, lat_stride, LC, LS, POS, RANK, LW: tl.constexpr, RS: tl.cons
+             return
+         P = P // CP
+     k = tl.arange(0, LW)
+-    kv8.store_row(LC, LS, P, tl.load(LAT + r * lat_stride + k).to(tl.float32), LW, RS, FP8)
++    if FP4:                              # TF_GLM_KV=fp4: codes, block scales, row scale (kv8.store_row4)
++        kv8.store_row4(LC, LS, P, tl.load(LAT + r * lat_stride + k).to(tl.float32), LW, RS)
++    else:
++        kv8.store_row(LC, LS, P, tl.load(LAT + r * lat_stride + k).to(tl.float32), LW, RS, FP8)
+ 
+ 
+ def latent_write(lat: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, cp: int = 1, rank: int = 0) -> None:
+@@ -412,7 +415,7 @@ def latent_write(lat: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, cp:
+     if lat.shape[1] != kv8.width(cache):
+         raise ValueError(f"latent_write: rows of {lat.shape[1]} into a cache of {kv8.width(cache)}")
+     _lat_write[(lat.shape[0],)](lat, lat.stride(0), vals, scl, pos, int(rank), LW=lat.shape[1], RS=rs, FP8=fp8,
+-                                CP=int(cp), num_warps=4)
++                                CP=int(cp), FP4=int(kv8.fp4(cache)), num_warps=4)
+ 
+ 
+ # --------------------------------------------------------------------------------------------- attention ---
+@@ -472,7 +475,7 @@ def _tile_v(q, kv, vv, ks, m, l, o, valid, SCALE: tl.constexpr, FP8: tl.constexp
+ @triton.jit
+ def _dense_chunks(QA, LC, LS, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr, CH: tl.constexpr,
+                   SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr,
+-                  QP=None, KR=None, ROPE: tl.constexpr = 0):
++                  QP=None, KR=None, ROPE: tl.constexpr = 0, FP4: tl.constexpr = 0):
+     """Program (row, head block, chunk): causal attention of HB heads of row r over keys [c CH, (c + 1) CH); cache
+     rows RS elements apart (FP8: codes, their scales through LS). ROPE: rotary queries QP [R, H, ROPE] and the rotary
+     key cache KR [slots, ROPE] (bf16) join the scores (``_tile``)."""
+@@ -497,8 +500,12 @@ def _dense_chunks(QA, LC, LS, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.conste
+         for t in range(CH // KTT):
+             ki = start + t * KTT + tl.arange(0, KTT)
+             ok = ki <= limit
+-            kv = tl.load(LC + ki[:, None].to(tl.int64) * RS + k[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
+-            ks = row_scales(LS, ki.to(tl.int64), ok, LW, RS) if FP8 else None
++            if FP4:
++                kv, ks = kv8.load_rows4(LC, LS, ki.to(tl.int64), ok, k, LW, RS)
++            else:
++                kv = tl.load(LC + ki[:, None].to(tl.int64) * RS + k[None, :], mask=ok[:, None],
++                             other=0.0).to(tl.bfloat16)
++                ks = row_scales(LS, ki.to(tl.int64), ok, LW, RS) if FP8 else None
+             kr = None
+             if ROPE:
+                 kr = tl.load(KR + ki[:, None].to(tl.int64) * ROPE + j[None, :], mask=ok[:, None],
+@@ -513,7 +520,7 @@ def _dense_chunks(QA, LC, LS, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.conste
+ @triton.jit
+ def _sparse_chunks(QA, LC, LS, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr,
+                    CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, RS: tl.constexpr,
+-                   FP8: tl.constexpr, QP=None, KR=None, ROPE: tl.constexpr = 0):
++                   FP8: tl.constexpr, QP=None, KR=None, ROPE: tl.constexpr = 0, FP4: tl.constexpr = 0):
+     """Program (row, head block, chunk): HB heads of row r over its selected tokens [c CH, (c + 1) CH) in list order."""
+     r = tl.program_id(0)
+     hb = tl.program_id(1)
+@@ -535,8 +542,11 @@ def _sparse_chunks(QA, LC, LS, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.c
+             idx = c * CH + t * KTT + tl.arange(0, KTT)
+             ok = idx < n
+             tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
+-            kv = tl.load(LC + tok[:, None] * RS + k[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
+-            ks = row_scales(LS, tok, ok, LW, RS) if FP8 else None
++            if FP4:
++                kv, ks = kv8.load_rows4(LC, LS, tok, ok, k, LW, RS)
++            else:
++                kv = tl.load(LC + tok[:, None] * RS + k[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++                ks = row_scales(LS, tok, ok, LW, RS) if FP8 else None
+             kr = None
+             if ROPE:
+                 kr = tl.load(KR + tok[:, None] * ROPE + j[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
+@@ -678,10 +688,18 @@ def _cache_parts(cache: torch.Tensor, lw: int):
+     return kv8.parts(cache)
+ 
+ 
+-def chunk_stages() -> int:
++def key_tile(cache: torch.Tensor) -> int:
++    """Keys a tensor-core tile of the chunk programs takes: KT, or 16 on an FP4 cache (its tile is expanded in
++    registers and staged for both products through shared memory: 32 keys of 32 heads need 106 KB, past GB10's 99)."""
++    return 16 if kv8.fp4(cache) else KT
++
++
++def chunk_stages(cache: torch.Tensor | None = None) -> int:
+     """TF_GLM_LATENT_STAGES (default 3): Triton pipeline depth of the dense / sparse chunk programs' key tiles: the
+-    loads only, the same bits (1: none, as before; 4 does not fit in shared memory)."""
+-    return int(__import__("os").environ.get("TF_GLM_LATENT_STAGES", "3"))
++    loads only, the same bits (1: none, as before; 4 does not fit in shared memory). An FP4 cache's tiles (codes and
++    block scales gathered, then expanded) take at most 2: 3 needs 106,880 bytes, past GB10's 101,376."""
++    stages = int(__import__("os").environ.get("TF_GLM_LATENT_STAGES", "3"))
++    return min(stages, 2) if cache is not None and kv8.fp4(cache) else stages
+ 
+ 
+ class LatentScratch:
+@@ -732,8 +750,9 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: Laten
+     vals, scl, rs, fp8 = _cache_parts(cache, LW)
+     QP, KR, ROPE = _rope_args(qp, rope, R, H)
+     _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, pos, s.po[:n * LW], s.pm[:n], s.pl[:n], R, H=H, LW=LW,
+-                                                CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, RS=rs, FP8=fp8, QP=QP, KR=KR,
+-                                                ROPE=ROPE, num_warps=8, num_stages=chunk_stages())
++                                                CH=CHUNK, SCALE=scale, HBT=hb, KTT=key_tile(cache), RS=rs, FP8=fp8, QP=QP, KR=KR,
++                                                ROPE=ROPE, FP4=int(kv8.fp4(cache)), num_warps=8,
++                                                num_stages=chunk_stages(cache))
+     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
+     return out
+ 
+@@ -753,8 +772,9 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
+     vals, scl, rs, fp8 = _cache_parts(cache, LW)
+     QP, KR, ROPE = _rope_args(qp, rope, R, H)
+     _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, tokens, counts, po, pm, pl, R, W=W, H=H, LW=LW,
+-                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, RS=rs, FP8=fp8, QP=QP, KR=KR,
+-                                                 ROPE=ROPE, num_warps=8, num_stages=chunk_stages())
++                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=key_tile(cache), RS=rs, FP8=fp8, QP=QP, KR=KR,
++                                                 ROPE=ROPE, FP4=int(kv8.fp4(cache)), num_warps=8,
++                                                num_stages=chunk_stages(cache))
+     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
+ 
+ 
+@@ -911,6 +931,6 @@ def seg_attention(qa: torch.Tensor, cache: torch.Tensor, rows, tokens: torch.Ten
+     _seg_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, rows.pos, rows.base, rows.sparse, tokens, counts,
+                                               s.po[:n * LW], s.pm[:n], s.pl[:n], R, W=W, H=H, LW=LW, CH=CHUNK,
+                                               SCALE=scale, HBT=hb, KTT=KT, RS=rs, FP8=fp8, num_warps=8,
+-                                              num_stages=chunk_stages())
++                                              num_stages=chunk_stages(cache))
+     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
+     return out
+diff --git tensorfold/families/glm5_next/cuda/msa.cu tensorfold/families/glm5_next/cuda/msa.cu
+index 33a27f5..26db0ff 100644
+--- tensorfold/families/glm5_next/cuda/msa.cu
++++ tensorfold/families/glm5_next/cuda/msa.cu
+@@ -28,6 +28,7 @@ constexpr int KS = KD + 8;               // its stride in halves (padding: 8 row
+ constexpr int KT = 32;                   // keys a tile
+ constexpr int QH = 24;                   // query rows held (heads; 2 m tiles of 16, rows past QH read a zero row)
+ constexpr int CROW = LW + 16;            // an FP8 cache row: codes, fp32 scale, 12 zero bytes (kv8)
++constexpr int CROW4 = LW / 2 + LW / 16 + 16;   // an FP4 row: e2m1 codes, e4m3 block scales, fp32 scale, pad (kv8)
+ constexpr int NWARP = 8;
+ constexpr int NTHREADS = NWARP * 32;
+ constexpr int PS = KT + 8;               // P^T row stride (halves)
+@@ -82,17 +83,18 @@ __device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint16_t c) {
+ }
+ 
+ // The cp.async of a tile's cache rows (scale included) and rotary keys: thread (key tid / 8, part tid % 8) moves its
+-// key's latent pieces part, part + 8, .. (33 of 16 bytes a row) and rotary piece part; ``tok`` its key's token id
+-// (-1 past the list: zero-filled from row 0's address)
++// key's latent pieces part, part + 8, .. (R / 16 of 16 bytes a row: 33 FP8, 19 FP4) and rotary piece part; ``tok``
++// its key's token id (-1 past the list: zero-filled from row 0's address)
++template <int R>
+ __device__ __forceinline__ void stage_tile(unsigned char* smem, const uint8_t* __restrict__ cache,
+                                            const __nv_bfloat16* __restrict__ rope, int tok) {
+     const int key = threadIdx.x >> 3, part = threadIdx.x & 7;
+     const bool ok = tok >= 0;
+     const long long tk = ok ? tok : 0;
+     unsigned char* C = smem + SM_C + (size_t)key * CROW;
+-    const uint8_t* src = cache + tk * CROW;
++    const uint8_t* src = cache + tk * R;
+ #pragma unroll
+-    for (int p = part; p < CROW / 16; p += 8) cp_async16(C + p * 16, src + p * 16, ok);
++    for (int p = part; p < R / 16; p += 8) cp_async16(C + p * 16, src + p * 16, ok);
+     cp_async16(smem + SM_R + (size_t)key * RD * 2 + part * 16,
+                reinterpret_cast<const unsigned char*>(rope) + tk * RD * 2 + part * 16, ok);
+ }
+@@ -103,6 +105,9 @@ __device__ __forceinline__ int tile_token(const int* __restrict__ toks, int t0,
+     return i < n ? __ldg(toks + i) : -1;
+ }
+ 
++__constant__ float E2M1[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
++
++template <bool FP4>
+ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+     const __nv_bfloat16* __restrict__ qa, const __nv_bfloat16* __restrict__ qp, const uint8_t* __restrict__ cache,
+     const __nv_bfloat16* __restrict__ rope, const int* __restrict__ tokens, const int* __restrict__ counts,
+@@ -123,7 +128,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+     float* ast = mst + 64;
+     const int* toks = tokens + (size_t)r * W;
+ 
+-    stage_tile(smem, cache, rope, tile_token(toks, 0, n));
++    constexpr int R = FP4 ? CROW4 : CROW;                  // a cache row's bytes in global memory
++    stage_tile<R>(smem, cache, rope, tile_token(toks, 0, n));
+     cp_async_commit();
+     int next_tok = tile_token(toks, KT, n);              // a tile ahead of the gather it feeds
+     // queries (rows past H zero) and the zero row
+@@ -165,6 +171,33 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+         // dequantize: thread (key, 64-code slice); scales; rotary keys
+         {
+             const int key = threadIdx.x >> 3, sl = threadIdx.x & 7;
++            if constexpr (FP4) {
++                // 64 values: 32 code bytes (two a byte, the even value low), 4 block scales (e4m3), each code
++                // times its block scale exact in bf16
++                const unsigned char* row = smem + SM_C + (size_t)key * CROW;
++                const uint4* codes = reinterpret_cast<const uint4*>(row + sl * 32);
++                __nv_bfloat16* dst = K + (size_t)key * KS + sl * 64;
++#pragma unroll
++                for (int q2 = 0; q2 < 2; ++q2) {
++                    const uint4 c = codes[q2];
++                    const uint32_t w[4] = {c.x, c.y, c.z, c.w};
++#pragma unroll
++                    for (int j = 0; j < 4; ++j) {
++                        const int blk = q2 * 2 + (j >> 1);
++                        __nv_fp8_e4m3 bs8;
++                        *reinterpret_cast<unsigned char*>(&bs8) = row[LW / 2 + sl * 4 + blk];
++                        const float bs = float(bs8);
++                        uint32_t o[4];
++#pragma unroll
++                        for (int bb = 0; bb < 4; ++bb) {
++                            const uint32_t by = (w[j] >> (8 * bb)) & 0xffu;
++                            const __nv_bfloat162 v = __floats2bfloat162_rn(E2M1[by & 15u] * bs, E2M1[by >> 4] * bs);
++                            o[bb] = *reinterpret_cast<const uint32_t*>(&v);
++                        }
++                        *reinterpret_cast<uint4*>(dst + q2 * 32 + j * 8) = make_uint4(o[0], o[1], o[2], o[3]);
++                    }
++                }
++            } else {
+             const unsigned char* src = smem + SM_C + (size_t)key * CROW + sl * 64;
+             __nv_bfloat16* dst = K + (size_t)key * KS + sl * 64;
+ #pragma unroll
+@@ -180,12 +213,14 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+                 *reinterpret_cast<uint4*>(dst + q4 * 16) = make_uint4(b[0], b[1], b[2], b[3]);
+                 *reinterpret_cast<uint4*>(dst + q4 * 16 + 8) = make_uint4(b[4], b[5], b[6], b[7]);
+             }
++            }
+             *reinterpret_cast<uint4*>(K + (size_t)key * KS + LW + sl * 8) =
+                 *reinterpret_cast<const uint4*>(smem + SM_R + (size_t)key * RD * 2 + sl * 16);
+-            if (sl == 0) ksh[key] = *reinterpret_cast<const float*>(smem + SM_C + (size_t)key * CROW + LW);
++            if (sl == 0)
++                ksh[key] = *reinterpret_cast<const float*>(smem + SM_C + (size_t)key * CROW + (FP4 ? LW / 2 + LW / 16 : LW));
+         }
+         __syncthreads();                         // the key tile is ready; the staging area is free
+-        if (t0 + KT < n) stage_tile(smem, cache, rope, next_tok);
++        if (t0 + KT < n) stage_tile<R>(smem, cache, rope, next_tok);
+         cp_async_commit();
+         next_tok = tile_token(toks, t0 + 2 * KT, n);
+ 
+@@ -366,15 +401,17 @@ void msa_prompt_cuda(const at::Tensor& qa, const at::Tensor& qp, const at::Tenso
+                      const at::Tensor& tokens, const at::Tensor& counts, at::Tensor& out, double scale) {
+     const int R = (int)qa.size(0), H = (int)qa.size(1);
+     TORCH_CHECK(H <= QH, "msa: at most ", QH, " heads a rank");
+-    TORCH_CHECK(qa.size(2) == LW && qp.size(2) == RD && rope.size(1) == RD && cache.size(1) == CROW,
++    const bool fp4 = cache.size(1) == CROW4;
++    TORCH_CHECK(qa.size(2) == LW && qp.size(2) == RD && rope.size(1) == RD && (cache.size(1) == CROW || fp4),
+                 "msa: a 512-wide FP8 latent cache with 64 rotary values");
+     static bool once = [] {
+-        C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM));
++        C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM));
++        C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM));
+         return true;
+     }();
+     (void)once;
+     if (R == 0) return;
+-    msa_kernel<<<R, NTHREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(
++    (fp4 ? msa_kernel<true> : msa_kernel<false>)<<<R, NTHREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(
+         reinterpret_cast<const __nv_bfloat16*>(qa.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(qp.data_ptr()),
+         cache.data_ptr<uint8_t>(), reinterpret_cast<const __nv_bfloat16*>(rope.data_ptr()), tokens.data_ptr<int>(),
+         counts.data_ptr<int>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), H, (int)tokens.size(1),
+diff --git tensorfold/families/glm5_next/cuda/msa.py tensorfold/families/glm5_next/cuda/msa.py
+index 0d5d0ed..f08c778 100644
+--- tensorfold/families/glm5_next/cuda/msa.py
++++ tensorfold/families/glm5_next/cuda/msa.py
+@@ -17,17 +17,18 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_msa_v3", sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
++    return load(name="tensorfold_glm_msa_v4", sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
+                 extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
+ 
+ 
+ def supported(qa: torch.Tensor, cache: torch.Tensor, rope: torch.Tensor | None) -> bool:
+-    return (rope is not None and cache.dtype == torch.uint8 and cache.shape[-1] == 528 and qa.shape[-1] == 512
+-            and qa.shape[1] <= HEADS and rope.shape[-1] == 64)
++    return (rope is not None and ((cache.dtype == torch.uint8 and cache.shape[-1] == 528) or
++                                  (cache.dtype == torch.int8 and cache.shape[-1] == 304))
++            and qa.shape[-1] == 512 and qa.shape[1] <= HEADS and rope.shape[-1] == 64)
+ 
+ 
+ def prompt(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor, out: torch.Tensor,
+            scale: float, qp: torch.Tensor, rope: torch.Tensor) -> None:
+     """latent.sparse_attention for prompt rows: rows with counts > 0 attend their tokens (ascending, -1 padded)."""
+ 
+-    _ext().prompt(qa, qp, cache, rope, tokens, counts, out, float(scale))
++    _ext().prompt(qa, qp, cache.view(torch.uint8), rope, tokens, counts, out, float(scale))

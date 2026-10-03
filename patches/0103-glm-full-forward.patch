@@ -1,0 +1,518 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 40aa44e..2831505 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -103,6 +103,9 @@ class Engine:
+         from . import l2pf
+ 
+         pf = l2pf.Settings.from_env()                        # TF_GLM_L2PF: installed before any graph capture
++        if pf.on and w.cfg.full:
++            raise ValueError("TF_GLM_L2PF's sites are GLM-5.3-Flash's layers (hyper-connections, KDA, pooled "
++                             "indexer): leave it unset for full GLM-5.3")
+         if pf.on and torch.cuda.is_available() and w.meta.get("l2pf") is None:
+             w.meta["l2pf"] = l2pf.Prefetch(w, pf)
+             if w.rank == 0:
+@@ -181,7 +184,7 @@ class Engine:
+             # every row past the dense limit: the sparse graph for this pool bucket (same kernels as eager)
+             # the pool buckets the graphs were captured for: the home view's (a stream at home with a smaller
+             # extent scores pools past its own too, all past its visible ones: -inf, the same selection)
+-            bucket = pool_bucket(self.st.pos, R, self.home.index[0][2].shape[0] - 2)
++            bucket = self.bucket(self.st.pos, R, self.home.index[0][2])
+             g, kind = self.graphs.sparse.get((R, self.st.parity, bucket)), "sparse"
+         if g is not None:
+             self.replays[kind] += 1
+@@ -190,6 +193,16 @@ class Engine:
+         self.replays["eager"] += 1
+         return compute(self.w, self.st, self.buf, R, nch=chunks_for(self.st, R), host_pos=self.st.pos)
+ 
++    def bucket(self, pos: int, R: int, keys: torch.Tensor) -> int:
++        """The sparse graph a window at ``pos`` replays: its pool bucket (GLM-5.3-Flash: pooled keys ``keys``), or
++        its token bucket (full GLM-5.3: per-token keys, ``dsa_full.bucket``)."""
++
++        if self.w.cfg.full:
++            from .dsa_full import bucket
++
++            return bucket(pos, R, keys.shape[0])
++        return pool_bucket(pos, R, keys.shape[0] - 2)
++
+     def mtp(self, next_tokens: Sequence[int], hidden: torch.Tensor) -> torch.Tensor:
+         """The MTP head on rows (hidden, next token): logits of the last row [1, V/world]."""
+ 
+@@ -202,7 +215,7 @@ class Engine:
+             g = self.graphs.mtp.get(n)
+         elif (self.graphs is not None and not self.mbuf.zero_first and self.st.index is not None
+               and self.st.mtp_len >= self.w.cfg.dense_limit):
+-            bucket = pool_bucket(self.st.mtp_len, n, self.home.index[-1][2].shape[0] - 2)
++            bucket = self.bucket(self.st.mtp_len, n, self.home.index[-1][2])
+             g, kind = self.graphs.sparse_mtp.get((n, bucket)), "sparse_mtp"
+         if g is not None:
+             self.replays[kind] += 1
+@@ -320,6 +333,8 @@ def _ring_tail(st, n: int, m: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+     (keys, gates), cloned."""
+     index, kc = getattr(st, "index", None) or [], getattr(st, "kc", [])
+     out = []
++    if index and index[0][0] is None:    # full GLM-5.3: per-token index keys in the pool, no rings to carry
++        return out
+ 
+     def take(trio, end):
+         ik, ig, _ = trio
+@@ -338,6 +353,10 @@ def put_ring_tail(st, snap: Snapshot) -> None:
+     """A kept snapshot's ring tail (``_ring_tail``) into ``st``'s rings (restore, and a multi-stream stream taking
+     over a kept prompt in any slot)."""
+     index, kc = getattr(st, "index", None) or [], getattr(st, "kc", [])
++    if index and index[0][0] is None:    # full GLM-5.3: no rings
++        if snap.tail:
++            raise ValueError("a snapshot with indexer ring rows for caches without rings")
++        return
+     idx = list(index[:len(kc)]) if len(snap.ids) % 4 else []
+     if snap.mtp_len > 0 and snap.mtp_len % 4 and len(index) > len(kc):
+         idx.append(index[-1])
+@@ -390,6 +409,15 @@ def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
+     and the indexer's pooled keys (its per-token keys and gates live in rings: the snapshot's ``tail``)."""
+     views = [kc[:n] for kc in st.kc] + [vc[:n] for vc in st.vc if vc is not None]
+     idx = st.index or []
++    if idx and idx[0][0] is None:        # full GLM-5.3: rotary keys, per-token index keys (full layers, then MTP)
++        views += [kr[:n] for kr in getattr(st, "kr", [])]
++        has_mtp = m > 0 and getattr(st, "mtp_kc", None) is not None
++        views += [pk[:n] for _, _, pk in (idx[:-1] if has_mtp or getattr(st, "mtp_kr", None) is not None else idx)]
++        if has_mtp:
++            views += [st.mtp_kc[:m], st.mtp_kr[:m], idx[-1][2][:m]]
++        return views
++    if getattr(st, "kr", None):
++        views += [kr[:n] for kr in st.kr]
+     main_idx = idx[:len(st.kc)]
+     for _, _, pk in main_idx:
+         views.append(pk[:n // 4 + 1])
+@@ -397,6 +425,8 @@ def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
+         views.append(st.mtp_kc[:m])
+         if getattr(st, "mtp_vc", None) is not None:
+             views.append(st.mtp_vc[:m])
++        if getattr(st, "mtp_kr", None) is not None:
++            views.append(st.mtp_kr[:m])
+         if len(idx) > len(st.kc):
+             views.append(idx[-1][2][:m // 4 + 1])
+     return views
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 4d6499e..9a80070 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -81,8 +81,11 @@ class Buffers:
+         self.xs_fa = torch.empty((rows, 2), dtype=f32, device=dev)
+         self.xs_ga = torch.empty((rows, 2), dtype=f32, device=dev)
+         self.kxs = torch.empty((rows, LL * 128 // 64), dtype=f32, device=dev)
+-        # DSA
+-        self.dp = torch.empty((rows, c.q_lora + c.kv_lora), dtype=bf, device=dev)
++        # DSA (full GLM-5.3: the projection's rotary key columns past the latent, the rotated queries, the top-k of the
++        # forward's last full indexer layer, which its shared layers reuse)
++        self.dp = torch.empty((rows, c.q_lora + c.kv_lora + c.rope), dtype=bf, device=dev)
++        self.qp = torch.empty((rows, HL, c.rope), dtype=bf, device=dev) if c.full else None
++        self.topk = None
+         self.qr = torch.empty((rows, c.q_lora), dtype=bf, device=dev)
+         self.xs_qr = torch.empty((rows, c.q_lora // 64), dtype=f32, device=dev)
+         self.lat = torch.empty((rows, c.kv_lora), dtype=bf, device=dev)
+@@ -108,10 +111,26 @@ class Buffers:
+         self.wts = torch.empty((rows, slots), dtype=f32, device=dev)
+         self.eact = torch.empty((rows * slots, ml), dtype=bf, device=dev)
+         exl3 = c.quant == "exl3"
+-        self.ey = torch.empty((rows, slots, D), dtype=bf if prefill and not exl3 else f32, device=dev)
+-        self.exl3 = None
++        # full GLM-5.3: the universal kernels' per-slot outputs (``gx.y``) are the expert rows; no copy of them
++        self.ey = None if c.full else torch.empty((rows, slots, D), dtype=bf if prefill and not exl3 else f32,
++                                                  device=dev)
++        self.exl3 = self.gx = None
+         prompt = False
+-        if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
++        if c.full:                       # mixed-width EXL3 experts (the universal grouped kernels), shared expert BF16
++            from types import SimpleNamespace
++
++            from tensorfold.cuda.exl3 import experts as generic
++
++            # sized by the largest expert width a rank holds (the rotated layout's), every layer's fits
++            self.gx = generic.Scratch(SimpleNamespace(dims=D, width=ml, count=c.experts), rows, slots, device=dev)
++            # the shared expert's rows at the largest width a layer gives this rank, viewed at each layer's own width
++            # (``shared_rows``: contiguous [rows, width] views of the same memory)
++            sl = tp.of(w).shared
++            self.sgu = torch.empty((rows * 2 * sl,), dtype=bf, device=dev)
++            self.sact = torch.empty((rows * sl,), dtype=bf, device=dev)
++            self.sxs = torch.empty((rows * sl // 64,), dtype=f32, device=dev)
++            self.sy = torch.empty((rows, D), dtype=f32, device=dev)
++        elif c.quant == "exl3":          # EXL3 routed experts, and the shared expert as a BF16 MLP
+             from .exl3_mm import Scratch, prompt_kernels, prompt_pass
+ 
+             prompt = prefill and prompt_kernels()
+@@ -217,6 +236,11 @@ class Caches:
+             self.kc.append(k)
+             self.vc.append(v)
+         self.mtp = attention_planes() if w.mtp is not None else None
++        # full GLM-5.3: each DSA layer's (and the MTP layer's) rotary keys, bf16 [tokens, 64] beside the latents (an
++        # FP8 latent cache keeps them bf16, as DeepSeek's FP8 MLA cache does)
++        self.full = bool(c.full)
++        self.kr = [add((c.rope,)) for _ in range(dsa)] if self.full else []
++        self.mtp_kr = add((c.rope,)) if self.full and w.mtp is not None else None
+         # DSA indexer caches (long contexts only): per layer (and the MTP layer, last) keys, gates, pool keys; with a
+         # ring, index[i] = (None, None, pool plane) and rings[i] = (keys, gates) [streams x ring, 128]
+         self.index = None
+@@ -224,7 +248,12 @@ class Caches:
+         self.ring = None if ring is None else int(ring)
+         if self.ring is not None and self.ring < 4:
+             raise ValueError(f"index rings of {self.ring} rows")
+-        if w.meta.get("long_context"):
++        if w.meta.get("long_context") and self.full:
++            # full GLM-5.3: per-token index keys (bf16 [tokens, 128]) of each full indexer layer, then the MTP
++            # layer's; index[i] = (None, None, keys) (no rings: every later row scores every key)
++            n_idx = sum(1 for k in c.index_kinds if k == "full") + (1 if w.mtp is not None else 0)
++            self.index = [(None, None, add((c.index_dim,))) for _ in range(n_idx)]
++        elif w.meta.get("long_context"):
+             n_idx = dsa + (1 if w.mtp is not None else 0)
+             if self.ring is None:
+                 self.index = [(add((c.index_dim,)), add((c.index_dim,)), add((c.index_dim,), 4, 2, kv))
+@@ -259,10 +288,14 @@ class Caches:
+         view = lambda i: None if i is None else self.arena.view(i, base, size)     # noqa: E731
+         st.kc = [view(i) for i in self.kc]
+         st.vc = [view(i) for i in self.vc]
++        st.kr = [view(i) for i in self.kr]
++        st.mtp_kr = view(self.mtp_kr)
+         if self.mtp is not None:
+             st.mtp_kc, st.mtp_vc = view(self.mtp[0]), view(self.mtp[1])
+         if self.index is None:
+             st.index = None
++        elif self.full:
++            st.index = [(None, None, view(trio[2])) for trio in self.index]
+         elif self.rings is None:
+             st.index = [tuple(view(i) for i in trio) for trio in self.index]
+         else:                        # the slot's rings (index_update's ring: their rows) and the extent's pools
+@@ -326,6 +359,9 @@ class State:
+         dsa_layers = [l for l in w.layers if l.kind == "dsa"]
+         self.kda_index = {l.index: i for i, l in enumerate(kda_layers)}
+         self.dsa_index = {l.index: i for i, l in enumerate(dsa_layers)}
++        # full GLM-5.3: a full indexer layer's entry of ``index`` (shared layers have none; the MTP layer's is last)
++        full = [l.index for l in dsa_layers if l.dsa is not None and l.dsa.index is not None]
++        self.index_of = {layer: i for i, layer in enumerate(full)} if w.cfg.full else {}
+         n = len(kda_layers)
+         sl = self.slots
+         self.pos = 0
+@@ -391,6 +427,9 @@ class State:
+         other.mtp_pos_dev = self.mtp_pos_dev.clone()
+         other.kc = [x.clone() for x in self.kc]
+         other.vc = [x.clone() if x is not None else None for x in self.vc]
++        other.kr = [x.clone() for x in getattr(self, "kr", [])]
++        if getattr(self, "mtp_kr", None) is not None:
++            other.mtp_kr = self.mtp_kr.clone()
+         if self.index is not None:
+             other.index = [tuple(x.clone() for x in trio) for trio in self.index]
+         if hasattr(self, "mtp_kc"):
+@@ -614,7 +653,8 @@ def dense_rows(c, R: int, host_pos: int | None) -> int:
+ 
+ 
+ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s, *, scale: float, nch: int,
+-                    out: torch.Tensor, hb: int, starts: torch.Tensor | None = None) -> torch.Tensor:
++                    out: torch.Tensor, hb: int, starts: torch.Tensor | None = None, qp: torch.Tensor | None = None,
++                    rope: torch.Tensor | None = None) -> torch.Tensor:
+     """``latent.attention`` of qa's rows in blocks of the scratch's ``part_rows`` (block i's queries at device
+     position pos_dev + starts[i], ``starts`` = arange(0, rows, part_rows)): every row gets the bits of one call over
+     all of them, since a row's programs read only its query, keys up to its position and its own partials, and
+@@ -622,13 +662,14 @@ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s
+ 
+     R, step = qa.shape[0], s.part_rows
+     if R <= step:
+-        return latent.attention(qa, lc, pos_dev, s, scale=scale, nch=nch, out=out, hb=hb)
++        return latent.attention(qa, lc, pos_dev, s, scale=scale, nch=nch, out=out, hb=hb, qp=qp, rope=rope)
+     if starts is None or starts.numel() < -(-R // step):
+         raise ValueError(f"dense attention of {R} rows in blocks of {step} needs the blocks' start offsets")
+     at = pos_dev + starts                                  # each block's first row's position, on the device
+     for i, r0 in enumerate(range(0, R, step)):
+         r1 = min(R, r0 + step)
+-        latent.attention(qa[r0:r1], lc, at[i:i + 1], s, scale=scale, nch=nch, out=out[r0:r1], hb=hb)
++        latent.attention(qa[r0:r1], lc, at[i:i + 1], s, scale=scale, nch=nch, out=out[r0:r1], hb=hb,
++                         qp=None if qp is None else qp[r0:r1], rope=rope)
+     return out
+ 
+ 
+@@ -733,6 +774,115 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
+     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))
+ 
+ 
++def dsa_full_block(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
++                   R: int, nch: int | None, keys: torch.Tensor | None, host_pos: int | None,
++                   sparse_np: int | None = None, *, indexed: bool = True) -> torch.Tensor:
++    """Full GLM-5.3's attention on b.normed: q_a / kv_a (one projection) and their norms, q_b; the latent, the rotary
++    key (rotated) and, on a full indexer layer, the index key written at the rows' positions; queries absorbed
++    through kv_b (its key rows zero-padded over the rotary dims) with their rotary dims rotated beside them; dense
++    latent attention for rows within the top-k, the selected tokens' for rows past it, the selection made on a full
++    layer (``keys``: its per-token index keys) and reused on the shared layers after it (b.topk); then kv_b's value
++    rows and o_proj. ``indexed``: the engine holds index caches (long contexts). Returns every rank's partials."""
++
++    from . import dsa_full
++
++    c = w.cfg
++    a = layer.dsa
++    HL = a.heads
++    q0, l0 = c.q_lora, c.q_lora + c.kv_lora
++    freq = w.meta["rope_freq"]
++    with prof.timed("dsa: projections"):
++        mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
++        glue.rmsnorm(b.dp[:R, :q0], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
++        glue.rmsnorm(b.dp[:R, q0:l0], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
++        mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
++    with prof.timed("dsa: latent write"):
++        latent.latent_write(b.lat[:R], lc, pos_dev)
++        dsa_full.k_rope_write(b.dp[:R, l0:], kr, pos_dev, freq)
++    qp = dsa_full.q_rope(b.q[:R], b.qp[:R], pos_dev, freq, c.nope)
++    all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
++    sparse_rows = indexed and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
++    ix = a.index
++    if ix is not None and keys is not None:
++        with prof.timed("dsa: indexer update"):
++            mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
++            dsa_full.index_write(b.ikr[:R, :c.index_dim], ix.ln_w, ix.ln_b, keys, pos_dev, freq)
++        b.topk = None
++        if sparse_rows:
++            with prof.timed("dsa: select tokens"):
++                mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
++                dsa_full.index_q_rope(b.qi[:R], c.index_heads, pos_dev, freq)
++                b.topk = dsa_full.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], keys, host_pos, R, pos_dev,
++                                                bucket_cols=sparse_np, prompt=b.prefill and sparse_np is None,
++                                                k=c.index_topk)
++    elif sparse_rows and b.topk is None:
++        raise RuntimeError(f"layer {layer.index}: a shared indexer layer without a full layer's top-k before it")
++    s = b.lat_s
++    with prof.timed("dsa: absorb"):
++        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R], prompt=b.prefill and latent.PROMPT_MMA)
++    ol = s.ol[:R]
++    scale = c.qk_dim ** -0.5
++    if not all_sparse:
++        dense = dense_rows_full(c, R, host_pos) if sparse_rows else R
++        with prof.timed("dsa: dense attention"):
++            dense_attention(qa[:dense], lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol[:dense],
++                            hb=latent.head_block(R), starts=b.att_starts if b.prefill else None, qp=qp[:dense],
++                            rope=kr)
++    if sparse_rows:
++        tokens, counts = b.topk
++        with prof.timed("dsa: sparse attention"):
++            if b.prefill and latent.SPARSE_ONEPASS:
++                latent.sparse_onepass(qa, lc, tokens, counts, ol, scale, qp=qp, rope=kr)
++            else:
++                latent.sparse_attention(qa, lc, tokens, counts, ol, scale, qp=qp, rope=kr)
++    with prof.timed("dsa: expand"):
++        o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
++    return out_proj(w, b, o, a.o, None if b.prefill else qmm.group_sums(o, b.xs_ao[:R]), R,
++                    site=(layer.index, "a"))
++
++
++def dense_rows_full(c, R: int, host_pos: int | None) -> int:
++    """Full GLM-5.3: rows of a window from ``host_pos`` that keep dense attention (those that see at most the top-k
++    tokens: positions before the dense limit); all R when the position is not known on the host."""
++
++    if host_pos is None:
++        return R
++    return min(R, max(0, c.dense_limit - host_pos))
++
++
++def moe_full_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor | None:
++    """Full GLM-5.3's MoE: sigmoid routing with the correction bias (glue.select, as GLM-5.3-Flash's), the routed
++    experts of mixed EXL3 widths through the universal grouped kernels (each slot's fp32 row, row-independent), the
++    shared expert as a dense MLP, combined in slot order."""
++
++    from tensorfold.cuda.exl3 import experts as generic
++
++    c = w.cfg
++    m = layer.moe
++    with prof.timed("moe: route"):
++        glue.router(b.normed[:R], m.router, b.mlog[:R])
++        glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
++    slots = c.top_k + 1
++
++    def fill(lo: int, hi: int) -> None:
++        shared_front(layer, w, b, lo, hi)
++        # the routed experts in blocks of EXL3_BLOCK_ROWS rows: the universal kernels' grouping stages a window's picks
++        # in one block's shared memory (rows x slots x 4 bytes, 48 KiB without an opt-in: 2048-row prompt chunks did
++        # not launch); each row's bits are its own (the kernels keep rows apart), so blocks give the window's bits
++        for a in range(lo, hi, EXL3_BLOCK_ROWS):
++            z = min(hi, a + EXL3_BLOCK_ROWS)
++            with prof.timed("moe: routed (exl3)"):
++                y = generic.routed(b.normed[a:z], b.pick[a:z], None, m.experts, b.gx, None, z - a, c.limit,
++                                   act_mode=generic.ACT_BF16)
++            with prof.timed("moe: combine"):
++                glue.combine_shared(y.view(z - a, slots, c.hidden), b.sy[a:z], b.wts[a:z], b.part[a:z])
++
++    return partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"))
++
++
++EXL3_BLOCK_ROWS = 1024    # 1024 x 9 slots x 4 bytes = 36 KiB of the grouping kernel's shared memory
++
++
+ def mlp_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
+     m = layer.mlp
+     mm(b, b.normed[lo:hi], m.gu, b.xs[lo:hi], b.gu[lo:hi])
+@@ -750,10 +900,20 @@ def shared_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> Non
+     """The MoE's shared expert (an EXL3 checkpoint's, BF16 / FP8 / 4-bit matmuls) on rows lo .. hi: b.sy."""
+ 
+     s, c = layer.moe.shared, w.cfg
++    sgu, sact, sxs = shared_rows(b, s.width) if c.full else (b.sgu, b.sact, b.sxs)
+     with prof.timed("moe: shared expert"):
+-        mm(b, b.normed[lo:hi], s.gu, b.xs[lo:hi], b.sgu[lo:hi])
+-        glue.swiglu(b.sgu[lo:hi], b.sact[lo:hi], b.sxs[lo:hi], c.limit)
+-        mm(b, b.sact[lo:hi], s.down, b.sxs[lo:hi], b.sy[lo:hi], f32=True)
++        mm(b, b.normed[lo:hi], s.gu, b.xs[lo:hi], sgu[lo:hi])
++        glue.swiglu(sgu[lo:hi], sact[lo:hi], sxs[lo:hi], c.limit)
++        mm(b, sact[lo:hi], s.down, sxs[lo:hi], b.sy[lo:hi], f32=True)
++
++
++def shared_rows(b: Buffers, width: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Full GLM-5.3: the shared expert's [gate | up], activation and group-sum rows at this layer's width on this
++    rank (rotated by layer, ``tp.ROTATE``): views of the buffers' flat memory, contiguous rows."""
++
++    n = b.alloc_rows
++    return (b.sgu[:n * 2 * width].view(n, 2 * width), b.sact[:n * width].view(n, width),
++            b.sxs[:n * width // 64].view(n, width // 64))
+ 
+ 
+ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor:
+@@ -811,6 +971,13 @@ def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int |
+         with prof.timed("kda"):
+             return kda_block(layer, w, st, b, R, done)
+     di = st.dsa_index[layer.index]
++    if w.cfg.full:
++        keys = None
++        if st.index is not None and layer.dsa.index is not None:
++            keys = st.index[st.index_of[layer.index]][2]
++        with prof.timed("dsa (total)"):
++            return dsa_full_block(layer, w, st.kc[di], st.kr[di], st.pos_dev, b, R, nch, keys, host_pos, sparse_np,
++                                  indexed=st.index is not None)
+     with prof.timed("dsa (total)"):
+         return dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
+                          st.index[di] if st.index is not None else None, host_pos, sparse_np, done)
+@@ -818,7 +985,9 @@ def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int |
+ 
+ def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor | None:
+     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
+-        return mlp_block(layer, w, b, R, done) if layer.mlp is not None else moe_block(layer, w, b, R, done)
++        if layer.mlp is not None:
++            return mlp_block(layer, w, b, R, done)
++        return moe_full_block(layer, w, b, R) if w.cfg.full else moe_block(layer, w, b, R, done)
+ 
+ 
+ def mixer_front(layer: LayerW, w: Weights, b: Buffers):
+@@ -847,6 +1016,13 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
+ 
+     c = w.cfg
+     x = b.x[:R]
++    if c.full:                           # full GLM-5.3: pre-norm blocks on a plain residual (no hyper-connections)
++        glue.rmsnorm(x, layer.in_norm, c.eps, b.normed[:R], b.xs[:R])
++        g = mixer(layer) if mixer is not None else _mixer(layer, w, st, b, R, nch, host_pos, sparse_np)
++        glue.residual_add(x, x, g)
++        glue.rmsnorm(x, layer.post_norm, c.eps, b.normed[:R], b.xs[:R])
++        glue.residual_add(x, x, _ffn(layer, w, b, R))
++        return
+     h = layer.attn_hc
+     glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                 b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+@@ -917,7 +1093,8 @@ def compute_steps(w: Weights, st: State, b: Buffers, R: int, *, nch: int | None
+     if not b.prefill:
+         raise ValueError("layer-sliced forwards require prompt buffers")
+     c = w.cfg
+-    glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
++    b.topk = None
++    embed_rows(w, b, b.ids[:R], b.x[:R], c.streams)
+     if inject is not None:
+         rows, features = inject
+         b.x.index_copy_(0, rows, features.repeat(1, c.streams))
+@@ -948,6 +1125,23 @@ def compute_steps(w: Weights, st: State, b: Buffers, R: int, *, nch: int | None
+     return None
+ 
+ 
++def embed_rows(w: Weights, b: Buffers, ids: torch.Tensor, out: torch.Tensor, copies: int) -> None:
++    """Token rows of the embedding into ``out`` (``copies`` hyper-connection streams). Full GLM-5.3 split by
++    vocabulary rows (``w.meta["embed_offset"]``: this rank's first row): each rank writes the rows it holds (zeros
++    for the others) into its fp32 partials, gathered and summed (``residual_add`` onto zeros: bf16 of one non-zero
++    term, exactly the row)."""
++
++    if "embed_offset" not in w.meta:
++        glue.embed(ids, w.embed, w.cfg.hidden, copies, out)
++        return
++    from .dsa_full import embed_part
++
++    R = ids.shape[0]
++    embed_part(ids, w.embed, w.meta["embed_offset"], b.part[:R])
++    out.zero_()
++    glue.residual_add(out, out, gather(w, b, R))
++
++
+ def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
+     pos = st.pos if pos is None else pos
+     if pos + R > w.cfg.dense_limit and st.index is None:
+@@ -992,7 +1186,8 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
+ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
+              host_pos: int | None = None, sparse_np: int | None = None, inject=None, head: bool = True, mixer=None):
+     c = w.cfg
+-    glue.embed(b.ids[:R], w.embed, c.hidden, c.streams, b.x[:R])
++    b.topk = None
++    embed_rows(w, b, b.ids[:R], b.x[:R], c.streams)
+     if inject is not None:
+         rows, features = inject
+         b.x.index_copy_(0, rows, features.repeat(1, c.streams))
+diff --git tensorfold/families/glm5_next/cuda/graphs.py tensorfold/families/glm5_next/cuda/graphs.py
+index 39e5b1d..9934e88 100644
+--- tensorfold/families/glm5_next/cuda/graphs.py
++++ tensorfold/families/glm5_next/cuda/graphs.py
+@@ -57,9 +57,14 @@ class Graphs:
+ 
+     def _capture_sparse(self, e, main_rows, mtp_rows, parities) -> None:
+         w, st = e.w, e.st
+-        np_max = st.index[0][2].shape[0] - 2
++        if w.cfg.full:                   # full GLM-5.3: per-token keys, a bucket of token columns (dsa_full.bucket)
++            from .dsa_full import buckets
++
++            sizes = buckets(st.index[0][2].shape[0])
++        else:
++            sizes = pool_buckets(st.index[0][2].shape[0] - 2)
+         saved = list(st.cur)
+-        for bucket in pool_buckets(np_max):
++        for bucket in sizes:
+             for R in main_rows:
+                 for parity in parities:
+                     st.cur = [parity] * len(st.cur)
+diff --git tensorfold/families/glm5_next/cuda/mtp.py tensorfold/families/glm5_next/cuda/mtp.py
+index 40c05d8..f7ae986 100644
+--- tensorfold/families/glm5_next/cuda/mtp.py
++++ tensorfold/families/glm5_next/cuda/mtp.py
+@@ -7,7 +7,8 @@ from typing import Sequence
+ import torch
+ 
+ from . import glue, qmm
+-from .forward import Buffers, State, check_room, dsa_block, mm, moe_block
++from .forward import (Buffers, State, check_room, dsa_block, dsa_full_block, embed_rows, mm, moe_block,
++                      moe_full_block)
+ from .weights import Weights
+ 
+ 
+@@ -33,7 +34,7 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool =
+     c = w.cfg
+     m = w.mtp
+     D = c.hidden
+-    glue.embed(b.ids[:n], w.embed, D, 1, b.me[:n])
++    embed_rows(w, b, b.ids[:n], b.me[:n], 1)
+     if b.zero_first:
+         b.me[0].zero_()
+     glue.rmsnorm(b.me[:n], m.enorm, c.eps, b.mcat[:n, :D])
+@@ -41,11 +42,17 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool =
+     mm(b, b.mcat[:n], m.eh, None if b.prefill else qmm.group_sums(b.mcat[:n], b.mxs[:n]), b.mx[:n])
+     layer = m.layer
+     glue.rmsnorm(b.mx[:n], layer.in_norm, c.eps, b.normed[:n], b.xs[:n])
+-    g = dsa_block(layer, w, st.mtp_kc, st.mtp_vc, st.mtp_pos_dev, b, n, nch,
+-                  st.index[-1] if st.index is not None else None, host_pos, sparse_np)
++    if c.full:                           # full GLM-5.3: the MTP layer runs its own indexer (the last index entry)
++        b.topk = None
++        g = dsa_full_block(layer, w, st.mtp_kc, st.mtp_kr, st.mtp_pos_dev, b, n, nch,
++                           st.index[-1][2] if st.index is not None else None, host_pos, sparse_np,
++                           indexed=st.index is not None)
++    else:
++        g = dsa_block(layer, w, st.mtp_kc, st.mtp_vc, st.mtp_pos_dev, b, n, nch,
++                      st.index[-1] if st.index is not None else None, host_pos, sparse_np)
+     glue.residual_add(b.mx[:n], b.mx[:n], g)
+     glue.rmsnorm(b.mx[:n], layer.post_norm, c.eps, b.normed[:n], b.xs[:n])
+-    g = moe_block(layer, w, b, n)
++    g = moe_full_block(layer, w, b, n) if c.full else moe_block(layer, w, b, n)
+     glue.residual_add(b.mx[:n], b.mx[:n], g)
+     lo = n - 1 if last_only else 0
+     k = n - lo

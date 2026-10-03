@@ -1,0 +1,419 @@
+diff --git tensorfold/cuda/exl3/experts.cpp tensorfold/cuda/exl3/experts.cpp
+index 63c38c9..0998d92 100644
+--- tensorfold/cuda/exl3/experts.cpp
++++ tensorfold/cuda/exl3/experts.cpp
+@@ -4,7 +4,7 @@
+ void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
+                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+-                        int64_t, int64_t);
++                        int64_t, int64_t, int64_t);
+ void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+ void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
+ void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+@@ -26,7 +26,8 @@ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
+              const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
+-             int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi) {
++             int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi,
++             int64_t mt) {
+     check(X0, at::kHalf, "X0");
+     check(X1, at::kHalf, "X1");
+     check(TP0, at::kLong, "TP0");
+@@ -40,8 +41,9 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0,
+     TORCH_CHECK(Z.numel() >= mats * SK * P * N, "Z too small");
+     TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
+     c10::cuda::CUDAGuard guard(X0.device());
++    TORCH_CHECK(mt == 1 || mt == 2 || mt == 4, "member tiles a program: 1, 2 or 4");
+     exl3x_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, warps,
+-                       pf, lo, hi);
++                       pf, lo, hi, mt);
+ }
+ 
+ void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
+diff --git tensorfold/cuda/exl3/experts.cu tensorfold/cuda/exl3/experts.cu
+index 28c88af..8406505 100644
+--- tensorfold/cuda/exl3/experts.cu
++++ tensorfold/cuda/exl3/experts.cu
+@@ -253,7 +253,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
+                         const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
+                         const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
+                         int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
+-                        int64_t hi) {
++                        int64_t hi, int64_t mt) {
+     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
+     tf_exl3x::GroupedArgs a;
+     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
+@@ -269,6 +269,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
+     a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = (int)SK; a.maxm = (int)members.size(1); a.slots = (int)slots;
+     a.nexp_max = (int)uids.size(0);
+     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
++    a.mt = (int)mt;
+     auto stream = at::cuda::getCurrentCUDAStream();
+     if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
+     else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);
+@@ -292,6 +293,8 @@ void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucou
+     TORCH_CHECK(E <= GROUP_THREADS * GROUP_PER_THREAD, "too many experts for the grouping kernel");
+     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
+     const size_t smem = (size_t)R * slots * sizeof(int);
++    if (smem > 48 * 1024)     // a prompt chunk's picks (2,048 rows x 9 slots: 72 KiB): opt in past the default
++        C10_CUDA_CHECK(cudaFuncSetAttribute(group_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+     group_kernel<<<1, GROUP_THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+         pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), (int)R,
+         (int)slots, (int)E, (int)members.size(1));
+diff --git tensorfold/cuda/exl3/experts.py tensorfold/cuda/exl3/experts.py
+index f4569ec..33cd95f 100644
+--- tensorfold/cuda/exl3/experts.py
++++ tensorfold/cuda/exl3/experts.py
+@@ -26,7 +26,7 @@ def _ext():
+ 
+     here = Path(__file__).parent
+     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
+-    return load(name="tensorfold_exl3_experts_v1", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
++    return load(name="tensorfold_exl3_experts_v2", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+                 verbose=False)
+ 
+ 
+@@ -170,10 +170,17 @@ class Scratch:
+         return self.ids[:maxu], self.members_buf[:maxu * R].view(maxu, R)
+ 
+ 
++# full GLM-5.3's prompt chunks: (nt, warps, pf) of the multi-tile kernel (a program decodes a trellis tile once for up
++# to 4 x 16 rows of its expert); its K splits are the shape's default_config ones, so each row keeps those bits
++MT_TILES = (8, 4, 1)
++MT_NT = {2: (8, 4, 1), 4: (4, 4, 1)}       # member tiles -> (nt, warps, pf): register budget of the accumulators
++
++
+ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
+            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
+-           group: bool = True) -> torch.Tensor:
+-    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync."""
++           group: bool = True, mt: int = 1) -> torch.Tensor:
++    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host
++    sync. ``mt`` 4: the multi-tile kernel (prompt chunks: many rows an expert), the same bits a row as 1."""
+ 
+     ext = _ext()
+     D, I, E = ex.dims, ex.width, ex.count
+@@ -186,12 +193,16 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
+         ext.group(pick, ids, s.count, members, R, slots, E)
+     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
+     nt, w, sk, pf = s.cfg_gu
++    if mt > 1:
++        nt, w, pf = MT_NT.get(mt, MT_TILES)
+     ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
+-                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1])
++                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], mt)
+     ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode)
+     nt, w, sk, pf = s.cfg_d
++    if mt > 1:
++        nt, w, pf = MT_NT.get(mt, MT_TILES)
+     ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
+-                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1])
++                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], mt)
+     if wts is None:
+         ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
+         return s.y[:P]
+diff --git tensorfold/cuda/exl3/experts_grouped.cuh tensorfold/cuda/exl3/experts_grouped.cuh
+index 57be4c0..8daa6c7 100644
+--- tensorfold/cuda/exl3/experts_grouped.cuh
++++ tensorfold/cuda/exl3/experts_grouped.cuh
+@@ -283,6 +283,178 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+     }
+ }
+ 
++// grouped_kernel for prompt chunks (full GLM-5.3, mixed widths): a program takes up to MTL member tiles of 16 of
++// one expert (MTL x 16 rows) and decodes each trellis tile once for all of them (the decode, not the mma, bounds the
++// one-tile kernel on prompt chunks). Every row's sums are grouped_kernel's: the same k tiles a warp in the same order
++// (the same SK and W), each tile's two mma on that row's A fragment, warps added in order through shared memory a
++// member tile at a time, so the same bits.
++template <int CB, int K2, int NT, int PF, int MTL>
++__device__ __forceinline__ void warp_tiles_mt(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
++                                              const half* (&x0)[MTL], const half* (&x1)[MTL], const bool (&ok0)[MTL],
++                                              const bool (&ok1)[MTL], int nact, int lane, float (&acc)[MTL][NT][2][4]) {
++    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
++    const LaneMap<K2> map(lane);
++    const size_t kstride = (size_t)NTILES * TW;
++    const uint32_t* tp = T + ((size_t)kt0 * NTILES + nt0) * TW + lane;
++    uint32_t pf[PF][NT][LW];
++#pragma unroll
++    for (int d = 0; d < PF; ++d)
++        if (d < nkt)
++#pragma unroll
++            for (int i = 0; i < NT; ++i) load_words<K2>(pf[d][i], tp + d * kstride + i * TW, lane);
++    for (int ib = 0; ib < nkt; ib += PF) {
++#pragma unroll
++        for (int d = 0; d < PF; ++d) {
++            const int it = ib + d;
++            if (it < nkt) {
++                uint32_t w[NT][LW];
++#pragma unroll
++                for (int i = 0; i < NT; ++i)
++#pragma unroll
++                    for (int l = 0; l < LW; ++l) w[i][l] = pf[d][i][l];
++                if (it + PF < nkt)
++#pragma unroll
++                    for (int i = 0; i < NT; ++i)
++                        load_words<K2>(pf[d][i], tp + (size_t)(it + PF) * kstride + i * TW, lane);
++                const int k = (kt0 + it) * 16;
++                uint32_t a[MTL][4];
++#pragma unroll
++                for (int m = 0; m < MTL; ++m)
++                    if (m < nact) {
++                        a[m][0] = load_pair(x0[m] + k, ok0[m]);
++                        a[m][1] = load_pair(x1[m] + k, ok1[m]);
++                        a[m][2] = load_pair(x0[m] + k + 8, ok0[m]);
++                        a[m][3] = load_pair(x1[m] + k + 8, ok1[m]);
++                    }
++#pragma unroll
++                for (int i = 0; i < NT; ++i) {
++                    uint32_t b0[2], b1[2];
++                    decode_tile<CB, K2>(w[i], map, lane, b0, b1);
++#pragma unroll
++                    for (int m = 0; m < MTL; ++m)
++                        if (m < nact) {
++                            mma16816(acc[m][i][0], a[m], b0);
++                            mma16816(acc[m][i][1], a[m], b1);
++                        }
++                }
++            }
++        }
++    }
++}
++
++template <int CB, int NT, int W, int PF, int LO, int HI, int MTL>
++__global__ void __launch_bounds__(W * 32) grouped_mt_kernel(
++    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
++    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
++    const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
++    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
++    const int u = blockIdx.x;
++    if (u >= ucount[0]) return;
++    const int MT = (maxm + 16 * MTL - 1) / (16 * MTL);
++    const int mgroup = blockIdx.z % MT;
++    const int split = (blockIdx.z / MT) % SK;
++    const int mat = blockIdx.z / MT / SK;
++    const half* X = mat ? X1 : X0;
++    const int e = uids[u];
++    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
++    const int k2 = mat ? K2_1[e] : K2_0[e];
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int KT = K >> 4, NTILES = N >> 4;
++
++    __shared__ int rows_sh[16 * MTL];
++    for (int i = threadIdx.x; i < 16 * MTL; i += W * 32) {
++        const int m = mgroup * 16 * MTL + i;
++        const int code = m < maxm ? members[u * maxm + m] : -1;
++        rows_sh[i] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
++    }
++    __syncthreads();
++    if (rows_sh[0] < 0) return;
++    int nact = 0;                                     // member tiles holding rows (members come first)
++#pragma unroll
++    for (int m = 0; m < MTL; ++m) nact += rows_sh[m * 16] >= 0;
++    const half* x0[MTL];
++    const half* x1[MTL];
++    bool ok0[MTL], ok1[MTL];
++#pragma unroll
++    for (int m = 0; m < MTL; ++m) {
++        const int r0 = rows_sh[m * 16 + g], r1 = rows_sh[m * 16 + g + 8];
++        ok0[m] = r0 >= 0;
++        ok1[m] = r1 >= 0;
++        x0[m] = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
++        x1[m] = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
++    }
++    const int per_split = KT / SK, per_warp = per_split / W;
++    const int kt0 = split * per_split + warp * per_warp;
++    const int nt0 = blockIdx.y * NT;
++
++    float acc[MTL][NT][2][4];
++#pragma unroll
++    for (int m = 0; m < MTL; ++m)
++#pragma unroll
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
++
++    switch (k2) {
++#define TF_EXL3X_MT_CASE(K2_)                                                                                   \
++    case K2_:                                                                                                   \
++        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
++            warp_tiles_mt<CB, K2_, NT, PF, MTL>(T, NTILES, kt0, per_warp, nt0, x0, x1, ok0, ok1, nact, lane, acc); \
++        else                                                                                                    \
++            __trap();                                                                                           \
++        break;
++        TF_EXL3X_MT_CASE(2)
++        TF_EXL3X_MT_CASE(3)
++        TF_EXL3X_MT_CASE(4)
++        TF_EXL3X_MT_CASE(5)
++        TF_EXL3X_MT_CASE(6)
++        TF_EXL3X_MT_CASE(7)
++        TF_EXL3X_MT_CASE(8)
++        TF_EXL3X_MT_CASE(9)
++        TF_EXL3X_MT_CASE(10)
++        TF_EXL3X_MT_CASE(11)
++        TF_EXL3X_MT_CASE(12)
++        TF_EXL3X_MT_CASE(13)
++        TF_EXL3X_MT_CASE(14)
++        TF_EXL3X_MT_CASE(15)
++        TF_EXL3X_MT_CASE(16)
++#undef TF_EXL3X_MT_CASE
++        default:
++            __trap();
++    }
++
++    // a member tile at a time: grouped_kernel's reduction (warps in order) on its 16 rows
++    __shared__ float red[W][16][NT * 16];
++#pragma unroll
++    for (int m = 0; m < MTL; ++m) {
++        if (m >= nact) break;
++#pragma unroll
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int col = i * 16 + h * 8 + 2 * t;
++                red[warp][g][col] = acc[m][i][h][0];
++                red[warp][g][col + 1] = acc[m][i][h][1];
++                red[warp][g + 8][col] = acc[m][i][h][2];
++                red[warp][g + 8][col + 1] = acc[m][i][h][3];
++            }
++        __syncthreads();
++        for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
++            const int row = idx / (NT * 16), col = idx % (NT * 16);
++            const int r = rows_sh[m * 16 + row];
++            if (r < 0) continue;
++            float s = red[0][row][col];
++#pragma unroll
++            for (int w = 1; w < W; ++w) s += red[w][row][col];
++            Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
++        }
++        __syncthreads();
++    }
++}
++
+ // W_q [K, N] fp16 of one matrix through the same lane decode (tests; not on the forward path).
+ template <int CB, int K2>
+ __global__ void dequant_kernel(const uint32_t* __restrict__ T, half* __restrict__ out, int K, int N) {
+@@ -319,10 +491,37 @@ struct GroupedArgs {
+     int K, N, P, SK, maxm, slots;
+     int nexp_max;        // grid.x (upper bound of distinct experts)
+     int mats, nt, warps, pf, lo, hi;
++    int mt = 1;          // member tiles a program (> 1: grouped_mt_kernel, prompt chunks)
+ };
+ 
++template <int CB, int MTL>
++void grouped_mt_run(const GroupedArgs& a, cudaStream_t stream) {
++    const int MT = (a.maxm + 16 * MTL - 1) / (16 * MTL);
++    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
++#define TF_LAUNCH_MT(NT_, W_, PF_, LO_, HI_)                                                                    \
++    grouped_mt_kernel<CB, NT_, W_, PF_, LO_, HI_, MTL><<<grid, W_ * 32, 0, stream>>>(                           \
++        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
++        a.slots)
++#define TF_RANGES_MT(NT_, W_, PF_)                                                                              \
++    if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH_MT(NT_, W_, PF_, 2, 10);                                             \
++    else TF_LAUNCH_MT(NT_, W_, PF_, 2, 16);
++    if (a.nt == 8 && a.warps == 4 && a.pf == 1) { TF_RANGES_MT(8, 4, 1) }
++    else if (a.nt == 4 && a.warps == 4 && a.pf == 1) { TF_RANGES_MT(4, 4, 1) }
++    else TORCH_CHECK(false, "unsupported multi-tile setting nt=", a.nt, " warps=", a.warps, " pf=", a.pf);
++#undef TF_RANGES_MT
++#undef TF_LAUNCH_MT
++}
++
++template <int CB>
++void grouped_mt_launch(const GroupedArgs& a, cudaStream_t stream) {
++    if (a.mt == 2) grouped_mt_run<CB, 2>(a, stream);
++    else if (a.mt == 4) grouped_mt_run<CB, 4>(a, stream);
++    else TORCH_CHECK(false, "member tiles a program: 1, 2 or 4, not ", a.mt);
++}
++
+ template <int CB>
+ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
++    if (a.mt > 1) { grouped_mt_launch<CB>(a, stream); return; }
+     const int MT = (a.maxm + 15) / 16;
+     dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
+ #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
+diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
+index d43245c..643b7c1 100644
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -392,13 +392,14 @@ def full_buffer_bytes(t: dict, rows: int, *, world: int, share, capacity: int, p
+ def full_transient_bytes(t: dict, rows: int, capacity: int, *, prefill: bool, share) -> int:
+     """A window's selection and sparse attention scratch at the cache's capacity: fp32 token scores (a prompt chunk's
+     FULL_SELECT_ROWS rows at once; a decode window's rows over its bucket, at most the capacity), the token lists,
+-    and a decode window's sparse attention partials (prompt chunks attend in one pass)."""
++    and sparse attention's chunk partials (a prompt chunk's in blocks of 512 rows, forward.PROMPT_SPARSE_ROWS)."""
+     HL = share("heads", int(t["num_attention_heads"]))
+     lw, topk = int(t["kv_lora_rank"]), int(t.get("index_topk", 2048))
+     cols = max(capacity, FULL_TOPK_MIN_BUCKET)
+     scores = (min(rows, FULL_SELECT_ROWS) if prefill else rows) * cols * 4
+     lists = rows * (topk + 1) * 4
+-    partials = 0 if prefill else -(-topk // 512) * rows * HL * (lw + 2) * 4
++    # sparse attention's chunk partials: a decode window's rows, a prompt chunk's in blocks of 512 rows
++    partials = -(-topk // 512) * (min(rows, 512) if prefill else rows) * HL * (lw + 2) * 4
+     return scores + lists + partials
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 9a80070..72a0982 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -831,16 +831,24 @@ def dsa_full_block(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor
+     if sparse_rows:
+         tokens, counts = b.topk
+         with prof.timed("dsa: sparse attention"):
+-            if b.prefill and latent.SPARSE_ONEPASS:
+-                latent.sparse_onepass(qa, lc, tokens, counts, ol, scale, qp=qp, rope=kr)
+-            else:
+-                latent.sparse_attention(qa, lc, tokens, counts, ol, scale, qp=qp, rope=kr)
++            # the chunk programs and their merge, prompt chunks in blocks of PROMPT_SPARSE_ROWS rows (their fp32
++            # partials' memory): at full GLM-5.3's 22 heads a rank the one-pass prompt kernel (GLM-5.3-Flash's
++            # default) ran ~9.5x slower (131 vs 14 ms a 2048-row chunk and layer, GB10); each row keeps its bits in
++            # any block (the kernels keep rows apart)
++            step = PROMPT_SPARSE_ROWS if b.prefill else R
++            for r0 in range(0, R, step):
++                r1 = min(R, r0 + step)
++                latent.sparse_attention(qa[r0:r1], lc, tokens[r0:r1], counts[r0:r1], ol[r0:r1], scale, qp=qp[r0:r1],
++                                        rope=kr)
+     with prof.timed("dsa: expand"):
+         o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
+     return out_proj(w, b, o, a.o, None if b.prefill else qmm.group_sums(o, b.xs_ao[:R]), R,
+                     site=(layer.index, "a"))
+ 
+ 
++PROMPT_SPARSE_ROWS = 512   # full GLM-5.3: a prompt chunk's rows a sparse attention call takes (~185 MiB of partials)
++
++
+ def dense_rows_full(c, R: int, host_pos: int | None) -> int:
+     """Full GLM-5.3: rows of a window from ``host_pos`` that keep dense attention (those that see at most the top-k
+     tokens: positions before the dense limit); all R when the position is not known on the host."""
+@@ -866,21 +874,22 @@ def moe_full_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tenso
+ 
+     def fill(lo: int, hi: int) -> None:
+         shared_front(layer, w, b, lo, hi)
+-        # the routed experts in blocks of EXL3_BLOCK_ROWS rows: the universal kernels' grouping stages a window's picks
+-        # in one block's shared memory (rows x slots x 4 bytes, 48 KiB without an opt-in: 2048-row prompt chunks did
+-        # not launch); each row's bits are its own (the kernels keep rows apart), so blocks give the window's bits
++        # the routed experts in blocks of EXL3_BLOCK_ROWS rows (the grouping kernel stages a block's picks in shared
++        # memory, opted in past 48 KiB up to 2,048 x 9 x 4 bytes); a prompt chunk's take the 2-tile kernel (each
++        # trellis tile decoded and read once for 32 rows of its expert: -10% at 2,048 rows); every row keeps the
++        # same bits in any block and either kernel (the kernels keep rows apart; tests/gpu)
+         for a in range(lo, hi, EXL3_BLOCK_ROWS):
+             z = min(hi, a + EXL3_BLOCK_ROWS)
+             with prof.timed("moe: routed (exl3)"):
+                 y = generic.routed(b.normed[a:z], b.pick[a:z], None, m.experts, b.gx, None, z - a, c.limit,
+-                                   act_mode=generic.ACT_BF16)
++                                   act_mode=generic.ACT_BF16, mt=2 if b.prefill else 1)
+             with prof.timed("moe: combine"):
+                 glue.combine_shared(y.view(z - a, slots, c.hidden), b.sy[a:z], b.wts[a:z], b.part[a:z])
+ 
+     return partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"))
+ 
+ 
+-EXL3_BLOCK_ROWS = 1024    # 1024 x 9 slots x 4 bytes = 36 KiB of the grouping kernel's shared memory
++EXL3_BLOCK_ROWS = 2176    # a whole prompt chunk (2,048 rows and the split's pad): 2,176 x 9 x 4 bytes = 77 KiB
+ 
+ 
+ def mlp_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:

@@ -1,0 +1,749 @@
+diff --git tensorfold/cuda/exl3/mpe.cpp tensorfold/cuda/exl3/mpe.cpp
+new file mode 100644
+index 0000000..3b631fe
+--- /dev/null
++++ tensorfold/cuda/exl3/mpe.cpp
+@@ -0,0 +1,56 @@
++// Mia's prompt experts (mpe.cu): the bindings. By Mia's AI Lab (Apache-2.0).
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++int64_t mpe_item_rows();
++void mpe_route_cuda(const at::Tensor&, int64_t, int64_t, at::Tensor&, at::Tensor&, at::Tensor&, int64_t);
++void mpe_experts_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                      const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                      const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                      at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, double, int64_t,
++                      int64_t);
++
++static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
++                ": expected a contiguous CUDA tensor of the right dtype");
++}
++
++void route(const at::Tensor& pick, int64_t E, at::Tensor sorted, at::Tensor items, at::Tensor item_count,
++           int64_t max_items) {
++    check(pick, at::kInt, "pick");
++    check(sorted, at::kInt, "sorted");
++    check(items, at::kInt, "items");
++    check(item_count, at::kInt, "item_count");
++    TORCH_CHECK(sorted.numel() >= pick.numel() && items.numel() >= 3 * max_items, "route: buffers too small");
++    c10::cuda::CUDAGuard guard(pick.device());
++    mpe_route_cuda(pick, pick.numel(), E, sorted, items, item_count, max_items);
++}
++
++void experts(const at::Tensor& x, const at::Tensor& sorted, const at::Tensor& items, const at::Tensor& item_count,
++             const at::Tensor& gate_ptr, const at::Tensor& up_ptr, const at::Tensor& down_ptr, const at::Tensor& gu_k2,
++             const at::Tensor& d_k2, const at::Tensor& suh_g, const at::Tensor& suh_u, const at::Tensor& svh_g,
++             const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor xr, at::Tensor xd,
++             at::Tensor y,
++             int64_t D, int64_t I, int64_t slots, int64_t max_items, double limit, int64_t act_mode, int64_t cb) {
++    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && x.stride(0) % 4 == 0 &&
++                    x.size(1) == D,
++                "x: bf16 [R, D], unit column stride, row stride a multiple of 4");
++    for (auto* t : {&sorted, &items, &item_count, &gu_k2, &d_k2}) check(*t, at::kInt, "int32 table");
++    for (auto* t : {&gate_ptr, &up_ptr, &down_ptr}) check(*t, at::kLong, "trellis pointers");
++    for (auto* t : {&suh_g, &suh_u, &svh_g, &svh_u, &suh_d, &svh_d}) check(*t, at::kHalf, "suh/svh");
++    check(xd, at::kHalf, "xd");
++    check(xr, at::kHalf, "xr");
++    TORCH_CHECK(xr.numel() >= x.size(0) * D, "xr too small");
++    check(y, at::kFloat, "y");
++    TORCH_CHECK(xd.numel() >= sorted.numel() * I, "xd too small");
++    TORCH_CHECK(y.size(0) >= sorted.numel() && y.size(1) == D, "y: [>= pairs, D]");
++    c10::cuda::CUDAGuard guard(x.device());
++    mpe_experts_cuda(x, sorted, items, item_count, gate_ptr, up_ptr, down_ptr, gu_k2, d_k2, suh_g, suh_u, svh_g,
++                     svh_u, suh_d, svh_d, xr, xd, y, D, I, slots, max_items, limit, act_mode, cb);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("item_rows", &mpe_item_rows);
++    m.def("route", &route);
++    m.def("experts", &experts);
++}
+diff --git tensorfold/cuda/exl3/mpe.cu tensorfold/cuda/exl3/mpe.cu
+new file mode 100644
+index 0000000..420e02a
+--- /dev/null
++++ tensorfold/cuda/exl3/mpe.cu
+@@ -0,0 +1,492 @@
++// Mia's prompt experts (MPE): routed EXL3 experts of a prompt chunk (hundreds to thousands of rows), a width per
++// expert (2, 3 or 4 bits), tensor cores, the trellis decoded on the fly. By Mia's AI Lab (Apache-2.0), written for
++// this recipe on TensorFold's EXL3 decode (experts_grouped.cuh: Fmt / LaneMap / decode_tile, after ExLlamaV3, MIT,
++// Copyright (c) 2025 Turboderp).
++//
++// Each item is up to BM rows routed to one expert. A block takes an item and a 128-column block of the output:
++//
++//   rotate:  each row once a layer, xr = fp16((x * suh) @ H) a 128 block (the universal kernels' rot_in arithmetic;
++//            every expert of a layer shares gate's and up's suh, ``mpe.supported``).
++//   gate|up: the item's xr rows arrive by cp.async three chunks deep, one staged tile for gate and up; 8 warps each
++//            decode their 16 columns of gate and up a k tile at a time (each tile feeds the item's filled m tiles),
++//            one fp32 chain an output in k order; the epilogue does the output transform, svh, SwiGLU (the universal
++//            epilogue's roundings), suh_d and the down input's transform: xd fp16.
++//   down:    the item's xd rows the same way, the output transform and svh_d; every pair's row stored unweighted
++//            into y [pairs, D] fp32 (no atomics).
++//
++// Rows never mix: a row's outputs are the same bits whatever item, block or call it lands in, run after run.
++
++#include <cuda_fp16.h>
++#include <cuda_bf16.h>
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++
++#include "experts_grouped.cuh"
++
++namespace {
++
++using tf_exl3x::Fmt;
++using tf_exl3x::LaneMap;
++using tf_exl3x::decode_tile;
++using tf_exl3x::mma16816;
++
++constexpr float HS = 0.08838834764831845f;   // 1 / sqrt(128)
++constexpr int BM = 64;                       // rows an item
++constexpr int MT = BM / 16;                  // m tiles an item
++constexpr int NWARP = 8;
++constexpr int NTHREADS = NWARP * 32;
++constexpr int CK = 128;                      // k values a chunk (a Hadamard block)
++constexpr int ES = CK + 4;                   // epilogue row stride (fp32)
++constexpr int EROWS = 32;                    // epilogue rows a pass
++constexpr int ROUTE_THREADS = 1024;
++
++// The 128-point Walsh-Hadamard transform, 4 values a lane (lane L: 4L .. 4L + 3), fixed butterfly order.
++__device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
++    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
++    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
++#pragma unroll
++    for (int m = 1; m < 32; m <<= 1) {
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const float o = __shfl_xor_sync(0xffffffffu, v[j], m);
++            v[j] = (lane & m) ? o - v[j] : v[j] + o;
++        }
++    }
++}
++
++__device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
++
++// two floats as an fp16 pair (round to nearest), its bits
++__device__ __forceinline__ uint32_t h2u(float a, float b) {
++    const half2 h = __floats2half2_rn(a, b);
++    return *reinterpret_cast<const uint32_t*>(&h);
++}
++
++// half offset of (row, k) in a [BM][128] fp16 tile: 16-byte pieces XOR-swizzled by row so ldmatrix hits all banks
++__device__ __forceinline__ int swz(int row, int k) { return row * CK + (((k >> 3) ^ (row & 7)) << 3) + (k & 7); }
++
++__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const half* p) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
++}
++
++// The A fragments of m tile m, k tile kk (16 x 16) of a swizzled [BM][128] tile
++__device__ __forceinline__ void a_frag(uint32_t (&a)[4], const half* xs, int m, int kk, int lane) {
++    const int row = m * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
++    const int k = kk * 16 + (lane >> 4) * 8;
++    ldsm_x4(a, xs + swz(row, k));
++}
++
++// ---- the layer's input rotation, once a row --------------------------------------------------------------------
++// xr = fp16((x * suh) @ H) a 128 block (the universal kernels' rot_in arithmetic), when every expert of the layer
++// shares gate's and up's suh (``mpe.supported``): gate and up of every expert then read the same rotated row.
++__global__ void __launch_bounds__(NTHREADS) rotate_kernel(const __nv_bfloat16* __restrict__ x, int xstride,
++                                                          const half* __restrict__ suh, half* __restrict__ xr, int K) {
++    const int row = blockIdx.x, blk = blockIdx.y * NWARP + (threadIdx.x >> 5), lane = threadIdx.x & 31;
++    if (blk * CK >= K) return;
++    const int k = blk * CK + 4 * lane;
++    const uint2 raw = __ldg(reinterpret_cast<const uint2*>(x + (size_t)row * xstride + k));
++    const uint2 su = __ldg(reinterpret_cast<const uint2*>(suh + k));
++    const float2 p0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.x));
++    const float2 p1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw.y));
++    const float2 s0 = __half22float2(*reinterpret_cast<const half2*>(&su.x));
++    const float2 s1 = __half22float2(*reinterpret_cast<const half2*>(&su.y));
++    float v[4] = {p0.x * s0.x, p0.y * s0.y, p1.x * s1.x, p1.y * s1.y};
++#ifndef MPE_NOROT
++    fwht128(v, lane);
++#endif
++    *reinterpret_cast<uint2*>(xr + (size_t)row * K + k) = make_uint2(h2u(v[0] * HS, v[1] * HS), h2u(v[2] * HS, v[3] * HS));
++}
++
++// ---- route: pairs grouped by expert into items of <= BM ------------------------------------------------------------
++// One block. items[3 i] = (expert, first sorted position, rows); sorted[first ..] = the pairs (r * slots + s).
++__global__ void __launch_bounds__(ROUTE_THREADS) route_kernel(const int* __restrict__ pick, int n, int E,
++                                                              int* __restrict__ sorted, int* __restrict__ items,
++                                                              int* __restrict__ item_count, int max_items) {
++    extern __shared__ int sh[];
++    int* cnt = sh;            // [E]
++    int* base = sh + E;       // [E] first sorted position
++    int* ibase = sh + 2 * E;  // [E] first item
++    for (int e = threadIdx.x; e < E; e += ROUTE_THREADS) cnt[e] = 0;
++    __syncthreads();
++    for (int i = threadIdx.x; i < n; i += ROUTE_THREADS) {
++        const int e = pick[i];
++        if (e >= 0 && e < E) atomicAdd(&cnt[e], 1);
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {                      // E <= a few hundred: a serial scan is cheap and fixed in order
++        int p = 0, it = 0;
++        for (int e = 0; e < E; ++e) {
++            base[e] = p;
++            ibase[e] = it;
++            p += cnt[e];
++            it += (cnt[e] + BM - 1) / BM;
++        }
++        item_count[0] = min(it, max_items);
++    }
++    __syncthreads();
++    for (int e = threadIdx.x; e < E; e += ROUTE_THREADS) {
++        const int c = cnt[e], ni = (c + BM - 1) / BM;
++        for (int j = 0; j < ni; ++j) {
++            const int it = ibase[e] + j;
++            if (it < max_items) {
++                items[3 * it] = e;
++                items[3 * it + 1] = base[e] + j * BM;
++                items[3 * it + 2] = min(BM, c - j * BM);
++            }
++        }
++        cnt[e] = base[e];                        // the scatter's cursor
++    }
++    __syncthreads();
++    for (int i = threadIdx.x; i < n; i += ROUTE_THREADS) {
++        const int e = pick[i];
++        if (e >= 0 && e < E) sorted[atomicAdd(&cnt[e], 1)] = i;
++    }
++}
++
++// The lane's trellis words of a chunk's 8 k tiles of column tile nt (TW words a tile, lane < TW)
++template <int K2>
++__device__ __forceinline__ void load_words(uint32_t (&w)[8], const uint32_t* __restrict__ T, int kt0, int NTILES,
++                                           int nt, int lane) {
++    constexpr int TW = Fmt<K2>::TW;
++#pragma unroll
++    for (int kk = 0; kk < 8; ++kk)
++        w[kk] = (TW == 32 || lane < TW) ? __ldg(T + ((size_t)(kt0 + kk) * NTILES + nt) * TW + lane) : 0u;
++}
++
++// ---- the shared main loop -----------------------------------------------------------------------------------------
++// One 128-k chunk: 8 k tiles; each matrix's tile decoded once and run against the item's filled m tiles of the one
++// staged input (gate and up read the same rotated rows).
++template <int CB, int K2, int NM>
++__device__ __forceinline__ void chunk_mma(const half* xs, const uint32_t (&words)[NM][8], const LaneMap<K2>& map,
++                                          int lane, int mact, float (&acc)[NM][MT][2][4]) {
++#pragma unroll
++    for (int kk = 0; kk < 8; ++kk) {
++        uint32_t b[NM][2][2];
++#pragma unroll
++        for (int mat = 0; mat < NM; ++mat) {
++            uint32_t w[1] = {words[mat][kk]};
++#ifdef MPE_NODECODE
++            b[mat][0][0] = w[0]; b[mat][0][1] = w[0] ^ 1u; b[mat][1][0] = w[0] ^ 2u; b[mat][1][1] = w[0] ^ 3u;
++#else
++            decode_tile<CB, K2>(w, map, lane, b[mat][0], b[mat][1]);
++#endif
++        }
++#pragma unroll
++        for (int m = 0; m < MT; ++m) {
++            if (m < mact) {                               // empty m tiles (an item's padding) skipped
++                uint32_t a[4];
++                a_frag(a, xs, m, kk, lane);
++#pragma unroll
++                for (int mat = 0; mat < NM; ++mat) {
++                    mma16816(acc[mat][m][0], a, b[mat][0]);
++                    mma16816(acc[mat][m][1], a, b[mat][1]);
++                }
++            }
++        }
++    }
++}
++
++__device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool ok) {
++    const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(ok ? 16 : 0));
++}
++__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
++template <int N>
++__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
++
++constexpr int NSTAGE = 3;                        // input chunks in flight
++constexpr size_t STAGE = (size_t)BM * CK * 2;    // a chunk of the item's rows, fp16
++
++// Chunk rows of the item (row r at src + off[r], fp16, 128 values from k0) into a swizzled stage; rows past cnt
++// zero-filled up to the last m tile, the rest never read.
++__device__ __forceinline__ void stage_rows(half* dst, const half* __restrict__ src, const long long* off, int cnt,
++                                           int rows16, int k0) {
++    for (int idx = threadIdx.x; idx < rows16 * 16; idx += NTHREADS) {
++        const int r = idx >> 4, p = idx & 15;
++        cp_async16(dst + swz(r, p * 8), src + off[r] + k0 + p * 8, r < cnt);
++    }
++}
++
++// The item's whole K through the pipeline: NSTAGE - 1 chunks ahead by cp.async, the next chunk's trellis words in
++// registers during this chunk's mma.
++template <int CB, int K2, int NM>
++__device__ __forceinline__ void item_loop(const half* __restrict__ src, const long long* off, int cnt, int K,
++                                          const uint32_t* const (&T)[NM], int NTILES, const int (&nt)[NM],
++                                          unsigned char* smem,
++                                          float (&acc)[NM][MT][2][4]) {
++    const int lane = threadIdx.x & 31;
++    const LaneMap<K2> map(lane);
++    const int chunks = K / CK, mact = (cnt + 15) >> 4, rows16 = mact << 4;
++    auto stage = [&](int c) { return reinterpret_cast<half*>(smem + (size_t)(c % NSTAGE) * STAGE); };
++#pragma unroll
++    for (int c = 0; c < NSTAGE - 1; ++c) {
++        if (c < chunks) stage_rows(stage(c), src, off, cnt, rows16, c * CK);
++        cp_async_commit();
++    }
++    uint32_t cur[NM][8], nxt[NM][8];
++#pragma unroll
++    for (int mat = 0; mat < NM; ++mat) load_words<K2>(cur[mat], T[mat], 0, NTILES, nt[mat], lane);
++    for (int c = 0; c < chunks; ++c) {
++        cp_async_wait<NSTAGE - 2>();
++        __syncthreads();                                 // chunk c landed; every warp is past chunk c - 1's stage
++        if (c + NSTAGE - 1 < chunks) stage_rows(stage(c + NSTAGE - 1), src, off, cnt, rows16, (c + NSTAGE - 1) * CK);
++        cp_async_commit();
++        if (c + 1 < chunks)
++#pragma unroll
++            for (int mat = 0; mat < NM; ++mat) load_words<K2>(nxt[mat], T[mat], (c + 1) * 8, NTILES, nt[mat], lane);
++        chunk_mma<CB, K2, NM>(stage(c), cur, map, lane, mact, acc);
++#pragma unroll
++        for (int mat = 0; mat < NM; ++mat)
++#pragma unroll
++            for (int kk = 0; kk < 8; ++kk) cur[mat][kk] = nxt[mat][kk];
++    }
++    cp_async_wait<0>();
++    __syncthreads();                                     // the stages are free for the epilogue
++}
++
++// ---- gate | up -----------------------------------------------------------------------------------------------------
++constexpr size_t GU_SMEM_MAIN = NSTAGE * STAGE;
++constexpr size_t GU_SMEM_EPI = (size_t)2 * EROWS * ES * 4;
++constexpr size_t GU_SMEM = GU_SMEM_MAIN > GU_SMEM_EPI ? GU_SMEM_MAIN : GU_SMEM_EPI;
++
++template <int CB>
++__global__ void __launch_bounds__(NTHREADS, 2) gateup_kernel(
++    const half* __restrict__ xr, const int* __restrict__ sorted, const int* __restrict__ items,
++    const int* __restrict__ item_count, const int64_t* __restrict__ gate_ptr, const int64_t* __restrict__ up_ptr,
++    const int* __restrict__ k2s, const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
++    half* __restrict__ xd, int K, int N, int slots, float limit, int act_mode) {
++    extern __shared__ __align__(16) unsigned char smem[];
++    __shared__ long long off_sh[BM];
++    const int cb = blockIdx.x, item = blockIdx.y;
++    if (item >= item_count[0]) return;
++    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
++    if (threadIdx.x < BM)
++        off_sh[threadIdx.x] = (int)threadIdx.x < cnt ? (long long)(sorted[first + threadIdx.x] / slots) * K : 0;
++    __syncthreads();
++    float acc[2][MT][2][4];
++#pragma unroll
++    for (int a = 0; a < 2; ++a)
++#pragma unroll
++        for (int m = 0; m < MT; ++m)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int q = 0; q < 4; ++q) acc[a][m][h][q] = 0.f;
++    const uint32_t* Tg = reinterpret_cast<const uint32_t*>(gate_ptr[e]);
++    const uint32_t* Tu = reinterpret_cast<const uint32_t*>(up_ptr[e]);
++    const uint32_t* const T[2] = {Tg, Tu};
++    const int nt[2] = {cb * 8 + (int)(threadIdx.x >> 5), cb * 8 + (int)(threadIdx.x >> 5)};
++    switch (k2s[e]) {
++        case 4: item_loop<CB, 4, 2>(xr, off_sh, cnt, K, T, N >> 4, nt, smem, acc); break;
++        case 6: item_loop<CB, 6, 2>(xr, off_sh, cnt, K, T, N >> 4, nt, smem, acc); break;
++        case 8: item_loop<CB, 8, 2>(xr, off_sh, cnt, K, T, N >> 4, nt, smem, acc); break;
++        default: __trap();
++    }
++    // epilogue: EROWS rows a pass through shared memory
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    float* Eg = reinterpret_cast<float*>(smem);
++    float* Eu = Eg + EROWS * ES;
++    const int n0 = cb * CK + 4 * lane;
++    float svg[4], svu[4], sud[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        svg[j] = __half2float(svh_g[(size_t)e * N + n0 + j]);
++        svu[j] = __half2float(svh_u[(size_t)e * N + n0 + j]);
++        sud[j] = __half2float(suh_d[(size_t)e * N + n0 + j]);
++    }
++#pragma unroll
++    for (int pass = 0; pass < BM / EROWS; ++pass) {
++        __syncthreads();
++#pragma unroll
++        for (int mi = 0; mi < EROWS / 16; ++mi) {
++            const int m = pass * (EROWS / 16) + mi;
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int col = warp * 16 + h * 8 + 2 * t, r0 = mi * 16 + g;
++                Eg[r0 * ES + col] = acc[0][m][h][0];
++                Eg[r0 * ES + col + 1] = acc[0][m][h][1];
++                Eg[(r0 + 8) * ES + col] = acc[0][m][h][2];
++                Eg[(r0 + 8) * ES + col + 1] = acc[0][m][h][3];
++                Eu[r0 * ES + col] = acc[1][m][h][0];
++                Eu[r0 * ES + col + 1] = acc[1][m][h][1];
++                Eu[(r0 + 8) * ES + col] = acc[1][m][h][2];
++                Eu[(r0 + 8) * ES + col + 1] = acc[1][m][h][3];
++            }
++        }
++        __syncthreads();
++        for (int i = warp; i < EROWS; i += NWARP) {
++            const int r = pass * EROWS + i;
++            if (r >= cnt) break;
++            const float4 G = *reinterpret_cast<const float4*>(Eg + i * ES + 4 * lane);
++            const float4 U = *reinterpret_cast<const float4*>(Eu + i * ES + 4 * lane);
++            float gv[4] = {G.x, G.y, G.z, G.w}, uv[4] = {U.x, U.y, U.z, U.w};
++            fwht128(gv, lane);
++            fwht128(uv, lane);
++            float v[4];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                float act;
++                if (act_mode == 0) {
++                    const float gg = fminf(bf16r(gv[j] * HS * svg[j]), limit);
++                    const float uu = fminf(fmaxf(bf16r(uv[j] * HS * svu[j]), -limit), limit);
++                    act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
++                } else {
++                    const float gg = fminf(gv[j] * HS * svg[j], limit);
++                    const float uu = fminf(fmaxf(uv[j] * HS * svu[j], -limit), limit);
++                    act = gg / (1.f + expf(-gg)) * uu;
++                }
++                v[j] = act * sud[j];
++            }
++            fwht128(v, lane);
++            *reinterpret_cast<uint2*>(xd + (size_t)(first + r) * N + n0) =
++                make_uint2(h2u(v[0] * HS, v[1] * HS), h2u(v[2] * HS, v[3] * HS));
++        }
++    }
++}
++
++// ---- down ----------------------------------------------------------------------------------------------------------
++constexpr int DN_SLABS = 2;                      // 128-column slabs a down block (one staged input for both)
++constexpr size_t DN_SMEM_MAIN = NSTAGE * STAGE;
++constexpr size_t DN_SMEM_EPI = (size_t)EROWS * ES * 4;
++constexpr size_t DN_SMEM = DN_SMEM_MAIN > DN_SMEM_EPI ? DN_SMEM_MAIN : DN_SMEM_EPI;
++
++template <int CB>
++__global__ void __launch_bounds__(NTHREADS, 2) down_kernel(
++    const half* __restrict__ xd, const int* __restrict__ sorted, const int* __restrict__ items,
++    const int* __restrict__ item_count, const int64_t* __restrict__ down_ptr, const int* __restrict__ k2s,
++    const half* __restrict__ svh_d, float* __restrict__ y, int K, int N) {
++    extern __shared__ __align__(16) unsigned char smem[];
++    __shared__ int pair_sh[BM];
++    __shared__ long long off_sh[BM];
++    const int cb = blockIdx.x, item = blockIdx.y;
++    if (item >= item_count[0]) return;
++    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
++    if (threadIdx.x < BM) {
++        pair_sh[threadIdx.x] = (int)threadIdx.x < cnt ? sorted[first + threadIdx.x] : 0;
++        off_sh[threadIdx.x] = (long long)(first + min((int)threadIdx.x, cnt - 1)) * K;
++    }
++    __syncthreads();
++    float acc[DN_SLABS][MT][2][4];                       // DN_SLABS 128-column slabs a block, a tile of each a warp
++#pragma unroll
++    for (int a = 0; a < DN_SLABS; ++a)
++#pragma unroll
++        for (int m = 0; m < MT; ++m)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int q = 0; q < 4; ++q) acc[a][m][h][q] = 0.f;
++    const uint32_t* const Td = reinterpret_cast<const uint32_t*>(down_ptr[e]);
++    const uint32_t* const T[DN_SLABS] = {Td, Td};
++    const int nt[DN_SLABS] = {cb * 16 + (int)(threadIdx.x >> 5), cb * 16 + 8 + (int)(threadIdx.x >> 5)};
++    switch (k2s[e]) {
++        case 4: item_loop<CB, 4, DN_SLABS>(xd, off_sh, cnt, K, T, N >> 4, nt, smem, acc); break;
++        case 6: item_loop<CB, 6, DN_SLABS>(xd, off_sh, cnt, K, T, N >> 4, nt, smem, acc); break;
++        case 8: item_loop<CB, 8, DN_SLABS>(xd, off_sh, cnt, K, T, N >> 4, nt, smem, acc); break;
++        default: __trap();
++    }
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    float* Ed = reinterpret_cast<float*>(smem);
++#pragma unroll
++    for (int sl = 0; sl < DN_SLABS; ++sl) {
++    const int n0 = (cb * DN_SLABS + sl) * CK + 4 * lane;
++    float sv[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) sv[j] = __half2float(svh_d[(size_t)e * N + n0 + j]) * HS;
++#pragma unroll
++    for (int pass = 0; pass < BM / EROWS; ++pass) {
++        __syncthreads();
++#pragma unroll
++        for (int mi = 0; mi < EROWS / 16; ++mi) {
++            const int m = pass * (EROWS / 16) + mi;
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int col = warp * 16 + h * 8 + 2 * t, r0 = mi * 16 + g;
++                Ed[r0 * ES + col] = acc[sl][m][h][0];
++                Ed[r0 * ES + col + 1] = acc[sl][m][h][1];
++                Ed[(r0 + 8) * ES + col] = acc[sl][m][h][2];
++                Ed[(r0 + 8) * ES + col + 1] = acc[sl][m][h][3];
++            }
++        }
++        __syncthreads();
++        for (int i = warp; i < EROWS; i += NWARP) {
++            const int r = pass * EROWS + i;
++            if (r >= cnt) break;
++            const float4 V = *reinterpret_cast<const float4*>(Ed + i * ES + 4 * lane);
++            float v[4] = {V.x, V.y, V.z, V.w};
++            fwht128(v, lane);
++            *reinterpret_cast<float4*>(y + (size_t)pair_sh[r] * N + n0) =
++                make_float4(v[0] * sv[0], v[1] * sv[1], v[2] * sv[2], v[3] * sv[3]);
++        }
++    }
++    }
++}
++
++template <int CB>
++void launch(const at::Tensor& x, const at::Tensor& sorted, const at::Tensor& items, const at::Tensor& item_count,
++            const at::Tensor& gate_ptr, const at::Tensor& up_ptr, const at::Tensor& down_ptr, const at::Tensor& gu_k2,
++            const at::Tensor& d_k2, const at::Tensor& suh_g, const at::Tensor& suh_u, const at::Tensor& svh_g,
++            const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xr, at::Tensor& xd,
++            at::Tensor& y, int D, int I, int slots, int max_items, float limit, int act_mode, cudaStream_t stream) {
++    static bool once = [] {
++        C10_CUDA_CHECK(cudaFuncSetAttribute(gateup_kernel<CB>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                            (int)GU_SMEM));
++        C10_CUDA_CHECK(cudaFuncSetAttribute(down_kernel<CB>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                            (int)DN_SMEM));
++        C10_CUDA_CHECK(cudaFuncSetAttribute(gateup_kernel<CB>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
++        C10_CUDA_CHECK(cudaFuncSetAttribute(down_kernel<CB>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
++        return true;
++    }();
++    (void)once;
++    auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
++    (void)suh_u;
++    rotate_kernel<<<dim3((unsigned)x.size(0), (unsigned)((D / CK + NWARP - 1) / NWARP)), NTHREADS, 0, stream>>>(
++        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x.stride(0), h(suh_g),
++        reinterpret_cast<half*>(xr.data_ptr()), D);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    gateup_kernel<CB><<<dim3((unsigned)(I / CK), (unsigned)max_items), NTHREADS, GU_SMEM, stream>>>(
++        reinterpret_cast<const half*>(xr.data_ptr()), sorted.data_ptr<int>(),
++        items.data_ptr<int>(), item_count.data_ptr<int>(), gate_ptr.data_ptr<int64_t>(), up_ptr.data_ptr<int64_t>(),
++        gu_k2.data_ptr<int>(), h(svh_g), h(svh_u), h(suh_d),
++        reinterpret_cast<half*>(xd.data_ptr()), D, I, slots, limit, act_mode);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++    down_kernel<CB><<<dim3((unsigned)(D / (CK * DN_SLABS)), (unsigned)max_items), NTHREADS, DN_SMEM, stream>>>(
++        reinterpret_cast<const half*>(xd.data_ptr()), sorted.data_ptr<int>(), items.data_ptr<int>(),
++        item_count.data_ptr<int>(), down_ptr.data_ptr<int64_t>(), d_k2.data_ptr<int>(), h(svh_d),
++        y.data_ptr<float>(), I, D);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++}  // namespace
++
++int64_t mpe_item_rows() { return BM; }
++
++void mpe_route_cuda(const at::Tensor& pick, int64_t n, int64_t E, at::Tensor& sorted, at::Tensor& items,
++                    at::Tensor& item_count, int64_t max_items) {
++    TORCH_CHECK(E <= 4096, "mpe route: at most 4096 experts");
++    route_kernel<<<1, ROUTE_THREADS, (size_t)3 * E * sizeof(int), at::cuda::getCurrentCUDAStream()>>>(
++        pick.data_ptr<int>(), (int)n, (int)E, sorted.data_ptr<int>(), items.data_ptr<int>(),
++        item_count.data_ptr<int>(), (int)max_items);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void mpe_experts_cuda(const at::Tensor& x, const at::Tensor& sorted, const at::Tensor& items,
++                      const at::Tensor& item_count, const at::Tensor& gate_ptr, const at::Tensor& up_ptr,
++                      const at::Tensor& down_ptr, const at::Tensor& gu_k2, const at::Tensor& d_k2,
++                      const at::Tensor& suh_g, const at::Tensor& suh_u, const at::Tensor& svh_g,
++                      const at::Tensor& svh_u, const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xr,
++                      at::Tensor& xd, at::Tensor& y, int64_t D, int64_t I, int64_t slots, int64_t max_items, double limit,
++                      int64_t act_mode, int64_t cb) {
++    TORCH_CHECK(D % (CK * DN_SLABS) == 0 && I % CK == 0, "mpe: D a multiple of 256, I of 128");
++    auto stream = at::cuda::getCurrentCUDAStream();
++#define TF_MPE_ARGS x, sorted, items, item_count, gate_ptr, up_ptr, down_ptr, gu_k2, d_k2, suh_g, suh_u, svh_g, \
++                    svh_u, suh_d, svh_d, xr, xd, y, (int)D, (int)I, (int)slots, (int)max_items, (float)limit,        \
++                    (int)act_mode, stream
++    if (cb == 0) launch<0>(TF_MPE_ARGS);
++    else if (cb == 1) launch<1>(TF_MPE_ARGS);
++    else if (cb == 2) launch<2>(TF_MPE_ARGS);
++    else TORCH_CHECK(false, "codebook must be 0, 1 or 2");
++#undef TF_MPE_ARGS
++}
+diff --git tensorfold/cuda/exl3/mpe.py tensorfold/cuda/exl3/mpe.py
+new file mode 100644
+index 0000000..2d8cd53
+--- /dev/null
++++ tensorfold/cuda/exl3/mpe.py
+@@ -0,0 +1,85 @@
++"""Mia's prompt experts (MPE, mpe.cu): the routed EXL3 experts of a prompt chunk, a width per expert (2, 3 or 4 bits),
++on tensor cores with the trellis decoded on the fly; every pair's output row stored unweighted ([pairs, D] fp32, no
++atomics), so a row's bits do not depend on the other rows, the chunking or the run. The caller adds the slots in slot
++order (glue.combine_shared). By Mia's AI Lab (Apache-2.0)."""
++
++from __future__ import annotations
++
++import math
++from functools import lru_cache
++from pathlib import Path
++
++import torch
++
++from .experts import ACT_F32, Exl3RoutedExperts
++
++K2S = (4, 6, 8)               # 2, 3 and 4 bits a value
++
++
++@lru_cache(maxsize=1)
++def _ext():
++    from tensorfold.cuda.build import load
++
++    here = Path(__file__).parent
++    import os
++
++    defs = [f for f in os.environ.get("TF_MPE_DEFINES", "").split(",") if f]          # lab ablations only
++    flags = [f"-D{f}" for f in defs]
++    return load(name="tensorfold_exl3_mpe_v5" + "".join("_" + f.lower() for f in defs),
++                sources=[str(here / "mpe.cpp"), str(here / "mpe.cu")],
++                extra_cuda_cflags=["-O3", "-lineinfo"] + flags, extra_include_paths=[str(here)], verbose=False)
++
++
++def supported(ex: Exl3RoutedExperts) -> bool:
++    """Gate and up of each expert at one width, every width 2/3/4 bits, widths in whole 128 blocks."""
++
++    gk, uk, dk = ex.gate_k2.tolist(), ex.up_k2.tolist(), ex.down_k2.tolist()
++    if not (gk == uk and all(k in K2S for k in gk + dk) and ex.width % 128 == 0 and ex.dims % 256 == 0):
++        return False
++    # one input rotation for the layer: every expert's gate and up take the same suh
++    return bool(torch.equal(ex.suh_g, ex.suh_u) and (ex.suh_g == ex.suh_g[:1]).all())
++
++
++class Scratch:
++    """Buffers for up to ``rows`` rows of ``slots`` slots (``xd``: a contiguous fp16 buffer of >= pairs x width, and
++    ``xr``: one of >= rows x dims, may be lent)."""
++
++    def __init__(self, ex, rows: int, slots: int, device="cuda", xd: torch.Tensor | None = None,
++                 xr: torch.Tensor | None = None) -> None:
++        n = rows * slots
++        bm = _ext().item_rows()
++        self.rows, self.slots = rows, slots
++        self.max_items = -(-n // bm) + min(n, ex.count)
++        self.sorted = torch.empty((n,), dtype=torch.int32, device=device)
++        self.items = torch.empty((3 * self.max_items,), dtype=torch.int32, device=device)
++        self.count = torch.zeros((1,), dtype=torch.int32, device=device)
++        if xd is not None and (xd.dtype != torch.float16 or not xd.is_contiguous() or xd.numel() < n * ex.width):
++            raise ValueError("mpe.Scratch: the lent xd is too small")
++        self.xd = xd.view(-1)[:n * ex.width].view(n, ex.width) if xd is not None else \
++            torch.empty((n, ex.width), dtype=torch.float16, device=device)
++        if xr is not None and (xr.dtype != torch.float16 or not xr.is_contiguous() or xr.numel() < rows * ex.dims):
++            raise ValueError("mpe.Scratch: the lent xr is too small")
++        self.xr = xr.view(-1)[:rows * ex.dims].view(rows, ex.dims) if xr is not None else \
++            torch.empty((rows, ex.dims), dtype=torch.float16, device=device)
++
++
++def pairs(x: torch.Tensor, pick: torch.Tensor, ex: Exl3RoutedExperts, scratch: Scratch, y: torch.Tensor,
++          limit: float = math.inf, act_mode: int = ACT_F32) -> torch.Tensor:
++    """y [R * S, D] fp32: row r * S + s = expert pick[r, s](x[r]), unweighted (picks outside [0, E): not written).
++    R <= scratch.rows; no host sync."""
++
++    ext = _ext()
++    R, S = pick.shape
++    if R > scratch.rows or S != scratch.slots:
++        raise ValueError(f"{R} rows x {S} slots but the scratch holds {scratch.rows} x {scratch.slots}")
++    P = R * S
++    if y.dtype != torch.float32 or not y.is_contiguous() or y.shape[0] < P or y.shape[1] != ex.dims:
++        raise ValueError("mpe.pairs: y contiguous fp32 [>= R * S, D]")
++    pick = pick.contiguous()
++    items = min(scratch.max_items, -(-P // ext.item_rows()) + min(P, ex.count))
++    ext.route(pick, ex.count, scratch.sorted, scratch.items, scratch.count, items)
++    xd = scratch.xd.view(-1)[:P * ex.width].view(P, ex.width)
++    ext.experts(x, scratch.sorted[:P], scratch.items, scratch.count, ex.gate_ptr, ex.up_ptr, ex.down_ptr,
++                ex.gate_k2, ex.down_k2, ex.suh_g, ex.suh_u, ex.svh_g, ex.svh_u, ex.suh_d, ex.svh_d, scratch.xr, xd, y,
++                ex.dims, ex.width, S, items, float(limit), act_mode, ex.cb)
++    return y[:P]
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index d2bb752..a7879e8 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -115,7 +115,7 @@ class Buffers:
+         # full GLM-5.3: the universal kernels' per-slot outputs (``gx.y``) are the expert rows; no copy of them
+         self.ey = None if c.full else torch.empty((rows, slots, D), dtype=bf if prefill and not exl3 else f32,
+                                                   device=dev)
+-        self.exl3 = self.gx = self.px = None
++        self.exl3 = self.gx = self.px = self.mpx = None
+         prompt = False
+         if c.full:                       # mixed-width EXL3 experts (the universal grouped kernels), shared expert BF16
+             from types import SimpleNamespace
+@@ -124,12 +124,14 @@ class Buffers:
+ 
+             # sized by the largest expert width a rank holds (the rotated layout's), every layer's fits
+             self.gx = generic.Scratch(SimpleNamespace(dims=D, width=ml, count=c.experts), rows, slots, device=dev)
+-            # drowzeys' prompt kernels for prompt chunks (route, gate|up, down), xd lent from gx
+-            if prefill and PROMPT_EXPERTS and torch.device(dev).type == "cuda":
+-                from tensorfold.cuda.exl3 import prompt_experts
+-
+-                self.px = prompt_experts.PromptScratch(SimpleNamespace(width=ml, count=c.experts), rows, slots,
+-                                                       device=dev, xd=self.gx.xd)
++            # prompt chunks' expert kernels (``PROMPT_EXPERTS``), their buffers lent from gx (unused by prompts)
++            if prefill and PROMPT_EXPERTS != "0" and torch.device(dev).type == "cuda":
++                from tensorfold.cuda.exl3 import mpe, prompt_experts
++
++                shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
++                if PROMPT_EXPERTS == "mpe":
++                    self.mpx = mpe.Scratch(shape, rows, slots, device=dev, xd=self.gx.xd, xr=self.gx.xg)
++                self.px = prompt_experts.PromptScratch(shape, rows, slots, device=dev, xd=self.gx.xd)
+             # the shared expert's rows at the largest width a layer gives this rank, viewed at each layer's own width
+             # (``shared_rows``: contiguous [rows, width] views of the same memory)
+             sl = tp.of(w).shared
+@@ -888,7 +890,13 @@ def moe_full_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tenso
+         for a in range(lo, hi, EXL3_BLOCK_ROWS):
+             z = min(hi, a + EXL3_BLOCK_ROWS)
+             with prof.timed("moe: routed (exl3)"):
+-                if b.px is not None and prompt_ok(m.experts):
++                kind = prompt_ok(m.experts) if b.px is not None else None
++                if kind == "mpe" and b.mpx is not None:
++                    from tensorfold.cuda.exl3 import mpe
++
++                    y = mpe.pairs(b.normed[a:z], b.pick[a:z], m.experts, b.mpx, b.gx.y, c.limit,
++                                  act_mode=generic.ACT_BF16)
++                elif kind is not None:
+                     from tensorfold.cuda.exl3 import prompt_experts
+ 
+                     y = prompt_experts.prompt_pairs(b.normed[a:z], b.pick[a:z], m.experts, b.px, b.gx.y, c.limit,
+@@ -905,23 +913,31 @@ def moe_full_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tenso
+ 
+ 
+ EXL3_BLOCK_ROWS = 2176    # a whole prompt chunk (2,048 rows and the split's pad): 2,176 x 9 x 4 bytes = 77 KiB
+-# prompt chunks' routed experts through drowzeys' prompt kernels (cuda/exl3/prompt_experts: the trellis decoded once
+-# for up to 112 rows of an expert, the input rotation moved onto the decoded weights, gate|up and down in two launches),
+-# in their pairs mode (each slot's row stored, no atomics: a prompt's bits the same every run, rows independent of each
+-# other and of the chunking); prompt rows' bits then differ from the decode kernels' (both exact run to run).
+-# TF_GLM_PROMPT_EXPERTS=0: the universal grouped kernels for prompts too.
+-PROMPT_EXPERTS = os.environ.get("TF_GLM_PROMPT_EXPERTS", "1") != "0"
+-
+-
+-def prompt_ok(ex) -> bool:
+-    """Whether a layer's experts suit the prompt kernels (checked once a layer; a host sync at the first prompt)."""
+-
+-    ok = getattr(ex, "_prompt_ok", None)
+-    if ok is None:
+-        from tensorfold.cuda.exl3 import prompt_experts
+-
+-        ok = ex._prompt_ok = prompt_experts.supported(ex)
+-    return ok
++# Prompt chunks' routed experts (TF_GLM_PROMPT_EXPERTS):
++#   mpe (default): Mia's prompt experts (cuda/exl3/mpe: each row rotated once a layer, the trellis decoded once for
++#        up to 64 rows of an expert on tensor cores, gate and up off one staged input); layers whose experts do not
++#        share gate's and up's input scales take
++#   pe:  drowzeys' prompt kernels (cuda/exl3/prompt_experts, their pairs mode: the rotation moved onto the weights);
++#   0:   the universal grouped kernels for prompts too.
++# Every pair's row is stored (no atomics): a prompt's bits are the same every run, rows independent of each other and
++# of the chunking; prompt rows' bits differ from the decode kernels' (each exact run to run).
++PROMPT_EXPERTS = os.environ.get("TF_GLM_PROMPT_EXPERTS", "mpe").strip()
++if PROMPT_EXPERTS not in ("mpe", "pe", "0", "1"):
++    raise ValueError(f"TF_GLM_PROMPT_EXPERTS: mpe, pe or 0, not {PROMPT_EXPERTS!r}")
++PROMPT_EXPERTS = "pe" if PROMPT_EXPERTS == "1" else PROMPT_EXPERTS
++
++
++def prompt_ok(ex) -> str | None:
++    """Which prompt kernels a layer's experts take ("mpe", "pe" or None; checked once a layer, a host sync)."""
++
++    kind = getattr(ex, "_prompt_kind", False)
++    if kind is False:
++        from tensorfold.cuda.exl3 import mpe, prompt_experts
++
++        kind = "mpe" if PROMPT_EXPERTS == "mpe" and mpe.supported(ex) else \
++            "pe" if prompt_experts.supported(ex) else None
++        ex._prompt_kind = kind
++    return kind
+ 
+ 
+ def mlp_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:

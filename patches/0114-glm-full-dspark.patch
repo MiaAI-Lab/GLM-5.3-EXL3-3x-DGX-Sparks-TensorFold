@@ -1,0 +1,200 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 113e3d4..a86fe54 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -767,6 +767,7 @@ class DepthPolicy:
+                  mtp_ms: tuple[float, ...] | None = None) -> None:
+         self.most, self.fixed, self.low, self.high = most, fixed, low, high
+         self.mtp_ms = mtp_ms              # MTP chains: ms of a round of k drafts (``draft``'s cost rule)
++        self.learned = False              # a drafter with its own confidences (DSpark) takes round_ms without beta
+         self.confidence = confidence
+         self.beta, self.round_ms = beta, round_ms
+         self.rate = 0.8
+@@ -775,7 +776,9 @@ class DepthPolicy:
+     def chain_rule(self) -> dict:
+         """Drafter.propose's keyword arguments for the noise-aware rules (none for the others)."""
+ 
+-        return {"beta": self.beta, "round_ms": self.round_ms} if self.beta > 0 else {}
++        if self.beta > 0 or (self.round_ms is not None and self.learned):
++            return {"beta": self.beta, "round_ms": self.round_ms}
++        return {}
+ 
+     def next(self, drafted: int, accepted: int) -> int:
+         if self.fixed:
+diff --git tensorfold/families/glm5_next/cuda/dspark.py tensorfold/families/glm5_next/cuda/dspark.py
+index a078e85..2c4bbc7 100644
+--- tensorfold/families/glm5_next/cuda/dspark.py
++++ tensorfold/families/glm5_next/cuda/dspark.py
+@@ -421,7 +421,20 @@ class Drafter(_DFlash2):
+ 
+         n = self.block
+         x = torch.empty((n, self.D), dtype=torch.bfloat16, device=self.dev)
+-        glue.embed(self.ids, self.w.embed, self.D, 1, x)
++        meta = getattr(self.w, "meta", None) or {}
++        if "embed_offset" in meta:
++            # full GLM-5.3's embedding is split by vocabulary rows: each rank writes the rows it holds (zeros for the
++            # rest), the ranks' fp32 parts gathered and summed onto zeros (forward.embed_rows: exactly the bf16 rows)
++            from .dsa_full import embed_part
++
++            part = torch.empty((n, self.D), dtype=torch.float32, device=self.dev)
++            embed_part(self.ids, self.w.embed, meta["embed_offset"], part)
++            every = torch.empty((self.world * n * self.D,), dtype=torch.float32, device=self.dev)
++            self.w.comm.all_gather(part.view(-1), every)
++            x.zero_()
++            glue.residual_add(x, x, every.view(self.world, n, self.D))
++        else:
++            glue.embed(self.ids, self.w.embed, self.D, 1, x)
+         cos, sin = self._rotary(n)
+         idx = self._slots(n)
+         for i in range(len(self.layers)):
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 6ea50f4..f02c7bd 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -365,6 +365,29 @@ def multi_draft_bytes(t: dict, streams: int, world: int = 2, *, ring: bool, capa
+     return 2 * layers * heads * hd * (streams * cap + trash) * 2
+ 
+ 
++def dspark_weights(draft_dir, rank: int, world: int):
++    """A DSpark speculator's weights as held on this rank (``dspark.memory``: 4-bit copies) and their bf16 staging."""
++
++    from tensorfold.cuda.capacity import Weights
++
++    from .dspark import DSparkConfig, memory
++
++    m = memory(DSparkConfig.read(Path(draft_dir)), rank, world)
++    return Weights(m["weights"], m["weights"] * 4)
++
++
++def is_dspark(draft_dir) -> bool:
++    """Whether ``draft_dir`` holds a DSpark speculator (``dspark``: speculators_model_type "dspark", full GLM-5.3's)
++    rather than a DFlash2 drafter."""
++
++    if draft_dir is None:
++        return False
++    try:
++        return json.loads((Path(draft_dir) / "config.json").read_text()).get("speculators_model_type") == "dspark"
++    except (OSError, ValueError):
++        return False
++
++
+ def draft_fraction(draft_dir, rank: int, world: int):
+     """``geometry.dflash2_weights``'s per-rank rows of the drafter at ``draft_dir`` (``tp.draft_parts``)."""
+ 
+@@ -521,8 +544,9 @@ class GlmEngine:
+             # (``hcsplit``: the residual add and the next RMSNorm on own rows), without the fronts (OVERLAP=2)
+             if parallel != 1:
+                 raise ValueError("full GLM-5.3 serves one request at a time on CUDA (--parallel 1)")
+-            if drafter is not None:
+-                raise ValueError("full GLM-5.3 drafts with its MTP head; DFlash2 (--drafter) is GLM-5.3-Flash's")
++            if drafter is not None and not is_dspark(drafter):
++                raise ValueError("full GLM-5.3 drafts with its MTP head or a DSpark speculator (--drafter); DFlash2 is "
++                                 "GLM-5.3-Flash's")
+             if vision:
+                 raise ValueError("full GLM-5.3 is a text model (no --vision)")
+             if self.split.fronts:
+@@ -638,9 +662,17 @@ class GlmEngine:
+                 return g
+             return Geometry(lambda slots: g.bytes_at(slots) + extra + per * slots, g.reserve, g.minimum_slots)
+ 
++        dspark = is_dspark(drafter)
++
+         def draft_geometry(text):
+             from tensorfold.cuda.capacity import Geometry
+ 
++            if dspark:                       # DSpark: its context ring and block buffers (dspark.memory)
++                from .dspark import DSparkConfig, memory
++
++                m = memory(DSparkConfig.read(Path(drafter)), rank, world)
++                return Geometry(lambda slots: m["kv"] + m["fixed"], 0)
++
+             g = dflash2_geometry(text, world, MAX_ROWS, ring=DRAFT_RING,
+                                  kv_heads=tp_mod.split_sizes(int(text["num_key_value_heads"]), world, 1)[rank])
+             if parallel == 1:
+@@ -651,7 +683,8 @@ class GlmEngine:
+         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
+                                    geometry,
+                                    weights_estimate, rank=rank, world=world, gather=self._gather_ints,
+-                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, world, draft_fraction(d, rank, world)),
++                                   draft_dir=drafter, draft_weights=lambda d: (dspark_weights(d, rank, world) if dspark else
++                                                                               dflash2_weights(d, world, draft_fraction(d, rank, world))),
+                                    draft_geometry=draft_geometry)
+         self.limit = self.capacity_plan["context_window"]
+         capacity = self.capacity_plan["cache_slots"]
+@@ -765,7 +798,10 @@ class GlmEngine:
+                   ("DFlash2 drafts every request" if drafter is not None else "--no-drafts"), flush=True)
+         self.drafter = None
+         if drafter is not None:
+-            from .dflash2 import Drafter
++            if is_dspark(drafter):                   # full GLM-5.3's DSpark speculator (``dspark``)
++                from .dspark import Drafter
++            else:
++                from .dflash2 import Drafter
+ 
+             self.drafter = Drafter(drafter, w, capacity=pool_rows or capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING)
+         self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=graphs,
+@@ -995,6 +1031,18 @@ class GlmEngine:
+             return encode_policy(DFLASH_POLICY) if code[0] in (4, 5) else [code[0] + 10] + code[1:]
+         return code
+ 
++    def _f_policy(self):
++        """The automatic policy's drafter chains: DFlash2 blocks of 5 cut at a confidence product of 0.3; a DSpark
++        speculator's 8 drafts cut where its learned confidences' expected tokens a ms peak (the startup costs)."""
++
++        from .decode import DepthPolicy
++
++        if self.drafter is not None and type(self.drafter).__module__.endswith(".dspark") and self.costs is not None:
++            p = DepthPolicy(min(8, MAX_ROWS - 1), fixed=True, round_ms=round_costs(self.costs))
++            p.learned = True
++            return p
++        return DepthPolicy(5, fixed=True, confidence=0.3)
++
+     def _drafters(self, code: list[int]) -> tuple[bool, bool, bool]:
+         """(auto, MTP drafts, DFlash2 drafts) for a policy code."""
+ 
+@@ -1194,7 +1242,7 @@ class GlmEngine:
+                 choice = DrafterChoice(self.costs, first="f" if greedy else "m", explore=explore, every=every,
+                                        margin=margin)
+             res = auto_decode(self.e, drafter, first, max_tokens, sampling, choice=choice, m_policy=m_policy,
+-                              f_policy=DepthPolicy(5, fixed=True, confidence=0.3), stop_eos=stop_eos,
++                              f_policy=self._f_policy(), stop_eos=stop_eos,
+                               on_tokens=on_tokens, copies=copies)
+         elif use_dflash:
+             res = dflash_decode(self.e, self.drafter, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+diff --git tensorfold/families/glm_moe_dsa/__init__.py tensorfold/families/glm_moe_dsa/__init__.py
+index e116d37..e6e7f5f 100644
+--- tensorfold/families/glm_moe_dsa/__init__.py
++++ tensorfold/families/glm_moe_dsa/__init__.py
+@@ -38,8 +38,8 @@ def check(model_dir: str | Path) -> None:
+ 
+ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
+                 master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None, **options: Any):
+-    """The N-rank engine (N = 3 or 4) with MTP drafts (exact: drafted replies equal serial ones), or serial decoding
+-    with --no-drafts."""
++    """The N-rank engine (N = 3 or 4) with MTP drafts, or a DSpark speculator's (--drafter: its folder) (exact:
++    drafted replies equal serial ones), or serial decoding with --no-drafts."""
+ 
+     tp = int(tp)
+     if tp not in CUDA_TP:
+@@ -49,15 +49,18 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+         raise ValueError(f"--tp {tp} needs --master: rank 0's address on the link between the machines")
+     if not 0 <= int(rank) < tp:
+         raise ValueError(f"--rank {rank}: 0 to {tp - 1} with --tp {tp}")
+-    if drafter and not no_drafts:
+-        raise ValueError("GLM-5.3 drafts with its MTP head: pass no --drafter")
++    from tensorfold.families.glm5_next.cuda.engine import is_dspark
++
++    if drafter and not no_drafts and not is_dspark(drafter):
++        raise ValueError("GLM-5.3 drafts with its MTP head or a DSpark speculator (--drafter: its folder, "
++                         "RedHatAI/GLM-5.3-speculator.dspark): pass no other --drafter")
+     if options.get("vision"):
+         raise ValueError("GLM-5.3 is a text model: no --vision")
+     from tensorfold.families.glm5_next.cuda.engine import DEFAULT_POLICY, GlmEngine
+ 
+     policy = DEFAULT_POLICY if mtp_drafts is None else str(int(mtp_drafts))
+     return GlmEngine(Path(model_dir), rank=int(rank), world=tp, master=master, port=int(master_port), policy=policy,
+-                     drafter=None, context=options.get("context"), context_explicit=options.get("context_explicit"),
++                     drafter=Path(drafter) if drafter and not no_drafts else None, context=options.get("context"), context_explicit=options.get("context_explicit"),
+                      serial_only=bool(no_drafts), parallel=int(options.get("parallel", 1)))
+ 
+ 
