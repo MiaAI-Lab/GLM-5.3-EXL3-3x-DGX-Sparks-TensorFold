@@ -70,7 +70,7 @@ third-party notices that go with it.
   ([drowzeys/TensorFold](https://github.com/drowzeys/TensorFold), branch `glm-moe-dsa-tp4`, commit befd47d, Apache
   2.0: `glm_moe_dsa/cuda/fused.py`'s `select`, `_attn_dcp`, `_merge_lse`, `_dcp_combine`); the code and kernels (FP8
   rows, separate rotary plane, exact top-k merge, fp32 partials) are ours.
-- `0114-glm-full-dspark` (`DRAFTER=dspark`, the default; the drafter, `dspark.py`, arrives with patch 0113, and 0117
+- `0114-glm-full-dspark` (`DRAFTER=dspark`, the default; it adds the drafter, `dspark.py`, and 0117
   adds its sampling filter): drafts with Red Hat AI's DSpark speculator (above). The drafter's forward, Markov bias
   and confidence head are adapted from [vllm-project/speculators](https://github.com/vllm-project/speculators)
   (commit 36a19ca) and [vLLM](https://github.com/vllm-project/vllm) (commit 5f30fc7) (both Apache 2.0); its file

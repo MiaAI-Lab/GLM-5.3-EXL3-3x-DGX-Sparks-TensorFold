@@ -1,9 +1,12 @@
 diff --git tensorfold/cuda/exl3/prompt_experts.cpp tensorfold/cuda/exl3/prompt_experts.cpp
 new file mode 100644
-index 0000000..0c1300a
+index 0000000..e93e089
 --- /dev/null
 +++ tensorfold/cuda/exl3/prompt_experts.cpp
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,67 @@
++// Host bindings for prompt_experts.cu. By drowzeys, from drowzeys' TensorFold fork
++// (https://github.com/drowzeys/TensorFold, branch glm-moe-dsa-tp4, commit befd47d; Apache-2.0); modified by
++// Mia's AI Lab (the pairs mode, see prompt_experts.cu).
 +#include <torch/extension.h>
 +#include <c10/cuda/CUDAGuard.h>
 +
@@ -70,10 +73,10 @@ index 0000000..0c1300a
 +}
 diff --git tensorfold/cuda/exl3/prompt_experts.cu tensorfold/cuda/exl3/prompt_experts.cu
 new file mode 100644
-index 0000000..8616291
+index 0000000..5adb751
 --- /dev/null
 +++ tensorfold/cuda/exl3/prompt_experts.cu
-@@ -0,0 +1,877 @@
+@@ -0,0 +1,878 @@
 +// EXL3 routed experts for prompt chunks (hundreds to thousands of rows): a width per expert (any codebook), tensor
 +// cores, trellis decoded on the fly, no dequantized weights and no rotated inputs in memory.
 +//
@@ -96,7 +99,8 @@ index 0000000..8616291
 +// down input's rotation: xd [pairs, I] fp16 in routed order; also zeroes out), down (+ svh, routing weight, red.add
 +// into an fp32 out; items fastest in the grid so a column slab of out stays in L2).
 +//
-+// By drowzeys, from drowzeys' TensorFold fork (https://github.com/drowzeys/TensorFold, branch glm-moe-dsa-tp4, commit befd47d; Apache-2.0). Modified by Mia's AI Lab: a pairs mode (down
++// By drowzeys, from drowzeys' TensorFold fork (https://github.com/drowzeys/TensorFold, branch glm-moe-dsa-tp4,
++// commit befd47d; Apache-2.0). Modified by Mia's AI Lab: a pairs mode (down
 +// stores each pair's unweighted row into [pairs, D], no zeroing, no atomics), so a prompt's bits do not depend on the
 +// order the items run in.
 +
@@ -953,10 +957,10 @@ index 0000000..8616291
 +}
 diff --git tensorfold/cuda/exl3/prompt_experts.py tensorfold/cuda/exl3/prompt_experts.py
 new file mode 100644
-index 0000000..09787ee
+index 0000000..9b85a09
 --- /dev/null
 +++ tensorfold/cuda/exl3/prompt_experts.py
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,156 @@
 +"""Routed EXL3 experts for prompt chunks (hundreds to thousands of rows): tensor cores, a width per expert (2, 3 or 4
 +bits), trellis decoded on the fly, each expert's input Hadamard rotation moved onto its decoded weights
 +(prompt_experts.cu), so neither dequantized weights nor rotated inputs ever reach memory.
@@ -969,7 +973,8 @@ index 0000000..09787ee
 +row's arithmetic not depending on the other rows or the item it lands in, so the same bits every run and any chunking;
 +the caller adds the slots in slot order (glue.combine_shared).
 +
-+By drowzeys, from drowzeys' TensorFold fork (https://github.com/drowzeys/TensorFold, branch glm-moe-dsa-tp4, commit befd47d; Apache-2.0); the pairs mode added by Mia's AI Lab.
++By drowzeys, from drowzeys' TensorFold fork (https://github.com/drowzeys/TensorFold, branch glm-moe-dsa-tp4, commit
++befd47d; Apache-2.0); the pairs mode added by Mia's AI Lab.
 +"""
 +
 +from __future__ import annotations

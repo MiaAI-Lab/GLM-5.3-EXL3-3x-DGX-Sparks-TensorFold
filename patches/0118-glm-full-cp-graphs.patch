@@ -1,8 +1,8 @@
 diff --git tensorfold/families/glm5_next/cuda/dcp.py tensorfold/families/glm5_next/cuda/dcp.py
-index b488edc..242b7b2 100644
+index 6b02c9b..5db5f58 100644
 --- tensorfold/families/glm5_next/cuda/dcp.py
 +++ tensorfold/families/glm5_next/cuda/dcp.py
-@@ -157,7 +157,8 @@ def score_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank: i
+@@ -158,7 +158,8 @@ def score_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank: i
  
  
  def select_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank: int, G: int, pos_dev: torch.Tensor,
@@ -12,7 +12,7 @@ index b488edc..242b7b2 100644
      """A rank's candidates for R rows at positions pos .. pos + R - 1 (``pos_dev``: device [1]): int64 [R, k] packed
      keys (uint64 bits) of its min(k, visible) best local tokens, ascending position, 0 padded. ``cols``: the local
      columns scored (default all of ``keys``' slots; a decode graph's bucket, ``local_cols``), at least the last row's
-@@ -173,7 +174,8 @@ def select_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank:
+@@ -174,7 +175,8 @@ def select_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank:
      B = min(R, SELECT_ROWS)
      if B == 0:
          return cand
@@ -22,7 +22,7 @@ index b488edc..242b7b2 100644
      block, warps = (4096, 8) if NT > 1024 else (1024, 4)
      for a in range(0, R, B):
          n = min(B, R - a)
-@@ -272,7 +274,8 @@ def _merge_lse(PO, PM, PL, O, LSE, R, H: tl.constexpr, LW: tl.constexpr, NCH: tl
+@@ -273,7 +275,8 @@ def _merge_lse(PO, PM, PL, O, LSE, R, H: tl.constexpr, LW: tl.constexpr, NCH: tl
  
  def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Tensor, rope: torch.Tensor | None,
                        slots: torch.Tensor, counts: torch.Tensor, scale: float, *, o: torch.Tensor | None = None,
@@ -32,7 +32,7 @@ index b488edc..242b7b2 100644
      """A rank's partial latent attention: absorbed queries qa [R, H, 512] and rotary queries qp [R, H, 64] (bf16,
      every head of the rows) over its own selected tokens (``select_merge``: local slots, counts) of its local
      caches (latent: bf16 [slots, 512] or kv8 FP8 uint8 [slots, 528]; rotary keys rope [slots, 64] bf16) -> o
-@@ -292,9 +295,12 @@ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Te
+@@ -293,9 +296,12 @@ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Te
      lse = torch.empty((R, H), dtype=torch.float32, device=dev) if lse is None else lse
      if R == 0:
          return o, lse
@@ -96,7 +96,7 @@ index ddcf70e..6302462 100644
          self.comm.barrier()
          self.w = w
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index 3a3d367..904d0bd 100644
+index 9263f09..c312e44 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
 @@ -911,13 +911,18 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p

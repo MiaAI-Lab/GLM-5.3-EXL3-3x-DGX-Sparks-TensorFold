@@ -15,7 +15,7 @@ index b32fd52..9e2ef78 100644
                  print(f"[tensorfold] context parallelism: each of the {world} ranks keeps every {world}th token's "
                        f"caches; {'captured' if graphs else 'eager'} decode windows, no kept prompt states",
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index 904d0bd..9052f4e 100644
+index c312e44..b5d58b9 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
 @@ -906,6 +906,15 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p

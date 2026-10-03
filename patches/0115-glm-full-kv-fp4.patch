@@ -20,10 +20,10 @@ index cf05261..7082dab 100644
  
  
 diff --git tensorfold/families/glm5_next/cuda/dcp.py tensorfold/families/glm5_next/cuda/dcp.py
-index 22c5f42..b488edc 100644
+index 70f0ff2..6b02c9b 100644
 --- tensorfold/families/glm5_next/cuda/dcp.py
 +++ tensorfold/families/glm5_next/cuda/dcp.py
-@@ -30,7 +30,7 @@ import torch
+@@ -31,7 +31,7 @@ import torch
  import triton
  import triton.language as tl
  
@@ -32,7 +32,7 @@ index 22c5f42..b488edc 100644
  from .dsa_full import BT, MIN_BUCKET, ROW_G, SELECT_ROWS, TOPK, _order_key, _wscale
  
  WORLD = 3            # ranks a context-parallel cache is spread over by default
-@@ -298,9 +298,10 @@ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Te
+@@ -299,9 +299,10 @@ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Te
      vals, scl, rs, fp8 = latent._cache_parts(cache, LW)
      QP, KR, ROPE = latent._rope_args(qp, rope, R, H)
      latent._sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, slots, counts, po, pm, pl, R, W=W, H=H, LW=LW,

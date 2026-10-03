@@ -222,7 +222,7 @@ license). Neither is part of this repository.
 Built on [TensorFold](https://github.com/ashhart/TensorFold) v0.6.0 (Ash Hart and the TensorFold contributors;
 Apache 2.0, MIT for code written before v0.6.0). Patch 0106 carries drowzeys' EXL3 prompt-expert kernels and the
 context parallelism of 0112-0113 follows their scheme, both from
-[drowzeys/TensorFold](https://github.com/drowzeys/TensorFold) (Apache 2.0); the DSpark drafter (0113-0114) is adapted
+[drowzeys/TensorFold](https://github.com/drowzeys/TensorFold) (Apache 2.0); the DSpark drafter (0114) is adapted
 from [vllm-project/speculators](https://github.com/vllm-project/speculators) and
 [vLLM](https://github.com/vllm-project/vllm) (Apache 2.0); patches 0001-0068 carry the GLM-5.3-Flash recipe's
 credits (b12x, jayleaton/glm53-tensorfold-spark and others). Made by Mia's AI Lab.

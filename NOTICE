@@ -113,8 +113,8 @@ drowzeys/TensorFold (a TensorFold fork)
 vllm-project/speculators and vLLM
   https://github.com/vllm-project/speculators (commit 36a19ca), https://github.com/vllm-project/vllm (commit 5f30fc7)
   Copyright the vLLM project contributors. Apache License, Version 2.0.
-  patches/0113-glm-full-context-parallel.patch adds tensorfold/families/glm5_next/cuda/dspark.py (0114 wires it in,
-  0117 adds its sampling filter); it adapts the DSpark drafter's forward (taps -> fc -> hidden_norm, the block of
+  patches/0114-glm-full-dspark.patch adds tensorfold/families/glm5_next/cuda/dspark.py and wires it in (0117 adds
+  its sampling filter); it adapts the DSpark drafter's forward (taps -> fc -> hidden_norm, the block of
   anchor and mask tokens, the Markov bias W2 W1[prev], the confidence head) from speculators'
   src/speculators/models/dspark and dflash, and vLLM's qwen3_dspark.py and v1/worker/gpu/spec_decode/dspark; rewritten
   on TensorFold's DFlash2 kernels, split over the ranks. Its header lists the files and functions.

@@ -650,7 +650,7 @@ index 0000000..2d8cd53
 +                ex.dims, ex.width, S, items, float(limit), act_mode, ex.cb)
 +    return y[:P]
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index d2bb752..a7879e8 100644
+index d2bb752..1f96d0c 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
 @@ -115,7 +115,7 @@ class Buffers:
@@ -723,7 +723,7 @@ index d2bb752..a7879e8 100644
 +#   mpe (default): Mia's prompt experts (cuda/exl3/mpe: each row rotated once a layer, the trellis decoded once for
 +#        up to 64 rows of an expert on tensor cores, gate and up off one staged input); layers whose experts do not
 +#        share gate's and up's input scales take
-+#   pe:  drowzeys' prompt kernels (cuda/exl3/prompt_experts, their pairs mode: the rotation moved onto the weights);
++#   pe:  drowzeys' prompt kernels (cuda/exl3/prompt_experts: the rotation moved onto the weights) in our pairs mode;
 +#   0:   the universal grouped kernels for prompts too.
 +# Every pair's row is stored (no atomics): a prompt's bits are the same every run, rows independent of each other and
 +# of the chunking; prompt rows' bits differ from the decode kernels' (each exact run to run).

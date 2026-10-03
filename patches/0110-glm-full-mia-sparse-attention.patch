@@ -17,7 +17,7 @@ index 6056e21..113e3d4 100644
              self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
              self.pbuf.set_taps(tuple(taps), w.cfg.hidden)
 diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
-index a7879e8..686a518 100644
+index 1f96d0c..ac6f1b0 100644
 --- tensorfold/families/glm5_next/cuda/forward.py
 +++ tensorfold/families/glm5_next/cuda/forward.py
 @@ -844,11 +844,18 @@ def dsa_full_block(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor
