@@ -1,0 +1,171 @@
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 4408991..40b0fcf 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -968,9 +968,26 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+                 allq = allq.reshape(n, G * HP, LW + RD)
+                 qa_all = allq[:, :, :LW].contiguous()
+                 qp_all = allq[:, :, LW:].contiguous()
+-            o, lse = dcp.attention_partial(qa_all, qp_all, lc, kr, tokens[r0:r1], counts[r0:r1], scale,
+-                                           o=sc.o[:n] if sc else None, lse=sc.lse[:n] if sc else None,
+-                                           parts=sc.parts if sc else None)
++            if b.prefill and CP_PROMPT_MSA and qa_all.is_cuda and msa_ok(qa_all[:, :HP].contiguous(), lc, kr):
++                # prompt rows: Mia's sparse attention a rank's head group at a time over this rank's tokens, its bf16
++                # output and per-head log-sum-exp straight into the exchange (``msa.prompt_lse``)
++                from . import msa
++
++                ob = torch.empty((n, G * HP, LW), dtype=torch.bfloat16, device=qa.device)
++                lse = torch.empty((n, G * HP), dtype=torch.float32, device=qa.device)
++                for gq in range(G):
++                    hs = slice(gq * HP, (gq + 1) * HP)
++                    og, lg = torch.empty((n, HP, LW), dtype=torch.bfloat16, device=qa.device), \
++                        torch.empty((n, HP), dtype=torch.float32, device=qa.device)
++                    msa.prompt_lse(qa_all[:, hs].contiguous(), lc, tokens[r0:r1], counts[r0:r1], og, lg, scale,
++                                   qp_all[:, hs].contiguous(), kr)
++                    ob[:, hs].copy_(og)
++                    lse[:, hs].copy_(lg)
++                o = None
++            else:
++                o, lse = dcp.attention_partial(qa_all, qp_all, lc, kr, tokens[r0:r1], counts[r0:r1], scale,
++                                               o=sc.o[:n] if sc else None, lse=sc.lse[:n] if sc else None,
++                                               parts=sc.parts if sc else None)
+             # each head owner's partials of every rank, rank order (own slot copied); the normalized outputs travel
+             # as bf16 (every rank's alike, its own too: the merge does not depend on who owns the head), the
+             # log-sum-exps as fp32
+@@ -985,7 +1002,7 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+                 sl.copy_(lse.view(n, G, HP).permute(1, 0, 2))
+                 sends = {p: [so[p], sl[p]] for p in range(G) if p != rank}
+             else:
+-                ob = o.to(torch.bfloat16)
++                ob = o.to(torch.bfloat16) if o is not None else ob
+                 got_o = torch.empty((G, n, HP, LW), dtype=torch.bfloat16, device=qa.device)
+                 got_l = torch.empty((G, n, HP), dtype=torch.float32, device=qa.device)
+                 sends = {p: [ob[:, p * HP:(p + 1) * HP].contiguous(), lse[:, p * HP:(p + 1) * HP].contiguous()]
+@@ -1004,6 +1021,9 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+                     site=(layer.index, "a"))
+ 
+ 
++# TF_GLM_CP_PROMPT_MSA (default 1): context-parallel prompt chunks attend through Mia's sparse attention (0129), not
++# the chunk programs; 0: the chunk programs as before
++CP_PROMPT_MSA = os.environ.get("TF_GLM_CP_PROMPT_MSA", "1") != "0"
+ CP_PROMPT_ROWS = 512       # context parallelism: a prompt chunk's rows a query gather / partials exchange takes
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/msa.cpp tensorfold/families/glm5_next/cuda/msa.cpp
+index a66d4d6..aac65e2 100644
+--- tensorfold/families/glm5_next/cuda/msa.cpp
++++ tensorfold/families/glm5_next/cuda/msa.cpp
+@@ -3,7 +3,7 @@
+ #include <c10/cuda/CUDAGuard.h>
+ 
+ void msa_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+-                     const at::Tensor&, at::Tensor&, double);
++                     const at::Tensor&, at::Tensor&, float*, double);
+ 
+ void prompt(const at::Tensor& qa, const at::Tensor& qp, const at::Tensor& cache, const at::Tensor& rope,
+             const at::Tensor& tokens, const at::Tensor& counts, at::Tensor out, double scale) {
+@@ -16,7 +16,25 @@ void prompt(const at::Tensor& qa, const at::Tensor& qp, const at::Tensor& cache,
+                     tokens.size(0) >= qa.size(0) && counts.size(0) >= qa.size(0),
+                 "msa: shapes");
+     c10::cuda::CUDAGuard guard(qa.device());
+-    msa_prompt_cuda(qa, qp, cache, rope, tokens, counts, out, scale);
++    msa_prompt_cuda(qa, qp, cache, rope, tokens, counts, out, nullptr, scale);
+ }
+ 
+-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("prompt", &prompt); }
++// prompt with each row's per-head log-sum-exp (fp32 [R, H]) too, and rows without tokens written as 0 / -inf: a
++// context-parallel rank's partial over its own tokens
++void prompt_lse(const at::Tensor& qa, const at::Tensor& qp, const at::Tensor& cache, const at::Tensor& rope,
++                const at::Tensor& tokens, const at::Tensor& counts, at::Tensor out, at::Tensor lse, double scale) {
++    TORCH_CHECK(lse.is_cuda() && lse.scalar_type() == at::kFloat && lse.is_contiguous() && lse.dim() == 2 &&
++                    lse.size(0) == qa.size(0) && lse.size(1) == qa.size(1),
++                "msa: a contiguous fp32 [R, H] lse");
++    auto ok = [](const at::Tensor& x, at::ScalarType t) { return x.is_cuda() && x.scalar_type() == t && x.is_contiguous(); };
++    TORCH_CHECK(ok(qa, at::kBFloat16) && ok(qp, at::kBFloat16) && ok(rope, at::kBFloat16) && ok(out, at::kBFloat16) &&
++                    ok(cache, at::kByte) && ok(tokens, at::kInt) && ok(counts, at::kInt) && out.sizes() == qa.sizes(),
++                "msa: shapes and types as prompt");
++    c10::cuda::CUDAGuard guard(qa.device());
++    msa_prompt_cuda(qa, qp, cache, rope, tokens, counts, out, lse.data_ptr<float>(), scale);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("prompt", &prompt);
++    m.def("prompt_lse", &prompt_lse);
++}
+diff --git tensorfold/families/glm5_next/cuda/msa.cu tensorfold/families/glm5_next/cuda/msa.cu
+index 26db0ff..1ad8331 100644
+--- tensorfold/families/glm5_next/cuda/msa.cu
++++ tensorfold/families/glm5_next/cuda/msa.cu
+@@ -111,11 +111,18 @@ template <bool FP4>
+ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+     const __nv_bfloat16* __restrict__ qa, const __nv_bfloat16* __restrict__ qp, const uint8_t* __restrict__ cache,
+     const __nv_bfloat16* __restrict__ rope, const int* __restrict__ tokens, const int* __restrict__ counts,
+-    __nv_bfloat16* __restrict__ out, int H, int W, float scale) {
++    __nv_bfloat16* __restrict__ out, float* __restrict__ lse, int H, int W, float scale) {
+     extern __shared__ __align__(16) unsigned char smem[];
+     const int r = blockIdx.x;
+     const int n = counts[r];
+-    if (n <= 0) return;
++    if (n <= 0) {                                       // lse (context parallelism): no local tokens, o 0, lse -inf
++        if (lse != nullptr) {
++            for (int i = threadIdx.x; i < H * LW / 2; i += NTHREADS)
++                reinterpret_cast<__nv_bfloat162*>(out + (size_t)r * H * LW)[i] = __floats2bfloat162_rn(0.f, 0.f);
++            if (threadIdx.x < H) lse[(size_t)r * H + threadIdx.x] = -INFINITY;
++        }
++        return;
++    }
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+     __nv_bfloat16* Q = reinterpret_cast<__nv_bfloat16*>(smem + SM_Q);
+     __nv_bfloat16* Z = reinterpret_cast<__nv_bfloat16*>(smem + SM_Z);
+@@ -377,6 +384,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+         }
+     }
+     __syncthreads();
++    // lse (context parallelism's merge of the ranks' partials): m + ln l of each head, fp32
++    if (lse != nullptr && threadIdx.x < H) lse[(size_t)r * H + threadIdx.x] = mst[threadIdx.x] + logf(lst[threadIdx.x]);
+     // out = O / l, bf16 (heads < H)
+ #pragma unroll
+     for (int a = 0; a < 2; ++a) {
+@@ -398,7 +407,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+ }  // namespace
+ 
+ void msa_prompt_cuda(const at::Tensor& qa, const at::Tensor& qp, const at::Tensor& cache, const at::Tensor& rope,
+-                     const at::Tensor& tokens, const at::Tensor& counts, at::Tensor& out, double scale) {
++                     const at::Tensor& tokens, const at::Tensor& counts, at::Tensor& out, float* lse, double scale) {
+     const int R = (int)qa.size(0), H = (int)qa.size(1);
+     TORCH_CHECK(H <= QH, "msa: at most ", QH, " heads a rank");
+     const bool fp4 = cache.size(1) == CROW4;
+@@ -414,7 +423,7 @@ void msa_prompt_cuda(const at::Tensor& qa, const at::Tensor& qp, const at::Tenso
+     (fp4 ? msa_kernel<true> : msa_kernel<false>)<<<R, NTHREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(
+         reinterpret_cast<const __nv_bfloat16*>(qa.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(qp.data_ptr()),
+         cache.data_ptr<uint8_t>(), reinterpret_cast<const __nv_bfloat16*>(rope.data_ptr()), tokens.data_ptr<int>(),
+-        counts.data_ptr<int>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), H, (int)tokens.size(1),
++        counts.data_ptr<int>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), lse, H, (int)tokens.size(1),
+         (float)scale);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+diff --git tensorfold/families/glm5_next/cuda/msa.py tensorfold/families/glm5_next/cuda/msa.py
+index f08c778..5713c69 100644
+--- tensorfold/families/glm5_next/cuda/msa.py
++++ tensorfold/families/glm5_next/cuda/msa.py
+@@ -17,7 +17,7 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_msa_v4", sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
++    return load(name="tensorfold_glm_msa_v5", sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
+                 extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
+ 
+ 
+@@ -32,3 +32,11 @@ def prompt(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts:
+     """latent.sparse_attention for prompt rows: rows with counts > 0 attend their tokens (ascending, -1 padded)."""
+ 
+     _ext().prompt(qa, qp, cache.view(torch.uint8), rope, tokens, counts, out, float(scale))
++
++
++def prompt_lse(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor, out: torch.Tensor,
++               lse: torch.Tensor, scale: float, qp: torch.Tensor, rope: torch.Tensor) -> None:
++    """``prompt`` and each row's per-head log-sum-exp (lse [R, H] fp32); rows without tokens: out 0, lse -inf. A
++    context-parallel rank's partial attention over its own tokens, merged across ranks by ``dcp.merge_ranks``."""
++
++    _ext().prompt_lse(qa, qp, cache.view(torch.uint8), rope, tokens, counts, out, lse, float(scale))

@@ -130,3 +130,41 @@ def test_mia_sparse_attention_matches_the_triton_kernels(kind):
         msa.prompt(qa[r:r + 1].contiguous(), cache, tok[r:r + 1].contiguous(), cnt[r:r + 1].contiguous(), one, 0.0625,
                    qp[r:r + 1].contiguous(), kr)
         assert torch.equal(one[0], got[r])
+
+
+@pytest.mark.parametrize("kind", ["fp8", "fp4"])
+def test_msa_lse_matches_partials(kind):
+    """0129: msa.prompt_lse (context parallelism's prompt partials) against dcp.attention_partial on the same lists:
+    outputs within bf16, log-sum-exps close, rows without tokens 0 / -inf, and the same output bits as msa.prompt."""
+    import torch
+
+    from tensorfold.families.glm5_next.cuda import dcp, kv8, latent, msa
+
+    torch.manual_seed(5)
+    dev = "cuda"
+    H, R, T, K = 22, 48, 5000, 2048
+    qa = (0.3 * torch.randn(R, H, 512, device=dev)).bfloat16()
+    qp = (0.3 * torch.randn(R, H, 64, device=dev)).bfloat16()
+    lat = torch.randn(T, 512, device=dev).bfloat16()
+    kr = torch.randn(T, 64, device=dev).bfloat16()
+    cache = kv8.zeros(T, 512, kind, dev)
+    latent.latent_write(lat, cache, torch.tensor([0], dtype=torch.int32, device=dev))
+    tok = torch.zeros((R, K), dtype=torch.int32, device=dev)
+    cnt = torch.zeros(R, dtype=torch.int32, device=dev)
+    for r in range(R):
+        n = [K, 9, 1, 700, 0][r % 5]
+        if n:
+            tok[r, :n] = torch.randperm(T, device=dev)[:n].sort().values.int()
+        cnt[r] = n
+    out = torch.empty(R, H, 512, dtype=torch.bfloat16, device=dev)
+    lse = torch.empty(R, H, dtype=torch.float32, device=dev)
+    msa.prompt_lse(qa, cache, tok, cnt, out, lse, 0.0625, qp, kr)
+    o_ref, l_ref = dcp.attention_partial(qa, qp, cache, kr, tok, cnt, 0.0625)
+    live = cnt > 0
+    err = (out[live].float() - o_ref[live]).abs().max().item()
+    assert err <= 0.02 * o_ref[live].abs().max().item(), err
+    assert (lse[live] - l_ref[live]).abs().max().item() < 2e-3
+    assert (out[~live] == 0).all() and torch.isneginf(lse[~live]).all()
+    plain = torch.zeros_like(out)
+    msa.prompt(qa, cache, tok, cnt, plain, 0.0625, qp, kr)
+    assert torch.equal(plain[live], out[live])
