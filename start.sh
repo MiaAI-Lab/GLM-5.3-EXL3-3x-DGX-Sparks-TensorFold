@@ -21,7 +21,7 @@
 # Setup: WORKER and WORKER2 in scripts/local.sh (scripts/local.sh.example), key-based ssh; the head exports its
 # Hugging Face cache over NFS to both workers (README "Weights over NFS").
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and their reasons in scripts/config.sh):
-#   serving  CONTEXT, PARALLEL, KV, DENSE, DRAFTER, MTP, CP, PREFILL_ROWS, PREFILL_SPLIT, PREFILL_OVERLAP, COPY, COPY_MAX, COPY_HYBRID,
+#   serving  CONTEXT, PARALLEL, KV, DENSE, DRAFTER, MTP, CP, PREFILL_ROWS, PREFILL_SPLIT, PREFILL_OVERLAP, COPY, COPY_MAX, COPY_HYBRID, DISK_CACHE, DISK_CACHE_GIB,
 #            SHARED_PREFIX, STREAM_SMOOTH, STREAM_SMOOTH_MS, KV_POOL_GIB, MAX_TOKENS, THINKING, COMM, SERVED_NAME,
 #            HOST, PORT
 #   memory   FLOOR_GIB, OVERHEAD_GIB, MEMORY_RESERVE_GIB, GUARD, GUARD_KILL_GIB
@@ -67,9 +67,9 @@ SERVE_ARGS=(--context "$CONTEXT" --max-tokens "$MAX_TOKENS" --drafter "$DRAFT_AR
 [[ "$CP" =~ ^[01]$ ]] || die "CP is 0 or 1"
 [[ "$DRAFTER" =~ ^(mtp|dspark)$ ]] || die "DRAFTER is mtp or dspark, not $DRAFTER"
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
-for v in COPY COPY_HYBRID SHARED_PREFIX STREAM_SMOOTH GUARD; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+for v in COPY COPY_HYBRID DISK_CACHE SHARED_PREFIX STREAM_SMOOTH GUARD; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$COPY_MAX" =~ ^([1-9]|1[0-5])$ ]] || die "COPY_MAX is 1 to 15, not $COPY_MAX"
-for v in KV_POOL_GIB FLOOR_GIB OVERHEAD_GIB MEMORY_RESERVE_GIB GUARD_KILL_GIB; do
+for v in KV_POOL_GIB DISK_CACHE_GIB FLOOR_GIB OVERHEAD_GIB MEMORY_RESERVE_GIB GUARD_KILL_GIB; do
   [[ "${!v}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "$v is a number of GiB, not ${!v}"
 done
 awk -v f="$FLOOR_GIB" -v k="$GUARD_KILL_GIB" 'BEGIN { exit !(f >= 4 && f > k) }' ||
@@ -401,7 +401,7 @@ IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED" "$PORT" "$R"
 cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED)
-    Window   $(arg_value --context) tokens · 3 Sparks · $( [[ "$PARALLEL" == 1 ]] && echo "one request at a time" || echo "$PARALLEL at once") · $KV KV$( [[ "$CP" == 1 ]] && echo " · context parallel")$( [[ -n "${TF_GLM_DISK_CACHE:-}" ]] && echo " · prompt cache on NVMe") · $DENSE dense weights$( [[ "$COMM" == roce ]] && echo " · RoCE all-gathers")
+    Window   $(arg_value --context) tokens · 3 Sparks · $( [[ "$PARALLEL" == 1 ]] && echo "one request at a time" || echo "$PARALLEL at once") · $KV KV$( [[ "$CP" == 1 ]] && echo " · context parallel")$( [[ -n "${TF_GLM_DISK_CACHE:-}" && "$PARALLEL" == 1 ]] && echo " · prompt cache on NVMe (up to ${TF_GLM_DISK_CACHE_GIB:-64} GiB a Spark)") · $DENSE dense weights$( [[ "$COMM" == roce ]] && echo " · RoCE all-gathers")
     Drafts   $DRAFTER$( [[ "$MTP" == 1 && "$DRAFTER" != mtp ]] && echo " + MTP") · copy drafts $( [[ "$COPY" == 1 ]] && echo "up to $COPY_MAX$( [[ "$COPY_HYBRID" == 1 ]] && echo ", checked by DSpark")" || echo off) · shared system prompts $( [[ "$SHARED_PREFIX" == 1 ]] && echo on || echo off)
     Memory   guard $( [[ "$GUARD" == 1 ]] && echo "on (stops a rank below $GUARD_KILL_GIB GiB; lowest so far: $STATE_DIR/guard/memguard.low)" || echo off)
     Logs     docker logs -f $CONTAINER_NAME$(for i in $(worker_ids); do printf '   (rank %s: ssh %s docker logs -f %s)' "$i" "$(worker_host "$i")" "$CONTAINER_NAME"; done)

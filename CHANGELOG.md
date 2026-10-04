@@ -71,3 +71,5 @@
   Boot hcp (cp500b's settings): 563 / 545 / 468 tok/s at 9.9k / 94k / 314k tokens (cp500b: 448 / 434; the last
   measured at 314k before, fp4g627p: 276), 607 / 596 / 590 at
   8k / 16k / 32k; exact 12/12, needles correct, spark3's lowest free memory 5.61 GiB. GPU tests 22/22.
+- The prompt cache on NVMe is on by default (`DISK_CACHE=1`, up to `DISK_CACHE_GIB=64` on each Spark: ~5.1M prompt
+  tokens across the three at fp4 with `CP=1`); `DISK_CACHE=0` turns it off.

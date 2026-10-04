@@ -33,6 +33,9 @@ once, and a prompt cache on NVMe.
 - Exact: a drafted reply equals the serial one, and requests sent together get the replies they get alone
   (`tools/exact.py`)
 - Tool calling, `/tokenize` and `/metrics` (the GLM-5.3-Flash recipe's server)
+- **A prompt cache on NVMe, on by default: ~5 million prompt tokens kept on the Sparks' disks**, so a conversation or
+  document you come back to, even after a restart, resumes in seconds instead of minutes of prefill
+  ([below](#prompt-cache-on-nvme-5m-tokens-of-conversations-kept))
 - One command on the first Spark: `./start.sh` sets up all three Sparks and starts the three ranks; `./stop.sh` stops them
 
 Built on [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart ([ashhart](https://github.com/ashhart)) and
@@ -41,6 +44,46 @@ and the context parallelism of patches 0112-0113 follows drowzeys' scheme, both 
 [drowzeys/TensorFold](https://github.com/drowzeys/TensorFold) (branch `glm-moe-dsa-tp4`, commit
 [befd47d](https://github.com/drowzeys/TensorFold/commit/befd47d), Apache 2.0). Everyone else this builds on is in
 [Credits](#credits) and [`CREDITS.md`](CREDITS.md).
+
+## Prompt cache on NVMe: ~5M tokens of conversations kept
+
+> [!IMPORTANT]
+> **On by default.** Every prompt the server reads is also saved, in the background, to the NVMe drives of the three
+> Sparks. A later request that starts with a saved prompt (a conversation you come back to, a document you ask about
+> again, any of them after `./start.sh restart`) loads it from disk in **seconds instead of minutes of prefill**.
+> Turn it off with `DISK_CACHE=0`.
+
+The window (499,712 tokens) is how much the model reads in one request; the prompt cache is how much earlier reading
+it does not have to redo. With one request at a time, the GPU holds only the conversation that ran last: switching
+to another conversation used to mean prefilling its whole history again (~3 minutes at 100k tokens, ~16 at 500k).
+With the cache, about ten full-window conversations can be kept and switched between.
+
+| Budget per Spark | Total across 3 Sparks | Prompt tokens kept |
+| --- | --- | --- |
+| 16 GiB | 48 GiB | ~1.3M |
+| 32 GiB | 96 GiB | ~2.6M |
+| **64 GiB (default)** | **~192 GiB** | **~5.1M** |
+| 128 GiB | ~384 GiB | ~10M |
+
+```bash
+./start.sh restart                      # on (the default): up to 64 GiB on each Spark
+DISK_CACHE_GIB=16 ./start.sh restart    # a smaller budget on each Spark
+DISK_CACHE=0 ./start.sh restart         # off: nothing is written to disk
+```
+
+- **Measured** (boots pcacheA / pcacheB, `KV=fp4 CP=1`): a 94,317-token prompt took 232.2 s to prefill and saved
+  1.26 GB on each Spark; after a restart the same request resumed from disk in **3.0 s** (prefill 0.002 s), answer
+  correct; exact 12/12. Prefill with the cache writing: 406 tok/s at 94k, against 410 without it on the same build
+  (within noise). A whole 500k-token conversation is ~6.7 GB a Spark; its load time is not measured yet.
+- **Where:** each Spark writes its own third of every prompt (context parallelism) to its own disk, under
+  `~/.cache/tensorfold-glm53-full/<image hash>/pcache`; nothing crosses the cables. The budget is a cap, not a
+  reservation: it grows as prompts are saved, the least recently used go first, and a Spark always keeps 100 GB free
+  (`TF_GLM_DISK_KEEP_FREE_GB`).
+- **What it stores:** the model's state for each prompt (its KV rows, checksummed), from which a prompt's content
+  can be derived: treat the folder like the conversations themselves. Delete it to clear the cache.
+- **Limits:** only prompts are saved, so a turn you continue prefills the model's last reply and your new message
+  (seconds). Without context parallelism (`CP=0`) every Spark stores every token, so the same budget keeps about a
+  third as many. With `PARALLEL` above 1 the cache is not used.
 
 ## Performance
 
@@ -134,12 +177,7 @@ Its Markdown prompt is the text in `tools/copy_ab_prose.md`, the one these runs 
 
 ### Prompt cache on NVMe (0132)
 
-With `TF_GLM_DISK_CACHE=<dir>` every kept prompt state is also written, in the background, to each Spark's own NVMe
-(each rank its own rows; checksummed; a size budget, 64 GiB by default, never leaving under 100 GB free). A later
-request whose prompt starts with a saved state resumes from it, also after a restart. Boots pcacheA / pcacheB
-(`KV=fp4 CP=1`, 626,688-token window): a 94,317-token needle answered in 236.1 s (232.2 s of it prefill) and saved
-1.26 GB a Spark; after a restart the same request resumed from disk in **3.0 s** (prefill 0.002 s), answer correct;
-exact 12/12. Setup: [Configuration](#configuration).
+Measured results and settings: [Prompt cache on NVMe](#prompt-cache-on-nvme-5m-tokens-of-conversations-kept).
 
 ### Exactness and long context
 
@@ -429,6 +467,7 @@ repository's. The first that sets a value wins: the environment, then `scripts/l
 | `PREFILL_SPLIT` / `PREFILL_OVERLAP` | `1` / `1` | prompt chunks' rows split between the ranks (exact), the exchanges on a second CUDA stream |
 | `COMM` | `roce` | the small all-gathers (up to `TF_ROCE_MAX_KB`, 512) as one-shot RDMA writes over the cables (+10% decode over `nccl`, the same replies); `nccl`: NCCL for all |
 | `COPY` / `COPY_MAX` | `1` / `15` | prompt-lookup drafts for replies that repeat earlier text, up to 15 a round (exact) |
+| `DISK_CACHE` / `DISK_CACHE_GIB` | `1` / `64` | the [prompt cache on NVMe](#prompt-cache-on-nvme-5m-tokens-of-conversations-kept), and its budget on each Spark in GiB; `DISK_CACHE=0`: off |
 | `COPY_HYBRID` | `1` | copies checked by DSpark's picks (0140; the same replies) |
 | `SHARED_PREFIX` | `1` | conversations sharing a system prompt reuse its prompt state |
 | `KV_POOL_GIB` | `1` | other conversations' kept prompt states (`TF_GLM_CACHE_GIB`), at most `TF_GLM_CACHE_ENTRIES` (8) of them |
@@ -458,7 +497,7 @@ README names:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TF_GLM_CP_GRAPHS` | `1` with `CP=1` | captured decode windows under `CP=1` (~2.9 GiB a Spark); `0`: eager |
-| `TF_GLM_DISK_CACHE` | off | a folder **inside the container** for the [NVMe prompt cache](#prompt-cache-on-nvme-0132) (`PARALLEL=1` only): `/cache/pcache` is `~/.cache/tensorfold-glm53-full/<image hash>/pcache` on each Spark; `TF_GLM_DISK_CACHE_GIB` (64) and `TF_GLM_DISK_KEEP_FREE_GB` (100) bound it |
+| `TF_GLM_DISK_CACHE` | `/cache/pcache` (set by `DISK_CACHE=1`) | the prompt cache's folder **inside the container**: `/cache` is `~/.cache/tensorfold-glm53-full/<image hash>` on each Spark; `TF_GLM_DISK_CACHE_GIB` (`DISK_CACHE_GIB`) and `TF_GLM_DISK_KEEP_FREE_GB` (100) bound it |
 | `TF_GLM_MULTI_GRAPHS` | on | CUDA graphs for the batched verify windows under `PARALLEL`; `top`: fewer graphs, less memory, the same bits; `0`: eager |
 | `TF_GLM_CP_KV_GATHER` | `1` | CP prompt chunks over the gathered rows (0141); `0`: the exchange of queries and partials before it |
 | `TF_GLM_CP_RAW_Q` | `0` (set by `scripts/config.sh`) | `1`: context-parallel prompt chunks gather raw queries (0135, +0.64 GiB a Spark; no faster on cp500a) |
@@ -467,12 +506,6 @@ README names:
 | `TENSORFOLD_NUCLEUS_UNION` | `1` (set by `scripts/config.sh`) | sampled replies check the top_p nucleus on every rank's candidates together: the same draws, ~1% faster |
 | `TF_GLM_CLEAR_THINKING` | `0` | `1`: drop earlier turns' reasoning from the prompt, as the checkpoint's template does |
 | `TF_GLM_MEM_TRACE` | `0` | `1`: every rank logs its memory after each prompt chunk |
-
-To enable the NVMe prompt cache:
-
-```bash
-TF_GLM_DISK_CACHE=/cache/pcache ./start.sh restart
-```
 
 Sampling defaults come from the checkpoint's `generation_config.json` (temperature 1.0, top_p 0.95), as in the
 GLM-5.3-Flash recipe; a request's own values win.

@@ -156,6 +156,20 @@ export TF_GLM_COPY_MAX="$COPY_MAX"
 # DSpark's chain (same replies; +8% on prose edits, +4% on JSON edits, 0 on plain text: boots cpyon / cp500b).
 COPY_HYBRID="${COPY_HYBRID:-1}"
 export TF_GLM_COPY_HYBRID="$COPY_HYBRID"
+# The prompt cache on NVMe (0132): DISK_CACHE=1 (default) writes every kept prompt state, in the background, to each
+# Spark's own disk (each its own rows, checksummed), so a later request that starts with it (a conversation you come
+# back to, a document asked about again, the same prompt after a restart) loads it in seconds instead of prefilling it
+# again. DISK_CACHE_GIB caps it on each Spark (64: ~5.1M prompt tokens across the three at fp4 with CP=1); the least
+# recently used go first, and a Spark always keeps 100 GB free (TF_GLM_DISK_KEEP_FREE_GB). Stored under
+# KERNEL_CACHE/<image hash>/pcache on each Spark. Prefill measured the same with it (406 vs 410 tok/s at 94k); a 94k
+# prompt resumed in 3.0 s after a restart (boots pcacheA / pcacheB). PARALLEL > 1: unused. DISK_CACHE=0: off.
+DISK_CACHE="${DISK_CACHE:-1}"
+DISK_CACHE_GIB="${DISK_CACHE_GIB:-64}"
+if [[ "$DISK_CACHE" == 1 ]]; then
+  export TF_GLM_DISK_CACHE="${TF_GLM_DISK_CACHE:-/cache/pcache}" TF_GLM_DISK_CACHE_GIB="${TF_GLM_DISK_CACHE_GIB:-$DISK_CACHE_GIB}"
+else
+  unset TF_GLM_DISK_CACHE
+fi
 # Conversations sharing a system prompt reuse its prompt state (same replies).
 SHARED_PREFIX="${SHARED_PREFIX:-1}"
 export TF_GLM_SHARED_PREFIX="$SHARED_PREFIX"
