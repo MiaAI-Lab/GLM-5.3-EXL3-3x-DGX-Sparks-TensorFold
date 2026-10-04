@@ -221,8 +221,10 @@ prebuild() {  # <node> (0: here, else a worker)
   fi
   log "Kernels on $( [[ "$n" == 0 ]] && echo here || echo "worker $n"): $out"
 }
-prebuild 0
-for i in $(worker_ids); do prebuild "$i"; done
+# every Spark at once (each builds its own kernels: ~3.5 min each, not ~10 one after another)
+prebuild 0 &
+for i in $(worker_ids); do prebuild "$i" & done
+wait
 
 log "Done: all 3 Sparks are ready. Start the server with ./start.sh (port $PORT)."
 log "The first start compiles CUDA kernels for GB10 (a few minutes); they are cached in $KERNEL_CACHE/<image hash> on each Spark."
