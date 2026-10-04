@@ -128,6 +128,19 @@ finished reply was right. The texts differ (1 of 20 long replies identical; on a
 a lossy cache moves a near tie early and greedy decoding takes another, equally good path. Earlier probe without
 context parallelism: FP4 29/30, FP8 27/30 short questions, recall 8/8 at 64k and 128k for both.
 
+`KV=fp4x` (0133: 31,476 instead of 39,072 bytes per token per rank, so ~24% more tokens per GiB), paired against FP4
+on the same items, boot fp4x500 (`KV=fp4x CP=1 CONTEXT=499712 PREFILL_ROWS=3072 TF_GLM_CP_GRAPHS=1`):
+
+| Category | FP4 | FP4X | only FP4 right | only FP4X right | p |
+| --- | --- | --- | --- | --- | --- |
+| Short questions | 124/150 | 124/150 | 4 | 4 | 1.00 |
+| Chained arithmetic | 39/40 | 40/40 | 0 | 1 | 1.00 |
+| Ledger tracking | 35/40 | 31/40 | 7 | 3 | 0.34 |
+| Python tasks | 25/25 | 25/25 | 0 | 0 | 1.00 |
+
+Not significant, but ledger tracking leans toward FP4: FP4X ran past the token limit 8 times (FP4: 5) and gave one
+finished wrong answer (FP4: none). Long-context recall was not run for FP4X. FP4 stays the default; FP4X is opt-in.
+
 ### Memory
 
 - Captured decode windows under context parallelism cost ~2.9 GiB on each Spark. With FP8 KV at a 655k window that
