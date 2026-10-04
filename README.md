@@ -226,6 +226,29 @@ dips to ~3.9 GiB during startup (graph capture and calibration), just above the 
 guard at startup (the guard stopped that rank; nothing froze). `DRY_RUN=1 CONTEXT=<n> ./start.sh` prints the plan of
 any window with the Sparks' memory of the moment.
 
+### More context: `KV=fp4x` (opt-in)
+
+`fp4` stays the setting for long windows. `KV=fp4x` (0133, 0137) also stores the rotary keys and the indexer's keys
+as e4m3 codes with a power-of-two scale instead of bf16, so the same memory holds ~24% more tokens:
+
+| `KV` | bytes a token a Spark | tokens a GiB (one Spark / three with `CP=1`) | window in the memory `fp4` uses at 499,712 (`CP=1`) |
+| --- | --- | --- | --- |
+| `fp8` | 56,544 | ~19.0k / ~57.0k | |
+| `fp4` | 39,072 | ~27.5k / ~82.4k | 499,712 (boot cp500b) |
+| `fp4x` | 31,476 (31,976 with MTP) | ~34.1k / ~102.3k | ~618k (computed, not booted yet) |
+
+Every reader dequantizes to the exact bf16 rows, so drafted replies still equal serial ones. On the quality suite it
+matched `fp4` on short questions, arithmetic and Python tasks; ledger tracking scored 31/40 against 35/40 (p 0.34, not
+significant; table under Results). Long-context recall and speed have not been measured with it. Use it when the
+window matters more than that margin:
+
+```bash
+KV=fp4x CP=1 CONTEXT=618496 PREFILL_ROWS=3072 TF_GLM_CP_GRAPHS=1 ./start.sh restart
+```
+
+`DRY_RUN=1` with the same settings prints the plan first; `start.sh` lowers the window by itself if the Sparks'
+memory of the moment does not admit it.
+
 ## Settings
 
 From the environment, `scripts/local.sh` or `./.env`; every default and its reason is in `scripts/config.sh`.
@@ -233,7 +256,7 @@ From the environment, `scripts/local.sh` or `./.env`; every default and its reas
 | Setting | Default | |
 |---|---|---|
 | `CONTEXT` | 163840 | prompt + reply window (boot p3; the memory plan checks every start) |
-| `KV` | fp8 | the latent cache as e4m3 rows with a power-of-two scale each (rotary and index keys stay bf16); `bf16`: exact, 1.7x the bytes |
+| `KV` | fp8 | the latent cache as e4m3 rows with a power-of-two scale each (rotary and index keys stay bf16); `bf16`: exact, 1.7x the bytes; `fp4`: 4-bit latent rows, 0.69x fp8's bytes, the same measured quality (the long-context setting); `fp4x`: opt-in, 0.56x, ~24% more context than `fp4` (below) |
 | `DENSE` | q4 | non-expert weights as 4-bit groups (head FP8, kv_b BF16); `fp8`, `bf16` take more memory |
 | `MTP` | 1 | MTP drafts (exact); 0 saves ~1.8 GiB a Spark |
 | `PREFILL_ROWS` | 2048 | prompt chunk rows; 1024 saves ~1 GiB a Spark |

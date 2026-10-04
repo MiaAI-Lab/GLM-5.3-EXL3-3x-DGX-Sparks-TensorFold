@@ -54,3 +54,7 @@
 - Fixes from those boots: the memory guard no longer ends its own ssh command or holds its parent's lock files;
   prompt chunks run the routed experts in 1024-row blocks (the universal kernels' grouping fits 48 KiB of shared
   memory).
+- `KV=fp4x` (0133, 0137; opt-in): fp4's latent rows plus e4m3 rotary and indexer keys, 31,476 bytes a token a Spark
+  against fp4's 39,072 (~24% more context in the same memory, ~618k instead of 499,712 under CP). Quality suite
+  against fp4 (boot fp4x500): equal on short questions, arithmetic and Python tasks, ledger tracking 31/40 against
+  35/40 (p 0.34, not significant). `fp4` stays the long-context setting.
