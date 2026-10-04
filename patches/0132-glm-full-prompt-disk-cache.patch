@@ -1,0 +1,1281 @@
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index 9a10205..f69ba7f 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -512,14 +512,29 @@ def _put_ring_window(drafter, n: int, rows: list[torch.Tensor]) -> None:
+         c.index_copy_(1, idx, r)
+ 
+ 
++def local_rows(n: int, rank: int, cp: int) -> int:
++    """Context parallelism (TF_GLM_CP): the rows a rank holds of a cache plane's first n positions, the positions p < n
++    with p % cp == rank (at local rows p // cp); n without it."""
++
++    if cp <= 1:
++        return int(n)
++    return max(0, (int(n) - int(rank) + cp - 1) // cp)
++
++
+ def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
+     """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values,
+-    and the indexer's pooled keys (its per-token keys and gates live in rings: the snapshot's ``tail``)."""
++    and the indexer's pooled keys (its per-token keys and gates live in rings: the snapshot's ``tail``). Under
++    context parallelism (full GLM-5.3) a rank's planes hold its own positions only: its local rows of n (and m)."""
++    caches = getattr(st, "caches", None)
++    cp = int(getattr(caches, "cp", 1) or 1)
++    has_mtp = m > 0 and getattr(st, "mtp_kc", None) is not None      # by the positions, alike on every rank
++    if cp > 1:
++        rank = int(caches.rank)
++        n, m = local_rows(n, rank, cp), local_rows(max(m, 0), rank, cp)
+     views = [kc[:n] for kc in st.kc] + [vc[:n] for vc in st.vc if vc is not None]
+     idx = st.index or []
+     if idx and idx[0][0] is None:        # full GLM-5.3: rotary keys, per-token index keys (full layers, then MTP)
+         views += [kr[:n] for kr in getattr(st, "kr", [])]
+-        has_mtp = m > 0 and getattr(st, "mtp_kc", None) is not None
+         views += [pk[:n] for _, _, pk in (idx[:-1] if has_mtp or getattr(st, "mtp_kr", None) is not None else idx)]
+         if has_mtp:
+             views += [st.mtp_kc[:m], st.mtp_kr[:m], idx[-1][2][:m]]
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 5914c64..d798fce 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -503,6 +503,7 @@ class GlmEngine:
+     concurrent = False          # the server hands every request straight to ``generate`` (the scheduler orders them)
+     multi = None                # --parallel > 1: the ``multi.MultiDecoder`` (both ranks)
+     scheduler = None            # ... and rank 0's ``multi.GlmScheduler``
++    disk = None                 # TF_GLM_DISK_CACHE: the kept prompt states' disk tier (``pcache.DiskCache``)
+ 
+     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, world: int = 2,
+                  policy: str = DEFAULT_POLICY,
+@@ -655,7 +656,8 @@ class GlmEngine:
+         # picks the points (the header carries them), but both ranks save and evict alike, so both must agree
+         self.shared = shared_prefix()
+         # TF_GLM_CP=1 (full GLM-5.3): context parallelism, every rank holding every world-th token of the caches
+-        # (``forward.dsa_full_cp``); one request at a time, no kept prompt states, eager decode windows (for now)
++        # (``forward.dsa_full_cp``); one request at a time, eager decode windows (for now); kept prompt states hold
++        # each rank's own rows of their positions (``decode.local_rows``), in memory and on disk alike
+         self.cp = world if cfg.full and os.environ.get("TF_GLM_CP", "0").strip() == "1" else 1
+         if self.cp > 1:
+             if parallel != 1:
+@@ -756,9 +758,12 @@ class GlmEngine:
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+                                  KV_KINDS.index(kv), self.cp]
++        # TF_GLM_DISK_CACHE (``pcache``): every rank takes part in a disk hit's agreement, so all have it or none
++        disk_on = int(bool(os.environ.get("TF_GLM_DISK_CACHE", "").strip() not in ("", "0", "off")) and parallel == 1)
++        mine.append(disk_on)
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+-        wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30) if self.cp == 1 else 0
++        wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
+         rows = self._gather_ints(mine + [spare >> 20])
+         odd = [r for r, row in enumerate(rows) if row[:-1] != rows[0][:-1]]
+@@ -768,7 +773,7 @@ class GlmEngine:
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+-                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV): "
++                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_DISK_CACHE): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+@@ -829,7 +834,8 @@ class GlmEngine:
+                 graphs = False
+             if rank == 0:
+                 print(f"[tensorfold] context parallelism: each of the {world} ranks keeps every {world}th token's "
+-                      f"caches; {'captured' if graphs else 'eager'} decode windows, no kept prompt states",
++                      f"caches; {'captured' if graphs else 'eager'} decode windows; kept prompt states hold each "
++                      "rank's own rows",
+                       flush=True)
+         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
+         self.comm.barrier()
+@@ -919,6 +925,21 @@ class GlmEngine:
+         self.cache: list = []
+         self.live: list[int] = []
+         self.cache_entries = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
++        # TF_GLM_DISK_CACHE=<dir>: kept prompt states also on this node's disk (``pcache.DiskCache``), one file a
++        # state and rank, keyed by what their bits depend on (the settings compared above but the cache slots)
++        self.disk = None
++        if disk_on:
++            from .pcache import DiskCache, engine_identity
++
++            settings = [v for i, v in enumerate(mine) if i != 1]
++            identity = engine_identity(model_dir, drafter, settings, kv=kv, world=world, cp=self.cp)
++            self.disk = DiskCache.from_env(identity, rank=rank, world=world, cp=self.cp, kv=kv,
++                                           log=lambda t: print(f"[tensorfold] rank {rank}: {t}", flush=True))
++            if rank == 0:
++                d = self.disk
++                print(f"[tensorfold] kept prompt states also on disk in {d.root} (TF_GLM_DISK_CACHE): up to "
++                      f"{d.budget / 2 ** 30:.1f} GiB, leaving {d.keep_free / 1e9:.0f} GB free; {len(d.entries)} "
++                      f"states there, {d.held() / 2 ** 30:.2f} GiB", flush=True)
+         if parallel > 1:
+             from .multi import GlmScheduler, MultiDecoder
+ 
+@@ -1059,8 +1080,9 @@ class GlmEngine:
+ 
+     def _gather_ints(self, values: list[int]) -> list[list[int]]:
+         torch = self.torch
+-        mine = torch.tensor(values, dtype=torch.int32, device="cuda")
+-        got = torch.empty((self.world * len(values),), dtype=torch.int32, device="cuda")
++        dev = getattr(self, "_dev", "cuda")
++        mine = torch.tensor(values, dtype=torch.int32, device=dev)
++        got = torch.empty((self.world * len(values),), dtype=torch.int32, device=dev)
+         self.comm.all_gather(mine, got)
+         return got.view(self.world, len(values)).tolist()
+ 
+@@ -1097,13 +1119,14 @@ class GlmEngine:
+         """Rank 0's int list on every rank (a length, then the values, through the all-gather)."""
+ 
+         torch = self.torch
+-        n = torch.tensor([len(values) if self.rank == 0 else 0], dtype=torch.int32, device="cuda")
+-        got = torch.empty((self.world,), dtype=torch.int32, device="cuda")
++        dev = getattr(self, "_dev", "cuda")
++        n = torch.tensor([len(values) if self.rank == 0 else 0], dtype=torch.int32, device=dev)
++        got = torch.empty((self.world,), dtype=torch.int32, device=dev)
+         self.comm.all_gather(n, got)
+         count = int(got[0].item())
+-        buf = (torch.tensor(values, dtype=torch.int32, device="cuda") if self.rank == 0
+-               else torch.zeros((count,), dtype=torch.int32, device="cuda"))
+-        allv = torch.empty((self.world * count,), dtype=torch.int32, device="cuda")
++        buf = (torch.tensor(values, dtype=torch.int32, device=dev) if self.rank == 0
++               else torch.zeros((count,), dtype=torch.int32, device=dev))
++        allv = torch.empty((self.world * count,), dtype=torch.int32, device=dev)
+         self.comm.all_gather(buf, allv)
+         return [int(v) for v in allv[:count].tolist()]
+ 
+@@ -1229,13 +1252,95 @@ class GlmEngine:
+ 
+         return sum(snapshot_bytes(c) for c in self.cache)
+ 
++    # -- the disk tier (TF_GLM_DISK_CACHE, ``pcache``)
++    def _disk_candidate(self, prompt: list[int], code: list[int], hit) -> int:
++        """Rank 0: the length of the longest saved prefix of ``prompt`` on disk that fits the request (as ``_resume``
++        asks of kept states) and is longer than the in-memory ``hit``; 0 for none."""
++
++        if getattr(self, "disk", None) is None:
++            return 0
++        _, mtp, dflash = self._drafters(code)
++        least, total = (len(hit.ids) if hit is not None else 0), len(prompt)
++
++        def fits(entry) -> bool:
++            n = int(entry["n"])
++            return (n > least and (not dflash or entry.get("drafter")) and (not mtp or entry.get("mtp"))
++                    and not (self.grid and n % self.grid) and (n < total or (n == total and entry.get("head"))))
++
++        best = self.disk.lookup(prompt, fits)
++        if best is None:
++            self.disk.stats["misses"] += 1
++            return 0
++        return int(best["n"])
++
++    def _disk_resume(self, prompt: list[int], n: int, hit):
++        """Every rank: the state of prompt[:n] from this rank's file, or ``hit`` (or None) when any rank has no sound
++        one. Two all-gathers of ok flags: after the headers (identity, rank, token ids: nothing changed yet), then
++        after the rows (read into the live caches, every piece checksummed; other kept states' rows saved first, as
++        any request's prefill would). A miss or a mismatch on any rank: every rank forgets its file of it."""
++
++        from .pcache import PCacheError, load_snapshot
++
++        d = self.disk
++        ids = list(prompt[:n])
++        meta, why = None, ""
++        try:
++            if d is None:
++                raise PCacheError("no disk tier on this rank")
++            meta = d.check(ids)
++        except Exception as err:          # noqa: BLE001  (any failure is a miss: the ranks must still agree)
++            meta, why = None, str(err) if isinstance(err, PCacheError) else repr(err)
++        if min(r[0] for r in self._gather_ints([int(meta is not None)])) == 0:
++            self._disk_forget(ids, why or "another rank's file")
++            return hit
++        d.fence(0)                        # no write may still read the live caches the rows go into
++        self._take_over([])               # every kept state's rows are saved (or dropped) before they are overwritten
++        self.live = []
++        snap = None
++        try:
++            snap = load_snapshot(d, self.e, ids, meta, drafter=self._kept_drafter(), live=True)
++        except Exception as err:          # noqa: BLE001
++            snap, why = None, str(err) if isinstance(err, PCacheError) else repr(err)
++        keep = int(hit is not None and hit in self.cache and hit.rows is not None)
++        got = self._gather_ints([int(snap is not None), keep])
++        if min(r[0] for r in got) == 0:
++            self._disk_forget(ids, why or "another rank's file")
++            return hit if min(r[1] for r in got) else None
++        d.touch(d.key(ids))
++        d.stats["hits"] += 1
++        self.live = ids
++        self._remember(snap)
++        return snap
++
++    def _disk_forget(self, ids: list[int], why: str) -> None:
++        d = self.disk
++        if d is None:
++            return
++        d.remove(d.key(ids))
++        if self.rank == 0 or why not in ("another rank's file",):
++            print(f"[tensorfold] rank {self.rank}: the saved state of {len(ids)} tokens is not used ({why})",
++                  flush=True)
++
+     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
+-             code: list[int], hit, draft: bool, constraint=None, feed=None, shared=()) -> dict[str, Any]:
+-        """``shared``: rank 0's shared-prefix points (``_shared``), which both ranks keep states at."""
++             code: list[int], hit, draft: bool, constraint=None, feed=None, shared=(), disk: int = 0) -> dict[str, Any]:
++        """``shared``: rank 0's shared-prefix points (``_shared``), which both ranks keep states at; ``disk``: the
++        length of the saved prefix rank 0 found on disk (``_disk_candidate``; 0: none), which every rank loads only
++        when all of them have a sound file of it (``_disk_resume``)."""
+ 
+         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
+         try:
+-            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed, shared)
++            loaded = None
++            if disk:
++                t = time.perf_counter()
++                got = self._disk_resume(prompt, int(disk), hit)
++                if got is not hit:
++                    hit, loaded = got, (int(disk), time.perf_counter() - t)
++            stats = self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, feed, shared)
++            if loaded is not None:
++                stats.update(disk_cached=loaded[0], disk_load_s=round(loaded[1], 3))
++            elif disk:
++                stats["disk_miss"] = int(disk)
++            return stats
+         finally:
+             self.e.constraint = self.e.window = self.e.vote = None
+ 
+@@ -1253,6 +1358,8 @@ class GlmEngine:
+         from .decode import load_rows
+ 
+         cut = len(hit.ids) if hit is not None else 0
++        if self.disk is not None:         # writes still reading rows this request changes end (or are given up)
++            self.disk.fence(0 if hit is not None and hit.rows is not None else cut)
+         self._take_over(list(hit.ids) if hit is not None else [])
+         if hit is not None and hit.rows is not None:
+             load_rows(self.e, hit, drafter=self._kept_drafter())
+@@ -1292,6 +1399,9 @@ class GlmEngine:
+             kept.append(snap)
+         if self.shared and draft and feed is None and hit is not None:     # what it resumed from is used again
+             self.cache = [c for c in self.cache if c is not hit] + [hit]
++        if self.disk is not None:         # to disk in the background (before _remember may drop one)
++            for snap in kept:
++                self.disk.submit(self.e, snap, drafter=self._kept_drafter())
+         for snap in kept:
+             self._remember(snap)
+         if not kept and draft and feed is None and hit is not None:     # the resume point is the grid point: newest
+@@ -1399,13 +1509,15 @@ class GlmEngine:
+             feed = VisionFeed(self, positions, rows)
+             feed.encode_s = time.perf_counter() - t
+         hit = self._resume(list(prompt), code) if draft and feed is None else None
++        # a longer saved prefix on disk (``pcache``): rank 0 names its length, every rank checks its own file
++        disk = self._disk_candidate(list(prompt), code, hit) if draft and feed is None else 0
+         shared = self._shared(list(prompt), hit) if draft and feed is None else []
+         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
+         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
+                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
+                   *_f64_ints(sampling.temperature if sampling else 0.0), int(sampling.top_k) if sampling else 0,
+                   *_f64_ints(sampling.top_p if sampling else 1.0), *_f64_ints(sampling.min_p if sampling else 0.0),
+-                  int(constraint is not None), len(positions),
++                  int(constraint is not None), len(positions), disk,
+                   *(shared + [0] * SHARED_MOST)[:SHARED_MOST]] + code
+         from tensorfold.engine.grammar import pack
+ 
+@@ -1417,7 +1529,7 @@ class GlmEngine:
+         if positions:
+             self._share(positions)
+         stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
+-                          shared)
++                          shared, disk)
+         stats.update(policy=spec, drafts=draft)
+         if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
+             self.comm.check()
+@@ -1441,7 +1553,7 @@ class GlmEngine:
+ 
+         self._await_bell()
+         (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi, shaped,
+-         images, *rest) = self._share(None)
++         images, disk, *rest) = self._share(None)
+         shared, code = [p for p in rest[:SHARED_MOST] if p], rest[SHARED_MOST:]
+         prompt = self._share(None)
+         packed = self._share(None) if shaped else []
+@@ -1461,7 +1573,7 @@ class GlmEngine:
+             if hit is None:
+                 raise RuntimeError(f"rank {self.rank} has no snapshot of the {cached} tokens rank 0 resumes from")
+         self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
+-                  constraint, feed, shared)
++                  constraint, feed, shared, disk)
+         if hasattr(self.comm, "check"):
+             self.comm.check()
+ 
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index f5751fa..bafb7d7 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -231,6 +231,7 @@ class Caches:
+         # planes (position p at row p // cp on rank p % cp; a plane's div), one spare row; single extents at base 0
+         cp = int(w.meta.get("cp", 1)) if c.full else 1
+         self.cp = cp
++        self.rank = int(w.rank) if cp > 1 else 0      # whose positions this rank's planes hold (``decode.local_rows``)
+ 
+         def add(shape, div: int = 1, pad: int = 0, fmt: str = "bf16") -> int:
+             n = rows // div + pad
+diff --git tensorfold/families/glm5_next/cuda/pcache.py tensorfold/families/glm5_next/cuda/pcache.py
+new file mode 100644
+index 0000000..ff21dee
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/pcache.py
+@@ -0,0 +1,956 @@
++"""Kept prompt states on local NVMe (TF_GLM_DISK_CACHE=<dir>; Mia's AI Lab): a second tier behind the in-memory kept
++prompts (``engine.GlmEngine.cache``), one file a state and rank on each node's own disk.
++
++A file holds one rank's slice of a ``decode.Snapshot``, exactly its bytes (a state loaded back is bit for bit the one
++kept): a page-aligned header, then page-aligned sections, each a tensor's raw bytes:
++
++    [0, 32)            magic, format version, header JSON length, data start, the JSON's checksum (``PREFIX``)
++    [32, data start)   the header JSON: rank, world, cp, kv kind, identity (the model, settings and engine source),
++                       the token count, sha256 of the token ids, MTP and drafter fields, checksum algorithm, and per
++                       section its dtype, shape, offset (from data start), length and a checksum per ``PIECE``
++    [data start, end)  the sections, each at a multiple of ``PAGE``; the file is a whole number of pages (O_DIRECT)
++
++Sections: ``ids`` (int32), ``rec`` / ``conv`` (KDA states; empty for full GLM-5.3), ``pending`` (the MTP head's rows
++waiting for the next token), ``head`` (the prompt end's logits row, a replay's), ``drafter.i`` (a ring drafter's
++window rows), ``tail.i.slots`` / ``tail.i.rows`` (GLM-5.3-Flash's indexer ring tail), ``rows.i`` (every cache plane's
++rows of the state, ``decode._saved_views``: latents, rotary keys, index keys, the MTP layer's; under context
++parallelism the rank's local rows of the n positions, ``decode.local_rows``).
++
++I/O moves ``PIECE``-sized pieces through a ring of page-aligned staging buffers (pinned when CUDA is up) with
++``threads`` reads or writes in flight (os.preadv / os.pwritev release the GIL), on an O_DIRECT descriptor where the
++file system takes one (buffered otherwise); a piece is checksummed as it passes (xxh3_64, else crc32). Writes go to a
++``.part`` file, fsync'd and renamed into place, so a partial file is never seen; the index (one JSON a rank,
++``index.w<world>r<rank>.json``) is replaced atomically after.
++
++``DiskCache``: the files of one directory under a byte budget (TF_GLM_DISK_CACHE_GIB, default 64) and a free-space
++floor (TF_GLM_DISK_KEEP_FREE_GB, default 100: a write that would leave less free evicts or is skipped), least recently
++used first out; a background ``Writer`` (bounded queue) so a request never waits for the disk. The longest saved prefix
++of a prompt: the entries' token counts at most the prompt's, the prompt's sha256 taken incrementally at each of them
++(one pass over its ids), the longest whose digest matches and whose fields fit the request."""
++
++from __future__ import annotations
++
++import errno
++import hashlib
++import json
++import mmap
++import os
++import shutil
++import struct
++import threading
++import time
++import zlib
++from collections import deque
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++from typing import Callable, Sequence
++
++import numpy as np
++import torch
++
++PAGE = 4096
++MAGIC = b"TFGLMPC\x01"
++VERSION = 1
++PREFIX = struct.Struct("<8sIIQQ")       # magic, version, JSON length, data start, the JSON's checksum (32 bytes)
++PIECE = 16 << 20                        # bytes an I/O (and a checksum) covers; a multiple of PAGE
++SUFFIX = ".tfpc"
++
++try:                                    # xxh3: ~10x crc32's speed; the header names the algorithm it used
++    import xxhash
++
++    SUM = "xxh3_64"
++except ImportError:                     # pragma: no cover - the image has xxhash
++    xxhash = None
++    SUM = "crc32"
++
++
++def checksum(buf, algo: str = SUM) -> int:
++    if algo == "xxh3_64":
++        if xxhash is None:
++            raise PCacheError("this file's checksums are xxh3_64, and xxhash is not installed")
++        return xxhash.xxh3_64_intdigest(buf)
++    if algo == "crc32":
++        return zlib.crc32(buf)
++    raise PCacheError(f"unknown checksum {algo!r}")
++
++
++class PCacheError(Exception):
++    """A state file that is missing, foreign (another model, settings, rank), truncated or corrupt."""
++
++
++def round_up(n: int, a: int = PAGE) -> int:
++    return -(-int(n) // a) * a
++
++
++def ids_digest(ids: Sequence[int]) -> str:
++    """sha256 of token ids as little-endian int32 (the files' and the index's prompt key)."""
++
++    return hashlib.sha256(np.asarray(ids, dtype="<i4").tobytes()).hexdigest()
++
++
++DTYPES = {str(d).replace("torch.", ""): d for d in (
++    torch.bfloat16, torch.float16, torch.float32, torch.float64, torch.int8, torch.uint8, torch.int16, torch.int32,
++    torch.int64, torch.bool, torch.float8_e4m3fn)}
++
++
++def _dtype(name: str) -> torch.dtype:
++    if name not in DTYPES:
++        raise PCacheError(f"a section of dtype {name!r}")
++    return DTYPES[name]
++
++
++def _u8(t: torch.Tensor) -> torch.Tensor:
++    """A contiguous tensor's bytes, flat (a view)."""
++
++    if not t.is_contiguous():
++        raise ValueError("a state section must be contiguous")
++    return t.reshape(-1).view(torch.uint8) if t.numel() else torch.empty((0,), dtype=torch.uint8, device=t.device)
++
++
++def _nbytes(t: torch.Tensor) -> int:
++    return t.numel() * t.element_size()
++
++
++# -- page-aligned host memory -----------------------------------------------------------------------------------------
++class HostBuffer:
++    """``nbytes`` (rounded to pages) of anonymous, page-aligned host memory as a uint8 tensor; registered with CUDA
++    (pinned: DMA without a bounce) when ``pin`` and CUDA is up. Exact size, freed by ``close``."""
++
++    def __init__(self, nbytes: int, pin: bool = False) -> None:
++        self.nbytes = round_up(max(int(nbytes), PAGE))
++        self.map = mmap.mmap(-1, self.nbytes)
++        self.array = np.frombuffer(self.map, dtype=np.uint8)
++        self.tensor = torch.from_numpy(self.array)
++        self.pinned = False
++        if pin and torch.cuda.is_available():
++            rc = torch.cuda.cudart().cudaHostRegister(self.tensor.data_ptr(), self.nbytes, 0)
++            self.pinned = int(rc) == 0
++
++    def view(self, a: int, b: int) -> memoryview:
++        return memoryview(self.map)[a:b]
++
++    def close(self) -> None:
++        if self.map is None:
++            return
++        if self.pinned:
++            torch.cuda.cudart().cudaHostUnregister(self.tensor.data_ptr())
++            self.pinned = False
++        self.tensor = self.array = None
++        try:
++            self.map.close()
++        except BufferError:               # a view still out: the mapping goes with its last reference
++            pass
++        self.map = None
++
++
++class Staging:
++    """``slots`` page-aligned buffers of ``PIECE`` bytes (one allocation), reused piece after piece."""
++
++    def __init__(self, slots: int, pin: bool) -> None:
++        self.slots = max(1, int(slots))
++        self.buf = HostBuffer(self.slots * PIECE, pin)
++
++    def slot(self, i: int) -> tuple[int, int]:
++        return i * PIECE, (i + 1) * PIECE
++
++    def tensor(self, i: int, n: int) -> torch.Tensor:
++        a, _ = self.slot(i)
++        return self.buf.tensor[a:a + n]
++
++
++# -- file descriptors ------------------------------------------------------------------------------------------------
++def _open(path, flags: int, direct: bool) -> tuple[int, bool]:
++    """(fd, O_DIRECT?): O_DIRECT when asked and the file system takes it (tmpfs, NFS and others refuse: buffered)."""
++
++    if direct and hasattr(os, "O_DIRECT"):
++        try:
++            return os.open(path, flags | os.O_DIRECT, 0o644), True
++        except OSError as err:
++            if err.errno not in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP):
++                raise
++    return os.open(path, flags, 0o644), False
++
++
++def _pread(fd: int, mv: memoryview, off: int) -> None:
++    got = 0
++    while got < len(mv):
++        n = os.preadv(fd, [mv[got:]], off + got)
++        if n <= 0:
++            raise PCacheError(f"short read at {off + got}")
++        got += n
++
++
++def _pwrite(fd: int, mv: memoryview, off: int) -> None:
++    put = 0
++    while put < len(mv):
++        n = os.pwritev(fd, [mv[put:]], off + put)
++        if n <= 0:
++            raise OSError(errno.EIO, f"short write at {off + put}")
++        put += n
++
++
++def _fsync_dir(path: Path) -> None:
++    try:
++        fd = os.open(path, os.O_RDONLY)
++    except OSError:
++        return
++    try:
++        os.fsync(fd)
++    except OSError:
++        pass
++    finally:
++        os.close(fd)
++
++
++# -- a snapshot's sections ---------------------------------------------------------------------------------------------
++def snapshot_sections(e, snap, drafter=None) -> tuple[dict, list[tuple[str, torch.Tensor]]]:
++    """(fields, [(name, tensor)]) of a kept state as a file holds it: its own tensors (clones, stable) and views of
++    the live caches' rows (``decode._saved_views``; with ``drafter`` a sliding-window drafter's rows too, as
++    ``save_rows`` keeps them). The rows must stay unchanged until they are written (``Writer.fence``)."""
++
++    from .decode import _saved_views
++
++    n = len(snap.ids)
++    ring = drafter is not None and getattr(drafter, "ring", 0)
++    # the drafter context the file keeps: a ring drafter's window rows (copied when kept), or a sliding window's rows
++    # given ``drafter`` (TF_GLM_SHARED_PREFIX, as save_rows); none otherwise
++    keeps_drafter = snap.drafter_end == n and (snap.drafter_rows is not None or (drafter is not None and not ring))
++    rows = snap.rows if snap.rows is not None else _saved_views(e, snap, drafter if keeps_drafter else None)
++    out: list[tuple[str, torch.Tensor]] = [("ids", torch.tensor(list(snap.ids), dtype=torch.int32)),
++                                           ("rec", snap.rec), ("conv", snap.conv)]
++    if snap.pending is not None:
++        out.append(("pending", snap.pending))
++    if snap.head is not None:
++        out.append(("head", snap.head))
++    for i, r in enumerate((snap.drafter_rows or []) if keeps_drafter else []):
++        out.append((f"drafter.{i}", r))
++    for i, (slots, trows) in enumerate(snap.tail or []):
++        out += [(f"tail.{i}.slots", slots), (f"tail.{i}.rows", trows)]
++    out += [(f"rows.{i}", r) for i, r in enumerate(rows)]
++    fields = dict(n=n, mtp_len=int(snap.mtp_len), drafter_end=int(snap.drafter_end) if keeps_drafter else -1,
++                  drafter_ring=bool(snap.drafter_rows is not None and keeps_drafter), head=snap.head is not None,
++                  pending=snap.pending is not None, tail=len(snap.tail or []), rows=len(rows))
++    # sections a file holds must be contiguous: a sliding window's [:, lo:n] views are copied now (small)
++    out = [(name, t if t.is_contiguous() else t.contiguous()) for name, t in out]
++    return fields, out
++
++
++def _layout(tensors: list[tuple[str, torch.Tensor]]) -> tuple[list[dict], int]:
++    secs, at = [], 0
++    for name, t in tensors:
++        nb = _nbytes(t)
++        secs.append(dict(name=name, dtype=str(t.dtype).replace("torch.", ""), shape=list(t.shape), offset=at,
++                         nbytes=nb, sums=["%016x" % 0] * max(1, -(-nb // PIECE))))
++        at += round_up(nb) if nb else 0
++    return secs, at
++
++
++def _header_bytes(meta: dict) -> bytes:
++    return json.dumps(meta, sort_keys=True, separators=(",", ":")).encode()
++
++
++class Job:
++    """One state to write: its key, header fields and sections; ``ready``: a CUDA event the sections' producers
++    recorded (the writer's stream waits on it); ``cancel``: set by a fence (its rows are about to change)."""
++
++    def __init__(self, key: str, path: Path, meta: dict, tensors: list[tuple[str, torch.Tensor]], entry: dict) -> None:
++        self.key, self.path, self.meta, self.tensors, self.entry = key, path, meta, tensors, entry
++        self.n = int(meta["n"])
++        self.ready = None
++        if any(t.is_cuda for _, t in tensors):
++            self.ready = torch.cuda.Event()
++            self.ready.record()
++        self.cancel = False
++        self.bytes = 0
++
++
++class Cancelled(Exception):
++    pass
++
++
++def write_file(path: Path, meta: dict, tensors: list[tuple[str, torch.Tensor]], *, staging: Staging,
++               pool: ThreadPoolExecutor | None, direct: bool = True, job: Job | None = None,
++               stream=None) -> int:
++    """Write a state file: sections through the staging ring (``slots`` pieces in flight), checksums as they pass,
++    the header last; into ``path`` + ``.part``, fsync'd, renamed into place. Returns the file's bytes."""
++
++    secs, data = _layout(tensors)
++    meta = dict(meta, sections=secs, sum=SUM, version=VERSION)
++    head = _header_bytes(meta)
++    start = round_up(PREFIX.size + len(head))
++    total = start + round_up(data)
++    tmp = path.with_name(path.name + f".{os.getpid()}.{threading.get_ident()}.part")
++    fd, is_direct = _open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, direct)
++    ok = False
++    try:
++        try:
++            os.posix_fallocate(fd, 0, total)
++        except (OSError, AttributeError):
++            os.ftruncate(fd, total)
++        pieces = [(s, t, a, min(a + PIECE, s["nbytes"])) for s, (_, t) in zip(secs, tensors)
++                  for a in range(0, s["nbytes"], PIECE)]
++        cuda = any(t.is_cuda for _, t in tensors)
++        if cuda and job is not None and job.ready is not None and stream is not None:
++            stream.wait_event(job.ready)
++        for w0 in range(0, len(pieces), staging.slots):
++            if job is not None and job.cancel:
++                raise Cancelled()
++            wave = pieces[w0:w0 + staging.slots]
++            ctx = torch.cuda.stream(stream) if (cuda and stream is not None) else _null()
++            with ctx:
++                for i, (s, t, a, b) in enumerate(wave):
++                    dst = staging.tensor(i, round_up(b - a))
++                    dst[:b - a].copy_(_u8(t)[a:b], non_blocking=cuda)
++                    if b - a < dst.numel():
++                        dst[b - a:].zero_()
++            if cuda:
++                (stream or torch.cuda.current_stream()).synchronize()
++
++            def put(item, fd=fd):
++                i, (s, t, a, b) = item
++                lo, _ = staging.slot(i)
++                mv = staging.buf.view(lo, lo + round_up(b - a))
++                try:
++                    s["sums"][a // PIECE] = "%016x" % checksum(mv[:b - a])
++                    _pwrite(fd, mv, start + s["offset"] + a)
++                finally:
++                    mv.release()
++
++            if pool is not None and len(wave) > 1:
++                list(pool.map(put, enumerate(wave)))
++            else:
++                for item in enumerate(wave):
++                    put(item)
++        meta["sections"] = secs
++        head2 = _header_bytes(meta)
++        assert len(head2) == len(head), "the header's length changed with its checksums"
++        hb = HostBuffer(start)
++        try:
++            hb.tensor[:PREFIX.size].numpy()[:] = np.frombuffer(
++                PREFIX.pack(MAGIC, VERSION, len(head2), start, checksum(head2)), dtype=np.uint8)
++            hb.tensor[PREFIX.size:PREFIX.size + len(head2)].numpy()[:] = np.frombuffer(head2, dtype=np.uint8)
++            mv = hb.view(0, start)
++            try:
++                _pwrite(fd, mv, 0)
++            finally:
++                mv.release()
++        finally:
++            hb.close()
++        os.fsync(fd)
++        ok = True
++    finally:
++        os.close(fd)
++        if not ok:
++            try:
++                os.unlink(tmp)
++            except OSError:
++                pass
++    os.replace(tmp, path)
++    _fsync_dir(path.parent)
++    return total
++
++
++class _null:
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *a):
++        return False
++
++
++def read_header(path: Path, direct: bool = True) -> dict:
++    """A state file's header (validated: magic, version, the JSON's checksum, the sections inside the file), with
++    ``data_start`` and ``file_bytes``. Raises PCacheError."""
++
++    try:
++        fd, _ = _open(path, os.O_RDONLY, direct)
++    except FileNotFoundError:
++        raise PCacheError("missing") from None
++    except OSError as err:
++        raise PCacheError(f"cannot open: {err}") from None
++    try:
++        size = os.fstat(fd).st_size
++        if size < PAGE or size % PAGE:
++            raise PCacheError(f"truncated ({size} bytes)")
++        first = HostBuffer(PAGE)
++        try:
++            mv = first.view(0, PAGE)
++            try:
++                _pread(fd, mv, 0)
++            finally:
++                mv.release()
++            magic, version, jlen, start, jsum = PREFIX.unpack(bytes(first.tensor[:PREFIX.size].numpy()))
++            if magic != MAGIC:
++                raise PCacheError("not a prompt state file")
++            if version != VERSION:
++                raise PCacheError(f"format version {version}, not {VERSION}")
++            if start % PAGE or start < PREFIX.size + jlen or start > size:
++                raise PCacheError("a bad header length")
++            if start > PAGE:
++                first.close()
++                first = HostBuffer(start)
++                mv = first.view(0, start)
++                try:
++                    _pread(fd, mv, 0)
++                finally:
++                    mv.release()
++            raw = bytes(first.tensor[PREFIX.size:PREFIX.size + jlen].numpy())
++        finally:
++            first.close()
++    except OSError as err:
++        raise PCacheError(f"unreadable: {err}") from None
++    finally:
++        os.close(fd)
++    try:
++        algo = json.loads(raw).get("sum", SUM)
++    except ValueError:
++        raise PCacheError("a corrupt header") from None
++    if checksum(raw, algo) != jsum:
++        raise PCacheError("a corrupt header")
++    meta = json.loads(raw)
++    end = 0
++    for s in meta.get("sections", []):
++        if s["offset"] % PAGE or s["nbytes"] < 0:
++            raise PCacheError("a misplaced section")
++        end = max(end, s["offset"] + round_up(s["nbytes"]))
++    if start + end > size:
++        raise PCacheError(f"truncated ({size} bytes, the header asks {start + end})")
++    meta["data_start"], meta["file_bytes"] = start, size
++    return meta
++
++
++def check_header(meta: dict, expect: dict) -> None:
++    """The header's identity fields equal ``expect``'s (identity, rank, world, cp, kv, n, ids); else PCacheError."""
++
++    for k, v in expect.items():
++        if meta.get(k) != v:
++            raise PCacheError(f"{k} {meta.get(k)!r}, not {v!r}")
++
++
++def read_sections(path: Path, meta: dict, dests: dict[str, torch.Tensor], *, staging: Staging,
++                  pool: ThreadPoolExecutor | None, direct: bool = True) -> None:
++    """Every section of a validated header into ``dests[name]`` (contiguous tensors of its dtype and shape, on any
++    device; the live caches' rows included), piece by piece through the staging ring, each piece checksummed before
++    it is copied out. Raises PCacheError (a destination may then hold part of the file)."""
++
++    start, algo = meta["data_start"], meta.get("sum", SUM)
++    secs = meta["sections"]
++    for s in secs:
++        t = dests.get(s["name"])
++        if t is None:
++            raise PCacheError(f"no destination for section {s['name']}")
++        if str(t.dtype).replace("torch.", "") != s["dtype"] or list(t.shape) != list(s["shape"]) or \
++                _nbytes(t) != s["nbytes"]:
++            raise PCacheError(f"section {s['name']}: {s['dtype']} {s['shape']}, the engine's {t.dtype} "
++                              f"{list(t.shape)}")
++    # a destination that is not one block of memory (a sliding window's rows) is read whole, then copied
++    whole = {name: torch.empty_like(t, memory_format=torch.contiguous_format)
++             for name, t in dests.items() if not t.is_contiguous()}
++    try:
++        fd, _ = _open(path, os.O_RDONLY, direct)
++    except OSError as err:
++        raise PCacheError(f"cannot open: {err}") from None
++    try:
++        pieces = [(s, whole.get(s["name"], dests[s["name"]]), a, min(a + PIECE, s["nbytes"])) for s in secs
++                  for a in range(0, s["nbytes"], PIECE)]
++        for w0 in range(0, len(pieces), staging.slots):
++            wave = pieces[w0:w0 + staging.slots]
++
++            def get(item, fd=fd):
++                i, (s, t, a, b) = item
++                lo, _ = staging.slot(i)
++                mv = staging.buf.view(lo, lo + round_up(b - a))
++                try:
++                    _pread(fd, mv, start + s["offset"] + a)
++                    if "%016x" % checksum(mv[:b - a], algo) != s["sums"][a // PIECE]:
++                        raise PCacheError(f"section {s['name']}: checksum mismatch at {a}")
++                finally:
++                    mv.release()
++
++            if pool is not None and len(wave) > 1:
++                list(pool.map(get, enumerate(wave)))
++            else:
++                for item in enumerate(wave):
++                    get(item)
++            cuda = False
++            for i, (s, t, a, b) in enumerate(wave):
++                cuda = cuda or t.is_cuda
++                _u8(t)[a:b].copy_(staging.tensor(i, b - a), non_blocking=t.is_cuda)
++            if cuda:
++                torch.cuda.current_stream().synchronize()      # the staging slots are reused by the next wave
++    except OSError as err:
++        raise PCacheError(f"unreadable: {err}") from None
++    finally:
++        os.close(fd)
++    for name, t in whole.items():
++        dests[name].copy_(t)
++
++
++# -- the background writer -------------------------------------------------------------------------------------------
++class Writer:
++    """One thread writing queued ``Job``s (at most ``depth`` waiting: a full queue skips a state, never waits)."""
++
++    def __init__(self, cache: "DiskCache", depth: int) -> None:
++        self.cache = cache
++        self.depth = max(1, int(depth))
++        self.q: deque[Job] = deque()
++        self.current: Job | None = None
++        self.cv = threading.Condition()
++        self.thread = threading.Thread(target=self._loop, name="tf-pcache-writer", daemon=True)
++        self.thread.start()
++
++    def submit(self, job: Job) -> bool:
++        with self.cv:
++            if len(self.q) >= self.depth:
++                return False
++            self.q.append(job)
++            self.cv.notify_all()
++            return True
++
++    def pending(self, key: str) -> bool:
++        with self.cv:
++            return (self.current is not None and self.current.key == key) or any(j.key == key for j in self.q)
++
++    def _loop(self) -> None:
++        while True:
++            with self.cv:
++                while not self.q:
++                    self.cv.wait()
++                job = self.current = self.q.popleft()
++            try:
++                self.cache._write(job)
++            except Cancelled:
++                self.cache.stats["cancelled"] += 1
++            except Exception as err:         # a full disk, an I/O error: the state is just not kept on disk
++                self.cache.stats["failed"] += 1
++                self.cache.log(f"writing a prompt state failed: {err!r}")
++            finally:
++                job.tensors = None
++                with self.cv:
++                    self.current = None
++                    self.cv.notify_all()
++
++    def fence(self, conflicts: Callable[[Job], bool], wait_s: float = 0.0) -> int:
++        """Before the live caches' rows change: drop queued jobs whose rows they are (``conflicts``), and let a
++        running one finish within ``wait_s`` or cancel it (between pieces). Returns the jobs given up."""
++
++        lost = 0
++        with self.cv:
++            keep = [j for j in self.q if not conflicts(j)]
++            lost += len(self.q) - len(keep)
++            self.q = deque(keep)
++            job = self.current
++            if job is not None and conflicts(job):
++                end = time.monotonic() + max(0.0, wait_s)
++                while self.current is job and time.monotonic() < end:
++                    self.cv.wait(timeout=max(1e-3, end - time.monotonic()))
++                if self.current is job:
++                    job.cancel = True
++                    lost += 1
++                    while self.current is job:
++                        self.cv.wait()
++        self.cache.stats["fenced"] += lost
++        return lost
++
++    def wait_key(self, key: str, timeout: float) -> bool:
++        """Wait (at most ``timeout`` s) while the state ``key`` is queued or being written; True when it no longer is."""
++
++        end = time.monotonic() + max(0.0, timeout)
++        with self.cv:
++            while (self.current is not None and self.current.key == key) or any(j.key == key for j in self.q):
++                left = end - time.monotonic()
++                if left <= 0:
++                    return False
++                self.cv.wait(timeout=left)
++        return True
++
++    def drain(self, timeout: float | None = None) -> bool:
++        """Wait until every queued job is written (tests, shutdown)."""
++
++        end = None if timeout is None else time.monotonic() + timeout
++        with self.cv:
++            while self.q or self.current is not None:
++                left = None if end is None else end - time.monotonic()
++                if left is not None and left <= 0:
++                    return False
++                self.cv.wait(timeout=left)
++        return True
++
++
++# -- the disk tier ------------------------------------------------------------------------------------------------------
++def _env_float(name: str, default: float) -> float:
++    v = os.environ.get(name, "").strip()
++    return float(v) if v else float(default)
++
++
++class DiskCache:
++    """Kept prompt states in ``root`` for one engine identity and rank: an LRU index of this rank's files, the
++    background writer, the readers. Every method but the writer's runs on the request thread."""
++
++    def __init__(self, root, identity: str, *, rank: int, world: int, cp: int = 1, kv: str = "bf16",
++                 budget: int = 64 << 30, keep_free: int = 100 * 10 ** 9, threads: int = 8, depth: int = 2,
++                 direct: bool = True, fence_s: float = 0.0, wait_s: float = 30.0,
++                 log: Callable[[str], None] | None = None) -> None:
++        self.root = Path(root)
++        self.root.mkdir(parents=True, exist_ok=True)
++        self.identity = hashlib.sha256(identity.encode()).hexdigest()[:32]
++        self.rank, self.world, self.cp, self.kv = int(rank), int(world), int(cp), str(kv)
++        self.budget, self.keep_free = int(budget), int(keep_free)
++        self.threads, self.direct, self.fence_s = max(1, int(threads)), bool(direct), float(fence_s)
++        self.wait_s = float(wait_s)
++        self.tag = f"w{self.world}r{self.rank}"
++        self.index_path = self.root / f"index.{self.tag}.json"
++        self.lock = threading.RLock()
++        self.entries: dict[str, dict] = {}
++        self.tick = 0
++        self.stats = {"written": 0, "skipped": 0, "cancelled": 0, "failed": 0, "fenced": 0, "evicted": 0,
++                      "hits": 0, "misses": 0}
++        self._log = log
++        self._load_index()
++        self._sweep()
++        pin = torch.cuda.is_available()
++        self.read_staging = Staging(self.threads, pin)
++        self.write_staging = Staging(self.threads, pin)
++        self.read_pool = ThreadPoolExecutor(self.threads, thread_name_prefix="tf-pcache-read")
++        self.write_pool = ThreadPoolExecutor(self.threads, thread_name_prefix="tf-pcache-write")
++        self.stream = torch.cuda.Stream() if pin else None
++        self.writer = Writer(self, depth)
++
++    @classmethod
++    def from_env(cls, identity: str, *, rank: int, world: int, cp: int, kv: str, log=None) -> "DiskCache | None":
++        """TF_GLM_DISK_CACHE=<dir> (off unset); TF_GLM_DISK_CACHE_GIB (64), TF_GLM_DISK_KEEP_FREE_GB (100),
++        TF_GLM_DISK_THREADS (8), TF_GLM_DISK_QUEUE (2), TF_GLM_DISK_DIRECT (1: O_DIRECT where possible),
++        TF_GLM_DISK_FENCE_MS (0: a write whose rows the next request changes is cancelled, not waited for),
++        TF_GLM_DISK_WAIT_S (30: how long a rank whose own write of a state rank 0 found is still running waits)."""
++
++        root = os.environ.get("TF_GLM_DISK_CACHE", "").strip()
++        if not root or root in ("0", "off"):
++            return None
++        return cls(root, identity, rank=rank, world=world, cp=cp, kv=kv,
++                   budget=int(_env_float("TF_GLM_DISK_CACHE_GIB", 64) * 2 ** 30),
++                   keep_free=int(_env_float("TF_GLM_DISK_KEEP_FREE_GB", 100) * 10 ** 9),
++                   threads=int(_env_float("TF_GLM_DISK_THREADS", 8)), depth=int(_env_float("TF_GLM_DISK_QUEUE", 2)),
++                   direct=os.environ.get("TF_GLM_DISK_DIRECT", "1").strip() != "0",
++                   fence_s=_env_float("TF_GLM_DISK_FENCE_MS", 0) / 1000,
++                   wait_s=_env_float("TF_GLM_DISK_WAIT_S", 30), log=log)
++
++    def log(self, text: str) -> None:
++        if self._log is not None:
++            self._log(text)
++
++    # -- names and the index
++    def key(self, ids: Sequence[int]) -> str:
++        return self.key_of(ids_digest(ids))
++
++    def key_of(self, digest: str) -> str:
++        return hashlib.sha256(f"{self.identity}:{digest}".encode()).hexdigest()[:40]
++
++    def path(self, key: str) -> Path:
++        return self.root / f"{key}.{self.tag}{SUFFIX}"
++
++    def expect(self, ids: Sequence[int]) -> dict:
++        return dict(identity=self.identity, rank=self.rank, world=self.world, cp=self.cp, kv=self.kv, n=len(ids),
++                    ids_sha256=ids_digest(ids))
++
++    def _load_index(self) -> None:
++        try:
++            data = json.loads(self.index_path.read_text())
++            self.entries = {k: v for k, v in data.get("entries", {}).items() if isinstance(v, dict)}
++            self.tick = int(data.get("tick", 0))
++        except (OSError, ValueError):
++            self.entries, self.tick = {}, 0
++
++    def _save_index(self, sync: bool = True) -> None:
++        """The index replaced atomically (a crash leaves the old or the new one); ``sync``: and made durable (not for
++        a use's new LRU tick, on the request thread: losing one only ages an entry)."""
++
++        tmp = self.index_path.with_name(self.index_path.name + f".{os.getpid()}.tmp")
++        with open(tmp, "w") as f:
++            json.dump({"version": VERSION, "tick": self.tick, "entries": self.entries}, f)
++            if sync:
++                f.flush()
++                os.fsync(f.fileno())
++        os.replace(tmp, self.index_path)
++        if sync:
++            _fsync_dir(self.root)
++
++    def _sweep(self) -> None:
++        """Startup: partial files of this rank go, entries without their file go, files without an entry go."""
++
++        with self.lock:
++            mine = f".{self.tag}{SUFFIX}"
++            for p in self.root.iterdir():
++                name = p.name
++                if mine + "." in name and name.endswith(".part"):
++                    p.unlink(missing_ok=True)
++            gone = [k for k in self.entries if not self.path(k).exists()]
++            for k in gone:
++                del self.entries[k]
++            known = {self.path(k).name for k in self.entries}
++            for p in self.root.glob(f"*{mine}"):
++                if p.name not in known:
++                    p.unlink(missing_ok=True)
++            self._save_index()
++
++    def held(self) -> int:
++        with self.lock:
++            return sum(int(e.get("bytes", 0)) for e in self.entries.values())
++
++    def contains(self, key: str) -> bool:
++        with self.lock:
++            return key in self.entries
++
++    def touch(self, key: str) -> None:
++        with self.lock:
++            if key in self.entries:
++                self.tick += 1
++                self.entries[key]["used"] = self.tick
++                self._save_index(sync=False)
++
++    def remove(self, key: str) -> None:
++        with self.lock:
++            self.entries.pop(key, None)
++            self.path(key).unlink(missing_ok=True)
++            self._save_index()
++
++    def free_bytes(self) -> int:
++        return shutil.disk_usage(self.root).free
++
++    def _room(self, need: int) -> bool:
++        """Evict least recently used files until ``need`` more bytes fit the budget and leave the free-space floor;
++        False when they cannot (nothing left to evict)."""
++
++        with self.lock:
++            while True:
++                fits = self.held() + need <= self.budget and self.free_bytes() - need >= self.keep_free
++                if fits:
++                    return True
++                if not self.entries:
++                    return False
++                old = min(self.entries, key=lambda k: self.entries[k].get("used", 0))
++                self.entries.pop(old)
++                self.path(old).unlink(missing_ok=True)
++                self.stats["evicted"] += 1
++                self._save_index()
++
++    def lookup(self, prompt: Sequence[int], fits: Callable[[dict], bool]) -> dict | None:
++        """The entry of the longest saved prefix of ``prompt`` (this identity's, ``fits`` it), or None: the prompt's
++        sha256 taken incrementally at each saved length, one pass over its ids."""
++
++        with self.lock:
++            cands = [dict(e, key=k) for k, e in self.entries.items()
++                     if e.get("identity") == self.identity and int(e["n"]) <= len(prompt) and fits(e)]
++        if not cands:
++            return None
++        arr = np.asarray(prompt, dtype="<i4")
++        h = hashlib.sha256()
++        at, digests = 0, {}
++        for n in sorted({int(c["n"]) for c in cands}):
++            h.update(arr[at:n].tobytes())
++            at = n
++            digests[n] = h.copy().hexdigest()
++        best = None
++        for c in cands:
++            if digests[int(c["n"])] == c["ids"] and (best is None or int(c["n"]) > int(best["n"])):
++                best = c
++        return best
++
++    # -- writing
++    def submit(self, e, snap, drafter=None) -> bool:
++        """Queue a kept state for the disk (the request thread): its sections now, the writing in the background.
++        False when it is already there, queued, or the queue is full."""
++
++        digest = ids_digest(snap.ids)
++        key = self.key_of(digest)
++        if self.contains(key):
++            self.touch(key)
++            return False
++        if self.writer.pending(key):
++            return False
++        fields, tensors = snapshot_sections(e, snap, drafter)
++        meta = dict(fields, identity=self.identity, rank=self.rank, world=self.world, cp=self.cp, kv=self.kv,
++                    ids_sha256=digest, created=time.time())
++        entry = dict(n=len(snap.ids), ids=digest, identity=self.identity, mtp=fields["mtp_len"] >= 0,
++                     drafter=fields["drafter_end"] == len(snap.ids), ring=fields["drafter_ring"], head=fields["head"])
++        job = Job(key, self.path(key), meta, tensors, entry)
++        ok = self.writer.submit(job)
++        if not ok:
++            self.stats["skipped"] += 1
++        return ok
++
++    def _write(self, job: Job) -> None:
++        secs, data = _layout(job.tensors)
++        need = round_up(PREFIX.size + len(_header_bytes(dict(job.meta, sections=secs, sum=SUM, version=VERSION)))) \
++            + round_up(data)
++        if not self._room(need):
++            self.stats["skipped"] += 1
++            self.log(f"a {need / 2 ** 30:.2f} GiB prompt state is not written: the budget "
++                     f"({self.budget / 2 ** 30:.1f} GiB) or the free-space floor ({self.keep_free / 1e9:.0f} GB) "
++                     "leaves no room")
++            return
++        total = write_file(job.path, job.meta, job.tensors, staging=self.write_staging, pool=self.write_pool,
++                           direct=self.direct, job=job, stream=self.stream)
++        with self.lock:
++            self.tick += 1
++            self.entries[job.key] = dict(job.entry, bytes=total, used=self.tick)
++            self._save_index()
++        self.stats["written"] += 1
++
++    def fence(self, cut: int, prompt: Sequence[int] | None = None) -> int:
++        """The live caches are about to change from position ``cut`` on: queued or running writes of states longer
++        than that are given up (``fence_s`` lets a running one finish first)."""
++
++        return self.writer.fence(lambda j: cut < j.n, self.fence_s)
++
++    # -- reading
++    def check(self, ids: Sequence[int]) -> dict:
++        """This rank's file of the state of ``ids``: its validated header (or PCacheError)."""
++
++        key = self.key(ids)
++        if not self.writer.wait_key(key, self.wait_s):      # rank 0 may have finished the same state's write first
++            raise PCacheError("still being written")
++        meta = read_header(self.path(key), self.direct)
++        check_header(meta, self.expect(ids))
++        return meta
++
++    def read(self, ids: Sequence[int], meta: dict, dests: dict[str, torch.Tensor]) -> None:
++        read_sections(self.path(self.key(ids)), meta, dests, staging=self.read_staging, pool=self.read_pool,
++                      direct=self.direct)
++
++    def close(self) -> None:
++        self.writer.drain()
++        self.read_pool.shutdown()
++        self.write_pool.shutdown()
++
++
++# -- a state back ------------------------------------------------------------------------------------------------------
++def load_snapshot(cache_or_path, e, ids: Sequence[int], meta: dict, *, drafter=None, live: bool = True,
++                  device=None):
++    """A ``decode.Snapshot`` of ``ids`` from a validated header: its own tensors (KDA states, MTP rows, head row,
++    drafter window, ring tail) new on ``device`` (the engine's), its rows read into the live caches (``live``: the
++    views ``restore`` resumes from; the caller saved or dropped what they held) or into new tensors kept as the
++    snapshot's saved rows (``load_rows`` puts them back). Raises PCacheError."""
++
++    from .decode import Snapshot, _saved_views
++
++    device = torch.device(e.w.device if device is None else device)
++    n = int(meta["n"])
++    if n != len(ids):
++        raise PCacheError("token count")
++    secs = {s["name"]: s for s in meta["sections"]}
++
++    def new(name):
++        s = secs[name]
++        return torch.empty(s["shape"], dtype=_dtype(s["dtype"]), device=device)
++
++    for need in ("ids", "rec", "conv"):
++        if need not in secs:
++            raise PCacheError(f"no {need} section")
++    dests: dict[str, torch.Tensor] = {name: new(name) for name in secs if not name.startswith("rows.")}
++    dests["ids"] = torch.empty(secs["ids"]["shape"], dtype=torch.int32)
++    snap = Snapshot(list(ids), dests["rec"], dests["conv"], dests.get("pending"), int(meta["mtp_len"]),
++                    int(meta["drafter_end"]))
++    keeps_drafter = snap.drafter_end == n
++    ring = drafter is not None and getattr(drafter, "ring", 0)
++    view_drafter = drafter if keeps_drafter and not ring and not meta.get("drafter_ring") else None
++    views = _saved_views(e, snap, view_drafter)
++    rows = [k for k in secs if k.startswith("rows.")]
++    if len(rows) != len(views) or int(meta.get("rows", -1)) != len(views):
++        raise PCacheError(f"{len(rows)} row sections, the engine's caches {len(views)}")
++    for i, v in enumerate(views):
++        dests[f"rows.{i}"] = v if live else torch.empty_like(v, memory_format=torch.contiguous_format)
++    if isinstance(cache_or_path, DiskCache):
++        cache_or_path.read(ids, meta, dests)
++    else:
++        with ThreadPoolExecutor(4) as pool:
++            read_sections(Path(cache_or_path), meta, dests, staging=Staging(4, False), pool=pool)
++    if dests["ids"].tolist() != list(ids):
++        raise PCacheError("token ids")
++    snap.head = dests.get("head")
++    if meta.get("drafter_ring"):
++        k = sum(1 for name in secs if name.startswith("drafter."))
++        snap.drafter_rows = [dests[f"drafter.{i}"] for i in range(k)]
++    snap.tail = [(dests[f"tail.{i}.slots"], dests[f"tail.{i}.rows"]) for i in range(int(meta.get("tail", 0)))]
++    if not live:
++        snap.rows = [dests[f"rows.{i}"] for i in range(len(views))]
++        snap.nbytes = sum(_nbytes(r) for r in snap.rows)
++    if not keeps_drafter:
++        snap.drafter_end, snap.drafter_rows = -1, None
++    snap.disk = True
++    return snap
++
++
++def save_snapshot(path, e, snap, *, identity: str, rank: int = 0, world: int = 1, cp: int = 1, kv: str = "bf16",
++                  drafter=None) -> int:
++    """Write one state file now (tests and tools; the engine queues ``DiskCache.submit``). Returns its bytes."""
++
++    fields, tensors = snapshot_sections(e, snap, drafter)
++    meta = dict(fields, identity=hashlib.sha256(identity.encode()).hexdigest()[:32], rank=rank, world=world, cp=cp,
++                kv=kv, ids_sha256=ids_digest(snap.ids), created=time.time())
++    if any(t.is_cuda for _, t in tensors):
++        torch.cuda.synchronize()
++    with ThreadPoolExecutor(4) as pool:
++        return write_file(Path(path), meta, tensors, staging=Staging(4, torch.cuda.is_available()), pool=pool)
++
++
++def open_snapshot(path, e, ids: Sequence[int], *, identity: str, rank: int = 0, world: int = 1, cp: int = 1,
++                  kv: str = "bf16", drafter=None, live: bool = False):
++    """Read one state file back as a Snapshot (tests and tools): header checked against the identity fields."""
++
++    meta = read_header(Path(path))
++    check_header(meta, dict(identity=hashlib.sha256(identity.encode()).hexdigest()[:32], rank=rank, world=world,
++                            cp=cp, kv=kv, n=len(ids), ids_sha256=ids_digest(ids)))
++    return load_snapshot(Path(path), e, ids, meta, drafter=drafter, live=live)
++
++
++# -- what a state depends on ---------------------------------------------------------------------------------------
++_SOURCE: str | None = None
++
++
++def source_digest() -> str:
++    """sha256 of the engine's source (tensorfold/cuda and the GLM family's code: .py, .cu, .cpp, .h, .cuh): any patch
++    that changes a kernel or the forward gives other bits, so other files."""
++
++    global _SOURCE
++    if _SOURCE is None:
++        import tensorfold
++
++        top = Path(tensorfold.__file__).resolve().parent
++        h = hashlib.sha256()
++        for sub in ("cuda", "families/glm5_next", "kernels"):
++            base = top / sub
++            if not base.is_dir():
++                continue
++            for p in sorted(base.rglob("*")):
++                if p.suffix in (".py", ".cu", ".cpp", ".h", ".cuh") and "__pycache__" not in p.parts:
++                    h.update(str(p.relative_to(top)).encode() + b"\0")
++                    h.update(p.read_bytes())
++        _SOURCE = h.hexdigest()
++    return _SOURCE
++
++
++def _folder_digest(folder) -> str:
++    """A checkpoint folder: its JSON files' bytes and its weight files' names, sizes and modification times."""
++
++    if folder is None:
++        return "none"
++    folder = Path(folder)
++    h = hashlib.sha256()
++    for p in sorted(folder.glob("*.json")):
++        h.update(p.name.encode() + b"\0" + p.read_bytes())
++    for p in sorted(folder.glob("*.safetensors")):
++        st = p.stat()
++        h.update(f"{p.name}:{st.st_size}:{st.st_mtime_ns}".encode())
++    return h.hexdigest()
++
++
++def engine_identity(model_dir, drafter_dir, settings: Sequence[int], *, kv: str, world: int, cp: int,
++                    extra: str = "") -> str:
++    """What a kept state's bits depend on besides its tokens: the checkpoint, the draft model, the startup settings
++    every rank agrees on (prompt rows, grid, split, MTP, KV format, ...), world and context parallelism, the engine's
++    source, and TF_GLM_DISK_CACHE_TAG (the caller's patch set name)."""
++
++    tag = os.environ.get("TF_GLM_DISK_CACHE_TAG", "").strip()
++    return "|".join([f"tfpc{VERSION}", _folder_digest(model_dir), _folder_digest(drafter_dir),
++                     ",".join(str(int(v)) for v in settings), f"kv={kv}", f"world={world}", f"cp={cp}",
++                     f"src={source_digest()}", f"tag={tag}", extra])

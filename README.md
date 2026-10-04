@@ -78,6 +78,14 @@ greedy; its live gauge on a chat shows the sampled rate.
 Decode speed depends on the text: speculative drafts land more often on predictable text. On worked arithmetic
 (thinking on) the drafter's acceptance was 87% and a request averaged ~45 tok/s, with bursts above 70.
 
+### Prompt cache on NVMe (0132)
+
+With `TF_GLM_DISK_CACHE=<dir>` every kept prompt state is also written, in the background, to each Spark's own NVMe
+(each rank its own rows; checksummed; a size budget, 64 GiB by default, never leaving under 100 GB free). A later
+request whose prompt starts with a saved state resumes from it, also after a restart. Boots pcacheA / pcacheB (fp4,
+`CP=1`): a 94,317-token needle prefilled in 236.1 s and saved 1.26 GB a Spark; after a restart the same request
+resumed from disk in 3.0 s (prefill 0.002 s), answer correct; exact 12/12.
+
 ### Exactness and long context
 
 - Drafted and concurrent replies equal serial ones: 12/12 on every boot listed here (`tools/exact.py`).

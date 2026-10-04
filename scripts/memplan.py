@@ -75,7 +75,7 @@ def main() -> int:
     ap.add_argument("model_dir", type=Path)
     ap.add_argument("--tp", type=int, default=3)
     ap.add_argument("--context", type=int, required=True)
-    ap.add_argument("--kv", default="bf16", choices=("bf16", "fp8", "fp4"))
+    ap.add_argument("--kv", default="bf16", choices=("bf16", "fp8", "fp4", "fp4x"))
     ap.add_argument("--dense", default="q4", choices=("bf16", "fp8", "q4"))
     ap.add_argument("--mtp", type=int, default=1, choices=(0, 1))
     ap.add_argument("--prefill-rows", type=int, default=2048)

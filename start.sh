@@ -49,7 +49,7 @@ fi
 SERVE_ARGS=(--context "$CONTEXT" --max-tokens "$MAX_TOKENS" --drafter "$DRAFT_ARG")
 [[ "$DENSE" =~ ^(bf16|fp8|q4)$ ]] || die "DENSE is bf16, fp8 or q4, not $DENSE"
 [[ "$COMM" =~ ^(nccl|roce)$ ]] || die "COMM is nccl or roce, not $COMM"
-[[ "$KV" =~ ^(bf16|fp8|fp4)$ ]] || die "KV is bf16, fp8 or fp4, not $KV"
+[[ "$KV" =~ ^(bf16|fp8|fp4|fp4x)$ ]] || die "KV is bf16, fp8, fp4 or fp4x, not $KV"
 [[ "$MTP" =~ ^[01]$ ]] || die "MTP is 0 or 1, not $MTP"
 [[ "$CONTEXT" =~ ^[0-9]+$ && "$CONTEXT" -ge 4096 && "$CONTEXT" -le 1048576 ]] || die "CONTEXT is a token count from 4096 to 1048576, not $CONTEXT"
 [[ "$PREFILL_ROWS" =~ ^(1024|2048)$ ]] || die "PREFILL_ROWS is 1024 or 2048, not $PREFILL_ROWS"

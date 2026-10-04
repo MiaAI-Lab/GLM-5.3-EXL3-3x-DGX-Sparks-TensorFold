@@ -1,0 +1,667 @@
+diff --git tensorfold/families/glm5_next/cuda/dflash2_multi.py tensorfold/families/glm5_next/cuda/dflash2_multi.py
+index 10c53b5..c39956f 100644
+--- tensorfold/families/glm5_next/cuda/dflash2_multi.py
++++ tensorfold/families/glm5_next/cuda/dflash2_multi.py
+@@ -136,6 +136,9 @@ class MultiDrafter:
+ 
+     def __init__(self, drafter: Drafter, streams: int = 4, *, tap_rows: int | None = None) -> None:
+         d = self.d = drafter
++        if type(drafter).__module__.endswith(".dspark"):
++            # DSpark subclasses dflash2.Drafter but its layers, block (8 drafts, not block - 1) and candidates differ
++            raise ValueError("a DSpark speculator's streams: dspark_multi.DSparkMulti, not DFlash2's MultiDrafter")
+         if streams < 1:
+             raise ValueError("a multi-stream drafter needs at least one stream")
+         self.streams = streams
+diff --git tensorfold/families/glm5_next/cuda/dspark.py tensorfold/families/glm5_next/cuda/dspark.py
+index 6235a49..dd723a4 100644
+--- tensorfold/families/glm5_next/cuda/dspark.py
++++ tensorfold/families/glm5_next/cuda/dspark.py
+@@ -472,7 +472,10 @@ class Drafter(_DFlash2):
+             part = torch.empty((n, self.D), dtype=torch.float32, device=self.dev)
+             embed_part(self.ids, self.w.embed, meta["embed_offset"], part)
+             every = torch.empty((self.world * n * self.D,), dtype=torch.float32, device=self.dev)
+-            self.w.comm.all_gather(part.view(-1), every)
++            if self.w.comm is None:              # one rank (tests): its part is every row
++                every.copy_(part.view(-1))
++            else:
++                self.w.comm.all_gather(part.view(-1), every)
+             x.zero_()
+             glue.residual_add(x, x, every.view(self.world, n, self.D))
+         else:
+diff --git tensorfold/families/glm5_next/cuda/dspark_multi.py tensorfold/families/glm5_next/cuda/dspark_multi.py
+new file mode 100644
+index 0000000..269a653
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/dspark_multi.py
+@@ -0,0 +1,135 @@
++"""DSpark for several streams at once (full GLM-5.3 under --parallel): one speculator's weights, a context per stream.
++
++Each stream's context is a ``dspark.Drafter`` of its own that shares every weight of the engine's drafter (a shallow
++copy: the layers, fc, norms, Markov tables, confidence head and the verifier's embedding / head are the same tensors)
++and owns what a sequence changes: its K/V context ring (``kc`` / ``vc``, ~35 MiB a stream at three ranks with the
++real checkpoint's 2,176-row ring), ``context_end`` and its device mirror ``pos_dev``, the block's ids and the
++candidate buffers. So a stream's drafts are exactly those its own solo drafter would make (the same calls on the
++same weights and the same context rows), and a context duck-types the solo drafter wherever one stream's context is
++handled on its own (``decode.prefill_chunk``'s taps, ``multi``'s kept prompts: ``ring``, ``window``, ``kc``, ``vc``).
++
++Milestone 2 (eager): proposals run one stream after another (a block pass each, its candidates gathered over the
++ranks as alone), context updates one stream after another; no CUDA graphs for the contexts yet (the solo drafter's
++graphs bind its own buffers, so a context starts without them). Unlike ``dflash2_multi.MultiDrafter`` (DFlash2's
++block is the anchor plus block - 1 drafts), a DSpark pass gives ``block`` drafts (8): a stream may draft up to 8.
++
++API (the ``dflash2_multi.MultiDrafter`` calls ``multi.MultiDecoder`` makes; both ranks call it identically):
++
++    md = DSparkMulti(drafter, streams=4)
++    ctx = md.contexts[i]
++    chains = md.propose([DraftRequest(ctx, pending, depth, sampling, confidence, beta, round_ms), ...])
++    md.commit([(ctx, taps), ...])                   # each stream's kept rows' taps [n, taps * D]
++"""
++
++from __future__ import annotations
++
++import copy
++from typing import Sequence
++
++import torch
++
++
++def context(drafter):
++    """A DSpark context sharing ``drafter``'s weights, with fresh sequence buffers (empty: context_end 0)."""
++
++    c = copy.copy(drafter)
++    pinned = torch.cuda.is_available()
++    c.kc = [torch.zeros_like(t) for t in drafter.kc]
++    c.vc = [torch.zeros_like(t) for t in drafter.vc]
++    c.pos_dev = torch.zeros_like(drafter.pos_dev)
++    c.context_end = 0
++    c.ids = drafter.ids.clone()
++    c.ids_host = torch.zeros(drafter.ids_host.shape, dtype=drafter.ids_host.dtype, pin_memory=pinned)
++    c.tap_in = torch.zeros_like(drafter.tap_in)
++    c.cand = torch.zeros_like(drafter.cand)
++    c.cand_host = torch.zeros(drafter.cand_host.shape, dtype=drafter.cand_host.dtype, pin_memory=pinned)
++    c.cand_ready = torch.cuda.Event() if pinned else None
++    c.packed = c.cand[:c.cand_n].view(c.gathered, c.block, 2 * c.top_k)
++    c.hconf = c.cand[c.cand_n:]
++    c.pool = None                         # the solo drafter's graphs replay ITS buffers: none here (eager)
++    c.block_graph = None
++    c.tap_graphs = {}
++    c.last_confidence = []
++    c.last_h = c.last_logits = None
++    return c
++
++
++def context_bytes(drafter) -> int:
++    """Device bytes one stream's context holds beyond the shared weights (``context``)."""
++
++    held = list(drafter.kc) + list(drafter.vc) + [drafter.pos_dev, drafter.ids, drafter.tap_in, drafter.cand]
++    return sum(t.numel() * t.element_size() for t in held)
++
++
++class DSparkMulti:
++    """Up to ``streams`` DSpark streams over one ``dspark.Drafter``'s weights (its own context stays the solo one)."""
++
++    def __init__(self, drafter, streams: int = 4) -> None:
++        if not type(drafter).__module__.endswith(".dspark"):
++            raise ValueError("DSparkMulti takes a DSpark drafter (dspark.Drafter); DFlash2: dflash2_multi.MultiDrafter")
++        if streams < 1:
++            raise ValueError("a multi-stream drafter needs at least one stream")
++        self.d = drafter
++        self.streams = streams
++        self.block = drafter.block              # drafts a pass gives (not block - 1: the anchor predicts the first)
++        self.contexts = [context(drafter) for _ in range(streams)]
++        for i, c in enumerate(self.contexts):
++            c.owner, c.slot = self, i
++
++    def nbytes(self) -> int:
++        """The contexts' buffers (the weights are the drafter's)."""
++        return sum(context_bytes(c) for c in self.contexts)
++
++    def reset(self) -> None:
++        for c in self.contexts:
++            c.reset()
++
++    def capture(self) -> None:
++        """No CUDA graphs for the stream contexts yet (milestone 2 runs them eagerly)."""
++
++    def drop_graphs(self) -> None:
++        pass
++
++    def _own(self, ctx) -> None:
++        if getattr(ctx, "owner", None) is not self:
++            raise ValueError("not one of this drafter's stream contexts")
++
++    @torch.no_grad()
++    def propose(self, reqs: Sequence) -> list[list[int]]:
++        """Each stream's ``Drafter.propose`` (up to ``block`` drafts), one stream after another; streams without a
++        depth or a context get [] (as a solo drafter runs none for them)."""
++
++        seen: set[int] = set()
++        out: list[list[int]] = []
++        for r in reqs:
++            self._own(r.ctx)
++            if r.ctx.slot in seen:
++                raise ValueError("a round proposes for each stream at most once")
++            seen.add(r.ctx.slot)
++            depth = min(int(r.depth), self.block)
++            if depth < 1 or r.ctx.context_end == 0:
++                out.append([])
++                continue
++            out.append(list(r.ctx.propose(r.pending, depth, r.sampling, r.confidence, beta=r.beta,
++                                          round_ms=r.round_ms)))
++        return out
++
++    @torch.no_grad()
++    def commit(self, items: Sequence[tuple]) -> None:
++        """Each stream's committed rows' taps at its positions context_end, context_end + 1, ... (its own context)."""
++
++        seen: set[int] = set()
++        for c, taps in items:
++            self._own(c)
++            if c.slot in seen:
++                raise ValueError("commit takes each of this drafter's streams at most once")
++            seen.add(c.slot)
++            if c.context_end + taps.shape[0] > c.capacity:
++                raise ValueError("drafter context past its capacity")
++        for c, taps in items:
++            if taps.shape[0]:
++                c.add_taps(taps)
++
++    def candidates(self, reqs):
++        raise ValueError("TF_GLM_MULTI_DEPTH=joint is GLM-5.3-Flash's (DFlash2's batched block pass): full GLM-5.3 "
++                         "takes policy or scale:A")
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 34463f7..c390c70 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -353,6 +353,17 @@ def round_costs(costs: dict) -> tuple[float, ...]:
+ 
+ 
+ PARALLEL_MOST = 4                     # --parallel: concurrent requests at most (the segmented kernels' streams)
++
++
++def multi_drafts(multi) -> str:
++    """--parallel's startup line: how the streams draft."""
++
++    if multi.drafts is None:
++        return "no drafts"
++    if multi.full:
++        return (f"DSpark drafts (a context a stream, eager), each round's windows at most {multi.window_rows} rows "
++                "(full GLM-5.3: eager batched verify, no CUDA graphs yet but a lone stream's)")
++    return "DFlash2 drafts"
+ MULTI_WINDOW = 32                     # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW)
+ 
+ 
+@@ -406,6 +417,78 @@ def dspark_weights(draft_dir, rank: int, world: int):
+     return Weights(m["weights"], m["weights"] * 4)
+ 
+ 
++def parallel_refusal(parallel: int, *, full: bool, drafter: bool, dspark: bool, serial_only: bool,
++                     cp: int = 1) -> str | None:
++    """Why --parallel ``parallel`` cannot start with these settings (before any connection or memory), or None.
++    ``full``: full GLM-5.3 (glm_moe_dsa); ``drafter``: a draft model was given (``dspark``: a DSpark speculator);
++    ``cp``: the ranks context parallelism (TF_GLM_CP=1) splits the caches over, 1 without it."""
++
++    if parallel <= 1:
++        return None
++    if cp > 1:
++        return (f"--parallel {parallel}: TF_GLM_CP=1 (context parallelism) serves one request at a time; concurrent "
++                "requests under context parallelism are not built yet: serve --parallel N with TF_GLM_CP=0, or "
++                "TF_GLM_CP=1 with --parallel 1")
++    if drafter or serial_only:
++        return None                  # a DFlash2 drafter on full GLM-5.3 is refused with the full checks
++    if full:
++        # the MTP head is not loaded under --parallel (``mtp_on``): its drafts are one request's at a time
++        return (f"--parallel {parallel}: full GLM-5.3's concurrent requests draft with a DSpark speculator only (its "
++                "MTP head drafts one request at a time, --parallel 1): give every rank the DSpark speculator "
++                "(--drafter), serve with --parallel 1 for MTP drafts, or pass --no-drafts to every rank to decode "
++                f"{parallel} requests together without drafts")
++    # this used to fail later as "TF_GLM_MTP=0 leaves no MTP head" whatever TF_GLM_MTP said (issue #38)
++    return (f"--parallel {parallel}: concurrent requests draft with DFlash2 only (the checkpoint's MTP head drafts "
++            "one request at a time, --parallel 1): give every rank the DFlash2 draft model (--drafter), serve with "
++            f"--parallel 1 for MTP drafts, or pass --no-drafts to every rank to decode {parallel} requests together "
++            "without drafts")
++
++
++def full_multi_bytes(t: dict, parallel: int, slots: int, *, world: int, share, kv: str, mtp: bool,
++                     prompt_split_k: bool) -> int:
++    """--parallel N on full GLM-5.3 (no context parallelism): what N streams add on a rank to the one-stream
++    geometry at ``slots`` cache slots A STREAM (the admitted window is each stream's; the pool holds N of them): the
++    other N - 1 streams' per-token caches (``geometry.full_token_bytes``; MLA's cache is the same on every rank)
++    and the batched verify window's own buffers (``verify.FullBatchedVerify``: FULL_MAX_ROWS decode rows over the
++    pool, ``geometry.full_buffer_bytes``). Its selection and attention scratch is a segment's at a time, no more
++    than a lone verify window's, which the one-stream geometry counts already. Full GLM-5.3 has no KDA states, so a
++    stream slot (``forward.Slots``) adds only its device positions."""
++
++    from tensorfold.cuda.geometry import full_buffer_bytes, full_token_bytes
++
++    from .verify import FULL_MAX_ROWS
++
++    if parallel <= 1:
++        return 0
++    return ((parallel - 1) * slots * full_token_bytes(t, kv, mtp)
++            + full_buffer_bytes(t, FULL_MAX_ROWS, world=world, share=share, capacity=parallel * slots,
++                                prefill=False, prompt_split_k=prompt_split_k)
++            + parallel * 16)
++
++
++def dspark_multi_bytes(draft_dir, parallel: int, rank: int, world: int, *, capacity: int, ring: bool) -> int:
++    """--parallel N with a DSpark speculator: its N stream contexts (``dspark_multi.DSparkMulti``) beside the solo
++    drafter's, each a context ring (~35 MiB a stream at three ranks) and its tap and candidate buffers, all sharing
++    the weights. ``capacity``: a flat context's tokens (no ring, TF_GLM_DRAFT_RING=0: the pool)."""
++
++    from .dspark import DSparkConfig, memory
++
++    if parallel <= 1:
++        return 0
++    m = memory(DSparkConfig.read(Path(draft_dir)), rank, world, capacity=capacity, ring=ring)
++    return parallel * (m["kv"] + m["fixed"])
++
++
++def full_pool_rows(slots: int, parallel: int, spare: int, token_bytes: int, align: int) -> tuple[int, int]:
++    """--parallel N on full GLM-5.3: (the pool's tokens, the most one stream holds). The admitted window is each
++    stream's: the pool is N windows (``slots`` cache slots each) plus what ``spare`` bytes (TF_GLM_CACHE_GIB beyond
++    the kept prompts' drafter windows) hold of other conversations' kept prompts, in whole ``align``-token extents;
++    a stream holds at most an even split of it, so N streams at their longest always fit together."""
++
++    pool = (parallel * slots + max(0, spare) // max(1, token_bytes)) // align * align
++    return pool, pool // parallel // align * align
++
++
+ def is_dspark(draft_dir) -> bool:
+     """Whether ``draft_dir`` holds a DSpark speculator (``dspark``: speculators_model_type "dspark", full GLM-5.3's)
+     rather than a DFlash2 drafter."""
+@@ -545,19 +628,20 @@ class GlmEngine:
+ 
+         if world not in SIZES:
+             raise ValueError(f"GLM-5.3-Flash's CUDA engine runs on {', '.join(map(str, SIZES))} ranks, not {world}")
+-        if int(parallel) > 1 and drafter is None and not serial_only:
+-            # before any connection or memory: the MTP head is not loaded under --parallel (``mtp_on`` below), so
+-            # this used to fail later as "TF_GLM_MTP=0 leaves no MTP head" whatever TF_GLM_MTP said (issue #38)
+-            raise ValueError(f"--parallel {int(parallel)}: concurrent requests draft with DFlash2 only (the "
+-                             "checkpoint's MTP head drafts one request at a time, --parallel 1): give every rank "
+-                             "the DFlash2 draft model (--drafter), serve with --parallel 1 for MTP drafts, or pass "
+-                             f"--no-drafts to every rank to decode {int(parallel)} requests together without drafts")
++        if int(parallel) > 1:
++            # before any connection or memory (``parallel_refusal``)
++            early = Config.read(model_dir)
++            why = parallel_refusal(int(parallel), full=bool(early.full), drafter=drafter is not None,
++                                   dspark=is_dspark(drafter), serial_only=serial_only,
++                                   cp=world if early.full and os.environ.get("TF_GLM_CP", "0").strip() == "1" else 1)
++            if why:
++                raise ValueError(why)
+         torch.cuda.set_device(0)
+         self.torch = torch
+         self.rank, self.world = rank, world
+         parallel = int(parallel)
+         if not 1 <= parallel <= PARALLEL_MOST:
+-            raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
++            raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once, not {parallel}")
+         self.parallel = parallel
+         self.policy = "0" if serial_only else policy
+         self.serial_only = serial_only
+@@ -577,11 +661,10 @@ class GlmEngine:
+                       "transport), larger ones over NCCL", flush=True)
+         cfg = Config.read(model_dir)
+         if cfg.full:
+-            # full GLM-5.3 (glm_moe_dsa): one request at a time with its MTP head; GLM-5.3-Flash's DFlash2 drafter
+-            # and image tower do not apply. The prompt row split (TF_GLM_HC_SPLIT) runs its plain-residual glue
+-            # (``hcsplit``: the residual add and the next RMSNorm on own rows), without the fronts (OVERLAP=2)
+-            if parallel != 1:
+-                raise ValueError("full GLM-5.3 serves one request at a time on CUDA (--parallel 1)")
++            # full GLM-5.3 (glm_moe_dsa): its MTP head (one request at a time) or a DSpark speculator (--parallel N
++            # too: ``multi``, ``dspark_multi``, ``verify.FullBatchedVerify``); GLM-5.3-Flash's DFlash2 drafter and image
++            # tower do not apply. The prompt row split (TF_GLM_HC_SPLIT) runs its plain-residual glue (``hcsplit``: the
++            # residual add and the next RMSNorm on own rows), without the fronts (OVERLAP=2)
+             if drafter is not None and not is_dspark(drafter):
+                 raise ValueError("full GLM-5.3 drafts with its MTP head or a DSpark speculator (--drafter); DFlash2 is "
+                                  "GLM-5.3-Flash's")
+@@ -660,8 +743,9 @@ class GlmEngine:
+         # each rank's own rows of their positions (``decode.local_rows``), in memory and on disk alike
+         self.cp = world if cfg.full and os.environ.get("TF_GLM_CP", "0").strip() == "1" else 1
+         if self.cp > 1:
+-            if parallel != 1:
+-                raise ValueError("TF_GLM_CP=1 serves one request at a time (--parallel 1)")
++            why = parallel_refusal(parallel, full=True, drafter=True, dspark=True, serial_only=False, cp=self.cp)
++            if why:
++                raise ValueError(why)
+             self.shared = 0
+         vision = bool(vision) and rank == 0
+         workspace = vision_workspace() if vision else 0
+@@ -686,10 +770,16 @@ class GlmEngine:
+             if cfg.full:
+                 from tensorfold.cuda.geometry import mla_full_geometry
+ 
+-                return mla_full_geometry(text, world, MAX_ROWS, share=share, decode_rows=MAX_ROWS,
+-                                         mtp_rows=min(MTP_ROWS, MAX_ROWS), prefill_rows=prompt_buffer_rows, kv=kv,
+-                                         mtp=self.mtp_on, prompt_split_k=dense_kind() not in ("q4",),
+-                                         minimum_slots=DENSE_CAPACITY, cp=self.cp)
++                g = mla_full_geometry(text, world, MAX_ROWS, share=share, decode_rows=MAX_ROWS,
++                                      mtp_rows=min(MTP_ROWS, MAX_ROWS), prefill_rows=prompt_buffer_rows, kv=kv,
++                                      mtp=self.mtp_on, prompt_split_k=dense_kind() not in ("q4",),
++                                      minimum_slots=DENSE_CAPACITY, cp=self.cp)
++                if parallel == 1:
++                    return g
++                # --parallel: the window is each stream's; the other streams' caches and the batched verify buffers
++                return Geometry(lambda slots: g.bytes_at(slots) + full_multi_bytes(
++                    text, parallel, slots, world=world, share=share, kv=kv, mtp=self.mtp_on,
++                    prompt_split_k=dense_kind() not in ("q4",)), g.reserve, g.minimum_slots)
+             g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT,
+                              prefill_rows=prompt_buffer_rows,
+                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
+@@ -712,7 +802,11 @@ class GlmEngine:
+                 from .dspark import DSparkConfig, memory
+ 
+                 m = memory(DSparkConfig.read(Path(drafter)), rank, world)
+-                return Geometry(lambda slots: m["kv"] + m["fixed"], 0)
++                if parallel == 1:
++                    return Geometry(lambda slots: m["kv"] + m["fixed"], 0)
++                # --parallel: a context a stream beside the solo one (``dspark_multi``)
++                return Geometry(lambda slots: m["kv"] + m["fixed"] + dspark_multi_bytes(
++                    drafter, parallel, rank, world, capacity=parallel * slots, ring=DRAFT_RING), 0)
+ 
+             g = dflash2_geometry(text, world, MAX_ROWS, ring=DRAFT_RING,
+                                  kv_heads=tp_mod.split_sizes(int(text["num_key_value_heads"]), world, 1)[rank])
+@@ -791,15 +885,32 @@ class GlmEngine:
+             from .pool import ALIGN
+ 
+             text = read_config(model_dir)
+-            g = geometry(text)
+-            per_token = max(1, -(-(g.bytes_at(capacity + 65536) - g.bytes_at(capacity)) // 65536))
+-            states = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8")) * (slot_bytes(text, world, rows=0, rank=rank) // 2 +
+-                                                                          (22 << 20))
+-            pool_rows = (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
+-            if pool_rows < ALIGN:
+-                raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one {ALIGN}-token "
+-                                 f"extent; free memory or lower --context")
+-            self.limit = min(self.limit, pool_rows - MAX_ROWS)
++            entries = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
++            if cfg.full:
++                # full GLM-5.3: the window is each stream's; the pool holds ``parallel`` of them and kept prompts'
++                # rows; a kept prompt's state beside the pool is its DSpark window (no KDA states)
++                from tensorfold.cuda.geometry import full_token_bytes
++
++                kept_window = 0
++                if dspark:
++                    from .dspark import DSparkConfig, memory
++
++                    kept_window = memory(DSparkConfig.read(Path(drafter)), rank, world)["kv"]
++                pool_rows, each = full_pool_rows(capacity, parallel, self.cache_bytes - entries * kept_window,
++                                                 full_token_bytes(text, kv, self.mtp_on), ALIGN)
++                if each < ALIGN:
++                    raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens leaves a stream less than "
++                                     f"one {ALIGN}-token extent; free memory, lower --context or --parallel")
++                self.limit = min(self.limit, each - MAX_ROWS)
++            else:
++                g = geometry(text)
++                per_token = max(1, -(-(g.bytes_at(capacity + 65536) - g.bytes_at(capacity)) // 65536))
++                states = entries * (slot_bytes(text, world, rows=0, rank=rank) // 2 + (22 << 20))
++                pool_rows = (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
++                if pool_rows < ALIGN:
++                    raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one "
++                                     f"{ALIGN}-token extent; free memory or lower --context")
++                self.limit = min(self.limit, pool_rows - MAX_ROWS)
+             self.cache_bytes = 0                 # kept prompts live in the pool
+             plan["pool_tokens"] = pool_rows
+         if rank == 0 and self.cache_bytes < wanted and parallel == 1:
+@@ -951,7 +1062,8 @@ class GlmEngine:
+                 self.scheduler = GlmScheduler(self.multi, max_streams=parallel)
+                 self.concurrent = True
+                 print(f"[tensorfold] --parallel {parallel}: up to {parallel} requests decode together, their caches "
+-                      f"in one pool of {pool_rows} tokens (each up to {self.limit}); DFlash2 drafts, prompt chunks of "
++                      f"in one pool of {pool_rows} tokens (each up to {self.limit}); "
++                      f"{multi_drafts(self.multi)}, prompt chunks of "
+                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
+                       f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
+                       f"{self.multi.tune.describe()}"
+@@ -1135,6 +1247,8 @@ class GlmEngine:
+     def _effective(self, code: list[int]) -> list[int]:
+         """Resolve auto and MTP policies to the available heads, using EXL3_AUTO for EXL3 with DFlash2 and DFlash2 when MTP is absent."""
+ 
++        if code[0] in (4, 5) and self.parallel > 1 and self.w.cfg.full:
++            return code                  # --parallel: ``multi.multi_code`` gives auto DSpark's multi-stream policy
+         if code[0] == 4 and self.drafter is not None and self.w.cfg.quant == "exl3":
+             return encode_policy(EXL3_AUTO)
+         if self.w.mtp is None and code[0] in (1, 2, 3, 4, 5):
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 87a239e..c5aa9fb 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -1748,10 +1748,12 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
+     if R > b.rows:
+         raise ValueError(f"window of {R} rows, buffers hold {b.rows}")
+     check_room(w, st, R)
+-    b.staged.synchronize()
++    if b.staged is not None:             # (no CUDA: no copy in flight)
++        b.staged.synchronize()
+     b.ids_host[:R].numpy()[:] = list(tokens)
+     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
+-    b.staged.record()
++    if b.staged is not None:
++        b.staged.record()
+     return R
+ 
+ 
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index bfc06e2..c4a1a44 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -29,7 +29,16 @@ in order through the same code (rank 0 as it decides them). Rank 1 derives draft
+ sent. An idle rank 1 waits on the doorbell (``GlmEngine._await_bell``), not in an all-gather. After an error the two
+ ranks cannot be trusted to agree: ``broken`` latches and every later call fails until both restart.
+ 
+-Multi-stream mode drafts with DFlash2 only: MTP policies are remapped to DFlash2 ones (drafts never change a reply)."""
++Multi-stream mode drafts with DFlash2 only: MTP policies are remapped to DFlash2 ones (drafts never change a reply).
++
++Full GLM-5.3 (glm_moe_dsa, milestone 2: eager, no context parallelism) runs the same scheduler, messages, prompt
++chunks, kept prompts, acceptance and keyed sampling with its own pieces: no KDA states (a slot holds only device
++positions); rounds verified by ``verify.FullBatchedVerify`` (one eager forward, each segment's attention on its own
++stream's caches) or ``SerialVerify``, every round's windows together at most ``verify.FULL_MAX_ROWS`` (16) rows, so
++each stream drafts at most its share (16 // streams - 1) and ``trim`` cuts the rest; DSpark drafts
++(``dspark_multi.DSparkMulti``: a context a stream over one weight set, proposals one stream after another, up to the
++speculator's 8 drafts; auto requests take TF_GLM_DSPARK_MULTI_POLICY); multi-prompt chunks through
++``multi_prefill.PieceMixer``'s full GLM split. A lone stream still moves home to the one-stream graphs."""
+ 
+ from __future__ import annotations
+ 
+@@ -50,7 +59,7 @@ from tensorfold.cuda.streams import Stream, next_fill
+ from . import multi_prefill, sliced_fill
+ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
+ from .pool import ALIGN, Pool, align_up
+-from .verify import BatchedVerify, Segment, SerialVerify, Verified
++from .verify import FULL_MAX_ROWS, BatchedVerify, FullBatchedVerify, Segment, SerialVerify, Verified
+ 
+ ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL, FILLPART, MFILLPART = range(1, 13)
+ OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+@@ -278,6 +287,19 @@ def put_draft_window(ctx, n: int, rows: list[torch.Tensor]) -> None:
+     ctx.pos_dev.fill_(n)
+ 
+ 
++def dspark_policy(value: str | None = None) -> str:
++    """TF_GLM_DSPARK_MULTI_POLICY: the DFlash2-style policy (f...) full GLM-5.3's DSpark streams draft by under
++    --parallel when a request names none (default fc8:0.3: up to the speculator's 8 drafts while the product of its
++    learned confidences holds 0.3; each stream's share of the round's 16 rows caps it further)."""
++
++    from .engine import encode_policy
++
++    value = (os.environ.get("TF_GLM_DSPARK_MULTI_POLICY", "") if value is None else value).strip() or "fc8:0.3"
++    if encode_policy(value)[0] < 10:
++        raise ValueError(f"TF_GLM_DSPARK_MULTI_POLICY: a drafter policy (f...), e.g. fc8:0.3, not {value!r}")
++    return value
++
++
+ # -- the verify seam -------------------------------------------------------------------------------------------------
+ def verify_kind(value: str | None = None) -> str:
+     """TF_GLM_MULTI_VERIFY: how a round's windows are verified: batched (the default: one forward over every stream's
+@@ -420,14 +442,32 @@ class MultiDecoder:
+                 raise ValueError("TF_GLM_MULTI_PREFILL=1 needs the latent cache (TF_GLM_LATENT=1)")
+         self.unit = fill_unit(self.grid)
+         self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
++        # full GLM-5.3 (glm_moe_dsa): no KDA states, DSpark drafts (a context per stream, eager), the eager batched
++        # verify of milestone 2 (``verify.FullBatchedVerify``: at most FULL_MAX_ROWS rows a round, every stream's)
++        self.full = bool(self.w.cfg.full)
++        self.window_rows = FULL_MAX_ROWS if self.full else MAX_WINDOW
++        if self.full and int(self.w.meta.get("cp", 1)) > 1:
++            raise ValueError("context parallelism (TF_GLM_CP=1) serves one request at a time: --parallel 1")
+         self.drafts = drafts
+         if self.drafts is None and engine.drafter is not None:
+-            from .dflash2_multi import MultiDrafter
++            if type(engine.drafter).__module__.endswith(".dspark"):
++                from .dspark_multi import DSparkMulti
+ 
+-            self.drafts = MultiDrafter(engine.drafter, streams=streams)
+-            graphs = os.environ.get("TF_GLM_MULTI_DRAFT_GRAPHS", "1") != "0" if draft_graphs is None else draft_graphs
+-            if graphs and torch.cuda.is_available():
+-                self.drafts.capture()
++                self.drafts = DSparkMulti(engine.drafter, streams=streams)      # eager (no graphs yet)
++            else:
++                from .dflash2_multi import MultiDrafter
++
++                self.drafts = MultiDrafter(engine.drafter, streams=streams)
++                graphs = (os.environ.get("TF_GLM_MULTI_DRAFT_GRAPHS", "1") != "0" if draft_graphs is None
++                          else draft_graphs)
++                if graphs and torch.cuda.is_available():
++                    self.drafts.capture()
++        if verify is None and self.full:
++            taps = engine.drafter.tap_layers if engine.drafter is not None else ()
++            if verify_kind() == "batched":
++                verify = FullBatchedVerify(e, taps=taps, rows=FULL_MAX_ROWS)
++            else:
++                verify = SerialVerify(e, taps=self.drafts is not None)
+         if verify is None:
+             if verify_kind() == "batched":
+                 taps = engine.drafter.tap_layers if engine.drafter is not None else ()
+@@ -440,6 +480,9 @@ class MultiDecoder:
+         self.verify = verify
+         # speed settings (multi_tune): the sampler's gathers, the drafts' depth, async messages, the profile
+         self.tune = tune if tune is not None else MultiSettings.from_env()
++        if self.full and self.tune.depth == "joint":
++            raise ValueError("TF_GLM_MULTI_DEPTH=joint is GLM-5.3-Flash's (DFlash2's batched block pass and verify "
++                             "graphs): full GLM-5.3 takes policy or scale:A")
+         self.profiles = None
+         if self.tune.profile and self.rank == 0:
+             self.profiles = {False: RoundProfile(self.tune.profile, label="batched"),
+@@ -469,6 +512,8 @@ class MultiDecoder:
+         self.requeue: list[Stream] = []                  # rank 0: streams given back to the scheduler's queue
+         self.eos = tuple(self.w.cfg.eos)
+         self.dflash_code = encode_policy(DFLASH_POLICY)
++        if self.full and self.drafts is not None:          # DSpark: up to its 8 drafts a round (auto requests)
++            self.dflash_code = encode_policy(dspark_policy())
+         if self.fill_budget:
+             self.fill_costs = self._time_prompt_layers()
+ 
+@@ -851,7 +896,8 @@ class MultiDecoder:
+         if hit is not None:
+             from .decode import put_ring_tail
+ 
+-            st.rec[st.cur[0]].copy_(hit.rec)
++            if st.cur:                      # KDA states (full GLM-5.3 has none)
++                st.rec[st.cur[0]].copy_(hit.rec)
+             st.conv.copy_(hit.conv)
+             put_ring_tail(st, hit)          # the index rows of its pools still filling, into this slot's rings
+             st.set_pos(cut)
+@@ -1453,15 +1499,19 @@ class MultiDecoder:
+         drafts: list[list[int]] = []
+         copied: list[bool] = []
+         asks = []
++        # full GLM-5.3: every stream's window in one batched verify of at most FULL_MAX_ROWS rows, so each stream drafts
++        # at most its share (2 streams: 7, 3: 4, 4: 3); ``trim`` still cuts copied drafts to the round's rows
++        share = max(0, self.window_rows // max(1, len(lanes)) - 1) if self.full else None
+         for l in lanes:
+             c = l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)) if l.copies is not None and not short else []
+             copied.append(bool(c))
+             drafts.append(list(c))
+-            if not short and not c and l.dflash and l.depth > 0:
++            depth = l.depth if share is None else min(l.depth, share)
++            if not short and not c and l.dflash and depth > 0:
+                 conf = l.policy.confidence
+                 if tune.depth == "scale":
+                     conf = scaled_confidence(conf, len(lanes), tune.alpha)
+-                asks.append((len(drafts) - 1, DraftRequest(self._ctx(l), l.s.out[-1], l.depth, l.s.sampling,
++                asks.append((len(drafts) - 1, DraftRequest(self._ctx(l), l.s.out[-1], depth, l.s.sampling,
+                                                            conf, **l.policy.chain_rule)))
+         if asks and tune.depth == "joint":
+             self._joint(lanes, drafts, asks)
+@@ -1469,7 +1519,7 @@ class MultiDecoder:
+             got = self.drafts.propose([a for _, a in asks])
+             for (k, _), d in zip(asks, got):
+                 drafts[k] = list(d)
+-        drafts = trim(drafts, MAX_WINDOW)
++        drafts = trim(drafts, self.window_rows)
+         if prof is not None:
+             prof.mark("propose")
+         segments = []
+diff --git tensorfold/families/glm5_next/cuda/multi_prefill.py tensorfold/families/glm5_next/cuda/multi_prefill.py
+index 474753d..3b832a8 100644
+--- tensorfold/families/glm5_next/cuda/multi_prefill.py
++++ tensorfold/families/glm5_next/cuda/multi_prefill.py
+@@ -27,6 +27,10 @@ one forward over them on the prompt buffers (``Engine.pbuf``):
+ So a piece's bits are those of the same rows run as a chunk of their own, from the same position: a valid chunking of
+ its prompt (pieces start where its own chunks would, on the prompt grid, and end at its kept points or its end).
+ 
++Full GLM-5.3 has no KDA layers: its attention's projections and output run over every row, the cache writes, RoPE,
++token selection (each piece's carried through the shared indexer layers on its own) and attention piece by piece
++(``forward.dsa_full_rows`` at the piece's rows, as ``verify.FullBatchedVerify`` does for decode windows).
++
+ Image prompts (rows replaced by the vision tower's output) and replays of a kept prompt's head are not grouped; they
+ fill alone as before. The latent cache is required (``latent.ENABLED``, the default)."""
+ 
+@@ -109,6 +113,33 @@ class PieceMixer:
+ 
+     def __init__(self, w, b, pieces: Sequence[Piece], R: int) -> None:
+         self.w, self.b, self.pieces, self.R = w, b, list(pieces), R
++        # full GLM-5.3: each piece's selection, carried through the shared indexer layers on its own (one carried
++        # selection, overwritten by the last piece, would hand the next shared layer another stream's tokens)
++        self.topk: list = [None] * len(self.pieces)
++
++    def _full(self, layer):
++        """Full GLM-5.3's attention over a multi-prompt chunk (``verify.FullBatchedVerify``'s split, prompt rows): the
++        projections and the output on every row, each piece's cache writes, RoPE, selection and attention on its own
++        stream's caches at its position, with the arguments a chunk of its own gets (``forward.dsa_full_rows``)."""
++
++        from . import prof
++        from .forward import chunks_for, dsa_full_front, dsa_full_out, dsa_full_rows
++
++        if layer.kind != "dsa":
++            raise ValueError(f"layer {layer.index}: full GLM-5.3 has attention layers only")
++        w, b, R = self.w, self.b, self.R
++        with prof.timed("dsa (total)"):
++            dsa_full_front(layer, w, b, 0, R)
++            for k, p in enumerate(self.pieces):
++                st = p.st
++                di = st.dsa_index[layer.index]
++                keys = None
++                if st.index is not None and layer.dsa.index is not None:
++                    keys = st.index[st.index_of[layer.index]][2]
++                self.topk[k] = dsa_full_rows(layer, w, st.kc[di], st.kr[di], st.pos_dev, b, p.rows,
++                                             chunks_for(st, p.rows), keys, st.pos, None,
++                                             indexed=st.index is not None, topk=self.topk[k], lo=p.lo)
++            return dsa_full_out(layer, w, b, R)
+ 
+     def __call__(self, layer, done: tuple[int, int] | None = None):
+         from . import prof
+@@ -116,6 +147,10 @@ class PieceMixer:
+         from . import qmm
+ 
+         w, b, R = self.w, self.b, self.R
++        if w.cfg.full:
++            if done is not None:
++                raise ValueError("full GLM-5.3's prompt chunks run no fronts during the swaps (TF_GLM_PREFILL_OVERLAP=2)")
++            return self._full(layer)
+         if layer.kind == "kda":
+             k = layer.kda
+             with prof.timed("kda"):
+@@ -149,10 +184,12 @@ def _stage(w, b, pieces: Sequence[Piece], R: int) -> None:
+     for p in pieces:
+         check_room(w, p.st, p.rows)
+     tokens = [int(t) for p in pieces for t in p.tokens]
+-    b.staged.synchronize()
++    if b.staged is not None:             # (no CUDA: no copy in flight)
++        b.staged.synchronize()
+     b.ids_host[:R].numpy()[:] = tokens
+     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
+-    b.staged.record()
++    if b.staged is not None:
++        b.staged.record()
+ 
+ 
+ @torch.no_grad()

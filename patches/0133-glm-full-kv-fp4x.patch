@@ -1,0 +1,986 @@
+diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
+index 7082dab..a44d8d1 100644
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -231,10 +231,11 @@ def _indexed_prefill_row(t: dict, world: int, h: int, hk: int, hd: int, nv: int,
+ 
+ def mla_row_bytes(width: int, kv: str = "bf16") -> int:
+     """A GLM DSA cache row of ``width`` values: bf16, TF_GLM_KV=fp8's e4m3 codes, fp32 scale and 12 pad bytes, or
+-    fp4's e2m1 codes, an e4m3 scale a block of 16 and the fp32 scale (families/glm5_next/cuda/kv8.py)."""
+-    if kv not in ("bf16", "fp8", "fp4"):
+-        raise ValueError(f"a GLM DSA cache is bf16, fp8 or fp4, not {kv!r}")
+-    if kv == "fp4":
++    fp4's e2m1 codes, an e4m3 scale a block of 16 and the fp32 scale (families/glm5_next/cuda/kv8.py); fp4x's latent
++    rows are fp4's (the rotary scale rides in their pad)."""
++    if kv not in ("bf16", "fp8", "fp4", "fp4x"):
++        raise ValueError(f"a GLM DSA cache is bf16, fp8, fp4 or fp4x, not {kv!r}")
++    if kv in ("fp4", "fp4x"):
+         return -(-(width // 2 + width // 16 + 4) // 16) * 16
+     return width + 16 if kv == "fp8" else 2 * width
+ 
+@@ -347,13 +348,25 @@ def full_counts(t: dict, mtp: bool) -> tuple[int, int]:
+     return layers + int(mtp), full + int(mtp)
+ 
+ 
++def full_rope_row_bytes(width: int, kv: str = "bf16") -> int:
++    """Full GLM-5.3's rotary key row of ``width`` values: bf16, or TF_GLM_KV=fp4x's e4m3 codes (their power-of-two
++    scale sits in the FP4 latent row's pad)."""
++    return width if kv == "fp4x" else 2 * width
++
++
++def full_index_row_bytes(width: int, kv: str = "bf16") -> int:
++    """Full GLM-5.3's per-token index key row of ``width`` values: bf16, or TF_GLM_KV=fp4x's e4m3 codes and fp32
++    power-of-two scale."""
++    return width + 4 if kv == "fp4x" else 2 * width
++
++
+ def full_token_bytes(t: dict, kv: str = "bf16", mtp: bool = True) -> int:
+     """Full GLM-5.3's cache bytes a token on every rank (MLA's cache is the same on all ranks): per attention layer
+-    its latent row (bf16, or TF_GLM_KV=fp8's codes, scale and pad) and its rotary key (bf16), per indexer its
+-    per-token index key (bf16)."""
++    its latent row (bf16, or TF_GLM_KV=fp8's codes, scale and pad, or fp4's) and its rotary key (bf16; fp4x: e4m3
++    codes), per indexer its per-token index key (bf16; fp4x: e4m3 codes and scale)."""
+     layers, indexers = full_counts(t, mtp)
+     lw, rope, idx = int(t["kv_lora_rank"]), int(t["qk_rope_head_dim"]), int(t.get("index_head_dim", 128))
+-    return layers * (mla_row_bytes(lw, kv) + 2 * rope) + indexers * 2 * idx
++    return layers * (mla_row_bytes(lw, kv) + full_rope_row_bytes(rope, kv)) + indexers * full_index_row_bytes(idx, kv)
+ 
+ 
+ def full_buffer_bytes(t: dict, rows: int, *, world: int, share, capacity: int, prefill: bool,
+diff --git tensorfold/families/glm5_next/cuda/dcp.py tensorfold/families/glm5_next/cuda/dcp.py
+index 301dc69..38cb9a3 100644
+--- tensorfold/families/glm5_next/cuda/dcp.py
++++ tensorfold/families/glm5_next/cuda/dcp.py
+@@ -32,7 +32,7 @@ import triton
+ import triton.language as tl
+ 
+ from . import kv8, latent
+-from .dsa_full import BT, MIN_BUCKET, ROW_G, SELECT_ROWS, TOPK, _order_key, _wscale
++from .dsa_full import BT, MIN_BUCKET, ROW_G, SELECT_ROWS, TOPK, _order_key, _wscale, key_args, key_tile
+ 
+ WORLD = 3            # ranks a context-parallel cache is spread over by default
+ 
+@@ -64,7 +64,8 @@ def local_cols(pos: int, R: int, rank: int, G: int, slots: int) -> int:
+ 
+ @triton.jit
+ def _scores_local(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, rank, scale, wscale, G: tl.constexpr,
+-                  H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, BTT: tl.constexpr, NG: tl.constexpr):
++                  H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, BTT: tl.constexpr, NG: tl.constexpr,
++                  KS=None, K8: tl.constexpr = 0):
+     """Program (row r, g): local token blocks g, g + NG, .. of row r's scores s_t = sum_h w_h relu(scale qi_h . k_t)
+     over the rank's keys KEYS [slots, D] (local slot t: global position t G + rank), for the row's visible local
+     slots t < (pos + r + G - rank) // G, -inf for later columns up to NT. dsa_full._scores' tile ([HP, BTT], keys
+@@ -83,8 +84,7 @@ def _scores_local(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, rank, scale,
+         if tb * BTT >= last:
+             tl.store(OUT + r * o_stride + t, float("-inf"), mask=t < NT)
+         else:
+-            k = tl.load(KEYS + t[:, None].to(tl.int64) * D + d[None, :], mask=(t < last)[:, None],
+-                        other=0.0).to(tl.bfloat16)                                                    # [BTT, D]
++            k = key_tile(KEYS, KS, t, t < last, d, D, K8)                                             # [BTT, D]
+             q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
+             kr = tl.where((t < nv)[:, None], k, 0.0)
+             dots = tl.dot(q, tl.trans(kr))                                                            # [HP, BTT]
+@@ -142,18 +142,20 @@ def _select_local(S, s_stride, CAND, POS, NT, rank, G: tl.constexpr, K: tl.const
+ def score_local(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, rank: int, G: int, pos_dev: torch.Tensor,
+                 R: int, NT: int, out: torch.Tensor) -> torch.Tensor:
+     """fp32 scores [R, NT] (``out``'s first NT columns) of R rows at positions pos .. pos + R - 1 over the rank's
+-    local index keys [slots, D] (bf16): column t is global token t G + rank, with dsa_full.score's bits."""
++    local index keys [slots, D] (bf16, or TF_GLM_KV=fp4x's e4m3 rows, dequantized exactly): column t is global token
++    t G + rank, with dsa_full.score's bits."""
+ 
+     H = wts.shape[1]
+-    D = keys.shape[1]
+-    if qi.shape[1] != H * D or not qi.is_contiguous() or wts.stride(1) != 1 or keys.dtype != torch.bfloat16 \
+-            or not keys.is_contiguous() or out.stride(1) != 1:
++    D = kv8.index_width(keys)
++    if qi.shape[1] != H * D or not qi.is_contiguous() or wts.stride(1) != 1 \
++            or keys.dtype not in (torch.bfloat16, torch.uint8) or not keys.is_contiguous() or out.stride(1) != 1:
+         raise ValueError("dcp scores: contiguous index queries [R, H * D], unit-stride weights, contiguous bf16 keys")
++    KEYS, KS, K8 = key_args(keys)
+     if R:
+         ng = min(ROW_G, triton.cdiv(NT, BT))
+-        _scores_local[(R, ng)](qi, wts, wts.stride(0), keys, out, out.stride(0), pos_dev, R, NT, int(rank),
++        _scores_local[(R, ng)](qi, wts, wts.stride(0), KEYS, out, out.stride(0), pos_dev, R, NT, int(rank),
+                                D ** -0.5, _wscale(H), G=int(G), H=H, HP=max(16, triton.next_power_of_2(H)), D=D,
+-                               BTT=BT, NG=ng, num_warps=4)
++                               BTT=BT, NG=ng, KS=KS, K8=K8, num_warps=4)
+     return out
+ 
+ 
+@@ -279,7 +281,8 @@ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Te
+                       parts: tuple | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+     """A rank's partial latent attention: absorbed queries qa [R, H, 512] and rotary queries qp [R, H, 64] (bf16,
+     every head of the rows) over its own selected tokens (``select_merge``: local slots, counts) of its local
+-    caches (latent: bf16 [slots, 512] or kv8 FP8 uint8 [slots, 528]; rotary keys rope [slots, 64] bf16) -> o
++    caches (latent: bf16 [slots, 512], kv8 FP8 uint8 [slots, 528] or FP4 int8 [slots, 304]; rotary keys rope
++    [slots, 64] bf16, or fp4x's e4m3 codes with their scales in the FP4 latent rows) -> o
+     [R, H, 512] fp32 normalized and lse [R, H] fp32 (-inf, o 0 where a row has no local tokens). latent._tile's math
+     (scores = q . k (times the FP8 row scale) + qp . k_rope, times scale; online softmax) in latent._sparse_chunks'
+     fixed grid (k / 512 chunks a row, ``hb`` heads a tile), then the chunks merged in order: a row's bits depend on
+@@ -303,11 +306,11 @@ def attention_partial(qa: torch.Tensor, qp: torch.Tensor | None, cache: torch.Te
+         pm = torch.empty((n,), dtype=torch.float32, device=dev)
+         pl = torch.empty((n,), dtype=torch.float32, device=dev)
+     vals, scl, rs, fp8 = latent._cache_parts(cache, LW)
+-    QP, KR, ROPE = latent._rope_args(qp, rope, R, H)
++    QP, KR, ROPE, R8, RSW = latent._rope_args(qp, rope, R, H, cache)
+     latent._sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, slots, counts, po, pm, pl, R, W=W, H=H, LW=LW,
+                                                         CH=latent.CHUNK, SCALE=scale, HBT=hb, KTT=latent.key_tile(cache), RS=rs,
+                                                         FP8=fp8, QP=QP, KR=KR, ROPE=ROPE, FP4=int(kv8.fp4(cache)),
+-                                                        num_warps=8,
++                                                        R8=R8, RSW=RSW, num_warps=8,
+                                                         num_stages=latent.chunk_stages(cache))
+     _merge_lse[(R, H)](po, pm, pl, o, lse, R, H=H, LW=LW, NCH=nch, num_warps=4)
+     return o, lse
+diff --git tensorfold/families/glm5_next/cuda/dsa_full.py tensorfold/families/glm5_next/cuda/dsa_full.py
+index be2ee38..13c05ca 100644
+--- tensorfold/families/glm5_next/cuda/dsa_full.py
++++ tensorfold/families/glm5_next/cuda/dsa_full.py
+@@ -7,7 +7,12 @@ window's rows keep the serial step's bits; positions come from the device (CUDA
+ RoPE follows transformers' ``apply_rotary_pos_emb_interleave``: pairs (x[2i], x[2i + 1]) rotate by angle
+ pos * theta^(-2i / dim) and come out half-split, [x_even cos - x_odd sin | x_odd cos + x_even sin]; queries and keys
+ alike, so their dot products are the interleaved ones. The angle is fp32(pos) * inv_freq (inv_freq as transformers
+-computes it, fp32), cos and sin rounded to bf16 as transformers hands them to the bf16 model, products in fp32."""
++computes it, fp32), cos and sin rounded to bf16 as transformers hands them to the bf16 model, products in fp32.
++
++TF_GLM_KV=fp4x (``kv8``): the rotary key plane holds e4m3 codes [slots, 64] (uint8) with each row's power-of-two
++scale in the FP4 latent row beside it, and the index keys e4m3 codes and an fp32 scale a row [slots, 128 + 4]
++(uint8). The writers quantize the bf16 row they would store (a function of the row alone); the readers dequantize it
++to that exact bf16 tile and run the bf16 arithmetic."""
+ 
+ from __future__ import annotations
+ 
+@@ -15,6 +20,8 @@ import torch
+ import triton
+ import triton.language as tl
+ 
++from . import kv8
++
+ TOPK = 2048          # tokens a sparse row attends (index_topk)
+ SELECT_ROWS = 128    # a prompt chunk's rows whose fp32 token scores are held at once ([rows, tokens])
+ BT = 64              # tokens a score tile takes (the tile sets a row's bits: fixed)
+@@ -103,10 +110,12 @@ def index_q_rope(qi: torch.Tensor, heads: int, pos: torch.Tensor, freq: torch.Te
+ 
+ @triton.jit
+ def _k_rope_write(K, k_stride, KR, POS, BASE, FREQ, RANK, HALF: tl.constexpr, SEG: tl.constexpr,
+-                  CP: tl.constexpr = 1):
++                  CP: tl.constexpr = 1, LS=None, LRS: tl.constexpr = 0, RSW: tl.constexpr = 0, R8: tl.constexpr = 0):
+     """Row r: its rotary key K[r, :2 HALF] (interleaved pairs) rotated at its position -> cache row (half-split).
+     SEG: position and extent base per row (POS[r], BASE[r]); else pos + r from POS[0]. CP > 1 (not with SEG): only
+-    positions p with p % CP == RANK, at row p // CP."""
++    positions p with p % CP == RANK, at row p // CP. R8 (TF_GLM_KV=fp4x): KR an e4m3 plane (2 HALF bytes a row), the
++    bf16 row's codes there and its power-of-two scale into fp32 word RSW of the same row of the FP4 latent cache LS
++    (rows LRS words apart)."""
+     r = tl.program_id(0)
+     if SEG:
+         pos = tl.load(POS + r)
+@@ -122,29 +131,55 @@ def _k_rope_write(K, k_stride, KR, POS, BASE, FREQ, RANK, HALF: tl.constexpr, SE
+     xe = tl.load(K + r * k_stride + 2 * i).to(tl.float32)
+     xo = tl.load(K + r * k_stride + 2 * i + 1).to(tl.float32)
+     a, b = _rotate(xe, xo, pos, FREQ, HALF)
+-    tl.store(KR + row * (2 * HALF) + i, a.to(tl.bfloat16))
+-    tl.store(KR + row * (2 * HALF) + HALF + i, b.to(tl.bfloat16))
++    if R8:
++        ab = a.to(tl.bfloat16).to(tl.float32)
++        bb = b.to(tl.bfloat16).to(tl.float32)
++        s, inv = kv8.scale_of(tl.maximum(tl.max(tl.abs(ab), 0), tl.max(tl.abs(bb), 0)))
++        tl.store(KR + row * (2 * HALF) + i, (ab * inv).to(tl.float8e4nv))
++        tl.store(KR + row * (2 * HALF) + HALF + i, (bb * inv).to(tl.float8e4nv))
++        tl.store(LS + row * LRS + RSW, s)
++    else:
++        tl.store(KR + row * (2 * HALF) + i, a.to(tl.bfloat16))
++        tl.store(KR + row * (2 * HALF) + HALF + i, b.to(tl.bfloat16))
++
++
++def rope8_args(cache: torch.Tensor, latent: torch.Tensor | None):
++    """(KR, LS, LRS, RSW, R8) kernel arguments of a rotary plane: bf16 as it is, or fp4x's e4m3 codes (fp8 view) with
++    the FP4 latent cache holding their scales (its fp32 view, row stride in words, the scale's word)."""
++    if not kv8.rope8(cache):
++        return cache, cache, 0, 0, 0
++    if latent is None or not kv8.fp4(latent) or latent.shape[0] != cache.shape[0] or not latent.is_contiguous():
++        raise ValueError("an FP8 rotary plane (TF_GLM_KV=fp4x) keeps its scales in a contiguous FP4 latent cache of "
++                         "as many rows")
++    if not cache.is_contiguous():
++        raise ValueError("an FP8 rotary plane: contiguous rows")
++    return (cache.view(torch.float8_e4m3fn), latent.view(torch.float32), latent.shape[1] // 4,
++            kv8.rope_scale_word(kv8.width(latent)), 1)
+ 
+ 
+ def k_rope_write(k: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, freq: torch.Tensor, cp: int = 1,
+-                 rank: int = 0) -> None:
++                 rank: int = 0, latent: torch.Tensor | None = None) -> None:
+     """k [R, rope] bf16 rows (any row stride): each row's rotary key, rotated at pos + r, into cache [slots, rope]
+-    (bf16) row pos + r (``cp`` > 1: this rank's positions only, at row p // cp)."""
++    (bf16) row pos + r (``cp`` > 1: this rank's positions only, at row p // cp). TF_GLM_KV=fp4x: cache uint8 [slots,
++    rope] codes, each row's scale into ``latent`` (the layer's FP4 latent cache) at the same row."""
+ 
+     half = freq.numel()
+-    if k.shape[1] < 2 * half or k.stride(1) != 1 or cache.dtype != torch.bfloat16 or cache.shape[1] != 2 * half:
++    if k.shape[1] < 2 * half or k.stride(1) != 1 or cache.dtype not in (torch.bfloat16, torch.uint8) \
++            or cache.shape[1] != 2 * half:
+         raise ValueError(f"k_rope_write: rows of {k.shape[1]} into a cache of {tuple(cache.shape)}")
++    KR, LS, LRS, RSW, R8 = rope8_args(cache, latent)
+     if k.shape[0]:
+-        _k_rope_write[(k.shape[0],)](k, k.stride(0), cache, pos, pos, freq, int(rank), HALF=half, SEG=False,
+-                                     CP=int(cp), num_warps=1)
++        _k_rope_write[(k.shape[0],)](k, k.stride(0), KR, pos, pos, freq, int(rank), HALF=half, SEG=False,
++                                     CP=int(cp), LS=LS, LRS=LRS, RSW=RSW, R8=R8, num_warps=1)
+ 
+ 
+ @triton.jit
+ def _index_write(KR, k_stride, LNW, LNB, IK, POS, FREQ, eps, RANK, D: tl.constexpr, HALF: tl.constexpr,
+-                 CP: tl.constexpr = 1):
++                 CP: tl.constexpr = 1, IS=None, K8: tl.constexpr = 0):
+     """Row r: LayerNorm(k_raw[r, :D]) (fp32 statistics, weight and bias), rounded to bf16 as the bf16 LayerNorm
+     returns it, then RoPE on its first 2 HALF dims at position pos + r -> IK[pos + r] (bf16). CP > 1: only
+-    positions p with p % CP == RANK, at row p // CP."""
++    positions p with p % CP == RANK, at row p // CP. K8 (TF_GLM_KV=fp4x): IK an e4m3 plane of rows D + 4 bytes, the
++    bf16 row's codes, then its power-of-two scale (IS: the plane's fp32 view, word D / 4 of the row)."""
+     r = tl.program_id(0)
+     pos = tl.load(POS) + r
+     slot = pos.to(tl.int64)
+@@ -159,33 +194,61 @@ def _index_write(KR, k_stride, LNW, LNB, IK, POS, FREQ, eps, RANK, D: tl.constex
+     xc = x - mean
+     rstd = 1.0 / tl.sqrt(tl.sum(xc * xc, axis=0) / D + eps)
+     y = xc * rstd * tl.load(LNW + d).to(tl.float32) + tl.load(LNB + d).to(tl.float32)
+-    row = IK + slot * D
+-    tl.store(row + d, y.to(tl.bfloat16), mask=d >= 2 * HALF)           # the dims past the rotary ones
+     i = tl.arange(0, HALF)
+     e, o = 2 * i, 2 * i + 1
+     ye = (tl.load(src + e).to(tl.float32) - mean) * rstd * tl.load(LNW + e).to(tl.float32) + tl.load(LNB + e).to(tl.float32)
+     yo = (tl.load(src + o).to(tl.float32) - mean) * rstd * tl.load(LNW + o).to(tl.float32) + tl.load(LNB + o).to(tl.float32)
+     a, b = _rotate(ye.to(tl.bfloat16).to(tl.float32), yo.to(tl.bfloat16).to(tl.float32), pos, FREQ, HALF)
+-    tl.store(row + i, a.to(tl.bfloat16))
+-    tl.store(row + HALF + i, b.to(tl.bfloat16))
++    if K8:
++        # the bf16 row (pass dims, then the rotated halves), its power-of-two scale, its codes
++        yb = tl.where(d >= 2 * HALF, y.to(tl.bfloat16).to(tl.float32), 0.0)
++        ab = a.to(tl.bfloat16).to(tl.float32)
++        bb = b.to(tl.bfloat16).to(tl.float32)
++        amax = tl.maximum(tl.max(tl.abs(yb), 0), tl.maximum(tl.max(tl.abs(ab), 0), tl.max(tl.abs(bb), 0)))
++        s, inv = kv8.scale_of(amax)
++        row = IK + slot * (D + 4)
++        tl.store(row + d, (yb * inv).to(tl.float8e4nv), mask=d >= 2 * HALF)
++        tl.store(row + i, (ab * inv).to(tl.float8e4nv))
++        tl.store(row + HALF + i, (bb * inv).to(tl.float8e4nv))
++        tl.store(IS + slot * ((D + 4) // 4) + D // 4, s)
++    else:
++        row = IK + slot * D
++        tl.store(row + d, y.to(tl.bfloat16), mask=d >= 2 * HALF)           # the dims past the rotary ones
++        tl.store(row + i, a.to(tl.bfloat16))
++        tl.store(row + HALF + i, b.to(tl.bfloat16))
+ 
+ 
+ def index_write(k_raw: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor, keys: torch.Tensor, pos: torch.Tensor,
+                 freq: torch.Tensor, eps: float = 1e-6, cp: int = 1, rank: int = 0) -> None:
+     """Window rows' index keys: k_raw [R, >= D] (wk's output, any row stride) -> LayerNorm -> RoPE on the first
+-    rotary dims -> keys [slots, D] bf16 rows pos .. pos + R - 1."""
+-
+-    D = keys.shape[1]
+-    if keys.dtype != torch.bfloat16 or not keys.is_contiguous() or k_raw.stride(1) != 1 or k_raw.shape[1] < D:
+-        raise ValueError("index_write: bf16 key rows, contiguous")
++    rotary dims -> keys [slots, D] bf16 rows pos .. pos + R - 1 (TF_GLM_KV=fp4x: uint8 [slots, D + 4] rows, the
++    bf16 row's e4m3 codes and fp32 scale)."""
++
++    D = kv8.index_width(keys)
++    if keys.dtype not in (torch.bfloat16, torch.uint8) or not keys.is_contiguous() or k_raw.stride(1) != 1 \
++            or k_raw.shape[1] < D:
++        raise ValueError("index_write: bf16 (or fp4x) key rows, contiguous")
++    k8 = kv8.index8(keys)
+     if k_raw.shape[0]:
+-        _index_write[(k_raw.shape[0],)](k_raw, k_raw.stride(0), ln_w, ln_b, keys, pos, freq, float(eps), int(rank),
+-                                        D=D, HALF=freq.numel(), CP=int(cp), num_warps=1)
++        _index_write[(k_raw.shape[0],)](k_raw, k_raw.stride(0), ln_w, ln_b,
++                                        keys.view(torch.float8_e4m3fn) if k8 else keys, pos, freq, float(eps),
++                                        int(rank), D=D, HALF=freq.numel(), CP=int(cp),
++                                        IS=keys.view(torch.float32) if k8 else keys, K8=int(k8), num_warps=1)
++
++
++@triton.jit
++def key_tile(KEYS, KS, t, ok, d, D: tl.constexpr, K8: tl.constexpr):
++    """Index key rows t ([BTT], rows not ok: zeros) as a bf16 tile [BTT, D]: bf16 rows as they are, or (K8,
++    TF_GLM_KV=fp4x) e4m3 codes times each row's power-of-two scale (KS: the plane's fp32 view), exactly the bf16
++    values."""
++    if K8:
++        return kv8.load_codes8(KEYS, KS, t.to(tl.int64), ok, d, D + 4, D // 4, (D + 4) // 4)
++    return tl.load(KEYS + t[:, None].to(tl.int64) * D + d[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
+ 
+ 
+ @triton.jit
+ def _scores(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, scale, wscale, H: tl.constexpr, HP: tl.constexpr,
+-            D: tl.constexpr, BTT: tl.constexpr, RB: tl.constexpr, G: tl.constexpr):
++            D: tl.constexpr, BTT: tl.constexpr, RB: tl.constexpr, G: tl.constexpr, KS=None, K8: tl.constexpr = 0):
+     """Program (RB rows, g): token blocks g, g + G, .. of the RB rows' scores s_t = sum_h w_h relu(scale qi_h . k_t)
+     for t <= the row's position, -inf for later columns up to NT. Each row's dot takes its own keys (masked to its
+     visible tokens) on the same [HP, BTT] tile whatever RB, G or R: the same bits a row."""
+@@ -205,8 +268,7 @@ def _scores(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, scale, wscale, H:
+                 if r < R:
+                     tl.store(OUT + r * o_stride + t, float("-inf"), mask=t < NT)
+         else:
+-            k = tl.load(KEYS + t[:, None].to(tl.int64) * D + d[None, :], mask=(t < last)[:, None],
+-                        other=0.0).to(tl.bfloat16)                                                    # [BTT, D]
++            k = key_tile(KEYS, KS, t, t < last, d, D, K8)                                             # [BTT, D]
+             for i in tl.static_range(RB):
+                 r = rb * RB + i
+                 if r < R:
+@@ -292,25 +354,36 @@ def score(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos_dev: torc
+     """fp32 scores [R, NT] (``out``'s first NT columns of each row) of R rows at positions pos .. pos + R - 1."""
+ 
+     H = wts.shape[1]
+-    D = keys.shape[1]
+-    if qi.shape[1] != H * D or not qi.is_contiguous() or wts.stride(1) != 1 or keys.dtype != torch.bfloat16:
+-        raise ValueError("index scores: contiguous index queries [R, H * D], unit-stride weights, bf16 keys")
++    D = kv8.index_width(keys)
++    if qi.shape[1] != H * D or not qi.is_contiguous() or wts.stride(1) != 1 \
++            or keys.dtype not in (torch.bfloat16, torch.uint8) or not keys.is_contiguous():
++        raise ValueError("index scores: contiguous index queries [R, H * D], unit-stride weights, bf16 (or fp4x) keys")
++    KEYS, KS, K8 = key_args(keys)
+     rb = int(rows_per_program)
+     g = min(ROW_G, triton.cdiv(NT, BT)) if rb == 1 else 1
+     grid = (triton.cdiv(R, rb), g if rb == 1 else triton.cdiv(NT, BT))
+     if rb == 1:
+-        _scores[grid](qi, wts, wts.stride(0), keys, out, out.stride(0), pos_dev, R, NT, D ** -0.5, _wscale(H), H=H,
+-                      HP=max(16, triton.next_power_of_2(H)), D=D, BTT=BT, RB=1, G=g, num_warps=4)
++        _scores[grid](qi, wts, wts.stride(0), KEYS, out, out.stride(0), pos_dev, R, NT, D ** -0.5, _wscale(H), H=H,
++                      HP=max(16, triton.next_power_of_2(H)), D=D, BTT=BT, RB=1, G=g, KS=KS, K8=K8, num_warps=4)
+     else:
+         # prompt rows: a program a (row block, token block); G = 1 with the grid's second axis the token block
+-        _scores_blocks[grid](qi, wts, wts.stride(0), keys, out, out.stride(0), pos_dev, R, NT, D ** -0.5, _wscale(H),
+-                             H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BTT=BT, RB=rb, num_warps=4)
++        _scores_blocks[grid](qi, wts, wts.stride(0), KEYS, out, out.stride(0), pos_dev, R, NT, D ** -0.5, _wscale(H),
++                             H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BTT=BT, RB=rb, KS=KS, K8=K8,
++                             num_warps=4)
+     return out
+ 
+ 
++def key_args(keys: torch.Tensor):
++    """(KEYS, KS, K8) kernel arguments of an index key plane: bf16 as it is, or fp4x's (fp8 view, fp32 view, 1)."""
++    if kv8.index8(keys):
++        return keys.view(torch.float8_e4m3fn), keys.view(torch.float32), 1
++    return keys, keys, 0
++
++
+ @triton.jit
+ def _scores_blocks(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, scale, wscale, H: tl.constexpr,
+-                   HP: tl.constexpr, D: tl.constexpr, BTT: tl.constexpr, RB: tl.constexpr):
++                   HP: tl.constexpr, D: tl.constexpr, BTT: tl.constexpr, RB: tl.constexpr, KS=None,
++                   K8: tl.constexpr = 0):
+     """_scores for prompt rows, program (RB rows, one token block): the same per-row tile and masks."""
+     rb = tl.program_id(0)
+     tb = tl.program_id(1)
+@@ -326,7 +399,7 @@ def _scores_blocks(QI, W, w_stride, KEYS, OUT, o_stride, POS, R, NT, scale, wsca
+             if r < R:
+                 tl.store(OUT + r * o_stride + t, float("-inf"), mask=t < NT)
+         return
+-    k = tl.load(KEYS + t[:, None].to(tl.int64) * D + d[None, :], mask=(t < last)[:, None], other=0.0).to(tl.bfloat16)
++    k = key_tile(KEYS, KS, t, t < last, d, D, K8)
+     for i in tl.static_range(RB):
+         r = rb * RB + i
+         if r < R:
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index d798fce..34463f7 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -630,8 +630,8 @@ class GlmEngine:
+         from .kv8 import KINDS as KV_KINDS, kv_kind
+ 
+         kv = kv_kind()
+-        if kv == "fp4" and not cfg.full:
+-            raise ValueError("TF_GLM_KV=fp4 is full GLM-5.3's (its latent cache); GLM-5.3-Flash takes bf16 or fp8")
++        if kv in ("fp4", "fp4x") and not cfg.full:
++            raise ValueError(f"TF_GLM_KV={kv} is full GLM-5.3's (its latent cache); GLM-5.3-Flash takes bf16 or fp8")
+         if kv != "bf16" and not LATENT:
+             raise ValueError("TF_GLM_KV=fp8 holds the latent cache: it needs TF_GLM_LATENT=1")
+         self.kv = kv
+@@ -877,6 +877,8 @@ class GlmEngine:
+         if rank == 0 and kv != "bf16":
+             print(f"[tensorfold] TF_GLM_KV={kv}: the latent cache as "
+                   + ("e2m1 codes with an e4m3 scale per 16 values and a power-of-two row scale" if kv == "fp4" else
++                     "e2m1 codes with an e4m3 scale per 16 values and a power-of-two row scale; the rotary and index "
++                     "keys as e4m3 rows with a power-of-two scale each" if kv == "fp4x" else
+                      "e4m3 rows with a power-of-two scale each")
+                   + " (lossy; drafted replies still equal serial ones)", flush=True)
+         if rank == 0 and quant_code:
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index bafb7d7..87a239e 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -211,7 +211,9 @@ class Caches:
+     pools still filling (``decode.Snapshot.tail``). None: arena planes (token t at its extent's row).
+ 
+     ``kv``: the latent planes' and pooled keys' format (TF_GLM_KV, ``kv8``): bf16, or fp8 (a uint8 row a token /
+-    pool: e4m3 codes, an fp32 power-of-two scale, pad), with the latent cache only."""
++    pool: e4m3 codes, an fp32 power-of-two scale, pad), with the latent cache only; full GLM-5.3 also fp4 (the
++    latent rows) and fp4x (fp4's latent rows, the rotary keys as e4m3 codes [tokens, 64] whose scales ride in the
++    latent rows' pad, the per-token index keys as e4m3 codes and an fp32 scale [tokens, 128 + 4])."""
+ 
+     def __init__(self, w: Weights, rows: int, *, streams: int = 1, ring: int | None = None,
+                  kv: str = "bf16") -> None:
+@@ -224,6 +226,8 @@ class Caches:
+         self.latent = latent.ENABLED
+         if kv not in kv8.KINDS or (kv != "bf16" and not self.latent):
+             raise ValueError(f"TF_GLM_KV={kv}: bf16, or fp8 with the latent cache (TF_GLM_LATENT=1)")
++        if kv8.x8(kv) and not c.full:
++            raise ValueError("TF_GLM_KV=fp4x is full GLM-5.3's (its rotary and index key planes)")
+         self.kv = kv
+         planes: list[Plane] = []
+ 
+@@ -233,9 +237,10 @@ class Caches:
+         self.cp = cp
+         self.rank = int(w.rank) if cp > 1 else 0      # whose positions this rank's planes hold (``decode.local_rows``)
+ 
+-        def add(shape, div: int = 1, pad: int = 0, fmt: str = "bf16") -> int:
++        def add(shape, div: int = 1, pad: int = 0, fmt: str = "bf16", make=None) -> int:
+             n = rows // div + pad
+-            t = (kv8.zeros(n, shape[0], fmt, dev) if fmt != "bf16" else
++            t = (make(n, shape[0], kv, dev) if make is not None else
++                 kv8.zeros(n, shape[0], fmt, dev) if fmt != "bf16" else
+                  torch.zeros((n, *shape), dtype=torch.bfloat16, device=dev))
+             planes.append(Plane(t, div, pad))
+             return len(planes) - 1
+@@ -252,10 +257,11 @@ class Caches:
+             self.vc.append(v)
+         self.mtp = attention_planes() if w.mtp is not None else None
+         # full GLM-5.3: each DSA layer's (and the MTP layer's) rotary keys, bf16 [tokens, 64] beside the latents (an
+-        # FP8 latent cache keeps them bf16, as DeepSeek's FP8 MLA cache does)
++        # FP8 latent cache keeps them bf16, as DeepSeek's FP8 MLA cache does; fp4x: e4m3 codes, the scale in the
++        # latent row at the same row)
+         self.full = bool(c.full)
+-        self.kr = [add((c.rope,), cp, int(cp > 1)) for _ in range(dsa)] if self.full else []
+-        self.mtp_kr = add((c.rope,), cp, int(cp > 1)) if self.full and w.mtp is not None else None
++        self.kr = [add((c.rope,), cp, int(cp > 1), make=kv8.rope_zeros) for _ in range(dsa)] if self.full else []
++        self.mtp_kr = add((c.rope,), cp, int(cp > 1), make=kv8.rope_zeros) if self.full and w.mtp is not None else None
+         # DSA indexer caches (long contexts only): per layer (and the MTP layer, last) keys, gates, pool keys; with a
+         # ring, index[i] = (None, None, pool plane) and rings[i] = (keys, gates) [streams x ring, 128]
+         self.index = None
+@@ -267,7 +273,8 @@ class Caches:
+             # full GLM-5.3: per-token index keys (bf16 [tokens, 128]) of each full indexer layer, then the MTP
+             # layer's; index[i] = (None, None, keys) (no rings: every later row scores every key)
+             n_idx = sum(1 for k in c.index_kinds if k == "full") + (1 if w.mtp is not None else 0)
+-            self.index = [(None, None, add((c.index_dim,), cp, int(cp > 1))) for _ in range(n_idx)]
++            self.index = [(None, None, add((c.index_dim,), cp, int(cp > 1), make=kv8.index_zeros))
++                          for _ in range(n_idx)]
+         elif w.meta.get("long_context"):
+             n_idx = dsa + (1 if w.mtp is not None else 0)
+             if self.ring is None:
+@@ -856,7 +863,7 @@ def dsa_full_rows(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor,
+     rs = slice(lo, lo + R)
+     with prof.timed("dsa: latent write"):
+         latent.latent_write(b.lat[rs], lc, pos_dev)
+-        dsa_full.k_rope_write(b.dp[rs, l0:], kr, pos_dev, freq)
++        dsa_full.k_rope_write(b.dp[rs, l0:], kr, pos_dev, freq, latent=lc)
+     qp = dsa_full.q_rope(b.q[rs], b.qp[rs], pos_dev, freq, c.nope)
+     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
+     sparse_rows = indexed and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
+@@ -944,7 +951,7 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+     dsa_full_front(layer, w, b, 0, R)
+     with prof.timed("dsa: latent write"):
+         latent.latent_write(b.lat[:R], lc, pos_dev, cp=G, rank=rank)
+-        dsa_full.k_rope_write(b.dp[:R, l0:], kr, pos_dev, freq, cp=G, rank=rank)
++        dsa_full.k_rope_write(b.dp[:R, l0:], kr, pos_dev, freq, cp=G, rank=rank, latent=lc)
+     qp = dsa_full.q_rope(b.q[:R], b.qp[:R], pos_dev, freq, c.nope)
+     ix = a.index
+     if ix is not None and keys is not None:
+diff --git tensorfold/families/glm5_next/cuda/kv8.py tensorfold/families/glm5_next/cuda/kv8.py
+index ff3f74f..2596c1a 100644
+--- tensorfold/families/glm5_next/cuda/kv8.py
++++ tensorfold/families/glm5_next/cuda/kv8.py
+@@ -21,7 +21,17 @@ power-of-two scale (as FP8's: 2^(ceil(log2 amax) - SHIFT)), zeros. A block's sca
+ rounded to e4m3; its values round to the nearest e2m1 (0, 0.5, 1, 1.5, 2, 3, 4, 6, signed) of the value over the two
+ scales. A code times its block scale is exact in bf16, so the readers dequantize to bf16 and fold the row's power of
+ two into their fp32 products as with FP8. Lossier than FP8 (about 9 bits a value against 8 + 1 / 32): a quality
+-question for the owner, measured before it is used."""
++question for the owner, measured before it is used.
++
++TF_GLM_KV=fp4x (full GLM-5.3; Mia's AI Lab): fp4's latent rows, and the two planes beside them in e4m3 with a
++power-of-two scale a row (the FP8 rule above, ``scales``): the rotary key plane as a uint8 tensor [rows, 64] of codes
++alone, its row's fp32 scale in the FP4 latent row's pad (fp32 word ``rope_scale_word``: the word after the latent's
++own scale, inside the 16-byte padding, so a rotary row costs 64 bytes instead of 128); the indexer's per-token keys as
++a uint8 tensor [rows, 128 + 4]: codes, then the row's fp32 scale (132 bytes instead of 256). A latent row and its
++rotary row live at the same row of their planes (same layer, same token: written in the same window, saved, copied
++and restored together). Each row's bytes are a function of its bf16 row alone; readers dequantize to bf16 exactly
++(an e4m3 code times a power of two is a bf16 value) and then run the bf16 arithmetic, so a reader's result equals
++the bf16 kernel's on the dequantized rows bit for bit, and drafted == serial holds as with bf16."""
+ 
+ from __future__ import annotations
+ 
+@@ -31,7 +41,7 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-KINDS = ("bf16", "fp8", "fp4")
++KINDS = ("bf16", "fp8", "fp4", "fp4x")
+ PAD = 16             # bytes after an FP8 row's codes: its fp32 scale, then zeros
+ BLOCK4 = 16          # FP4 (TF_GLM_KV=fp4): values sharing an e4m3 block scale
+ SHIFT = 8            # a row's scale: 2^(ceil(log2 amax) - SHIFT), so its codes stay within +-256
+@@ -43,12 +53,18 @@ def kv_kind(env=None) -> str:
+ 
+     kind = (os.environ if env is None else env).get("TF_GLM_KV", "bf16").strip() or "bf16"
+     if kind not in KINDS:
+-        raise ValueError(f"TF_GLM_KV is bf16 or fp8, not {kind!r}")
++        raise ValueError(f"TF_GLM_KV is bf16, fp8, fp4 or fp4x, not {kind!r}")
+     return kind
+ 
+ 
++def latent_kind(kind: str) -> str:
++    """The latent rows' format of a TF_GLM_KV kind (fp4x keeps fp4's latent rows)."""
++    return "fp4" if kind == "fp4x" else kind
++
++
+ def row_bytes(width: int, kind: str) -> int:
+-    """Bytes a cache row of ``width`` values takes."""
++    """Bytes a latent cache row of ``width`` values takes (fp4x: fp4's)."""
++    kind = latent_kind(kind)
+     if kind not in KINDS:
+         raise ValueError(f"a cache is bf16, fp8 or fp4, not {kind!r}")
+     if kind == "fp4":                    # codes, block scales, the fp32 row scale, zeros to a multiple of 16 bytes
+@@ -58,6 +74,7 @@ def row_bytes(width: int, kind: str) -> int:
+ 
+ def zeros(rows: int, width: int, kind: str, device) -> torch.Tensor:
+     """A zeroed cache of ``rows`` rows of ``width`` values (zero rows dequantize to zeros in either format)."""
++    kind = latent_kind(kind)
+     if kind == "fp8":
+         if width % 4:
+             raise ValueError(f"an FP8 cache row needs a width divisible by 4, not {width}")
+@@ -254,3 +271,113 @@ def load_rows4(VALS, SCL, rows, ok, k, LW: tl.constexpr, RS: tl.constexpr):
+     tile = (_e2m1(code) * bsf).to(tl.bfloat16)
+     sc = tl.load(SCL + rows * (RS // 4) + (LW // 2 + LW // 16) // 4, mask=ok, other=1.0)
+     return tile, sc
++
++
++# -- FP4X (TF_GLM_KV=fp4x): the rotary key plane and the index keys as e4m3 rows ---------------------------------------
++X8 = "fp4x"
++
++
++def x8(kind: str) -> bool:
++    """Whether a TF_GLM_KV kind keeps the rotary and index key planes as e4m3 rows."""
++    return kind == X8
++
++
++def rope_scale_word(lw: int) -> int:
++    """The fp32 word of an FP4 latent row (``lw`` values) that holds its rotary row's scale: right after the latent's
++    own scale, inside the row's pad."""
++    w = (lw // 2 + lw // BLOCK4) // 4 + 1
++    if 4 * (w + 1) > row_bytes(lw, "fp4"):
++        raise ValueError(f"an FP4 latent row of {lw} values has no pad word for the rotary scale")
++    return w
++
++
++def index_row_bytes(width: int, kind: str) -> int:
++    """Bytes a full GLM-5.3 index key row of ``width`` values takes: bf16, or fp4x's codes and fp32 scale."""
++    return width + 4 if x8(kind) else 2 * width
++
++
++def rope_row_bytes(width: int, kind: str) -> int:
++    """Bytes a rotary key row of ``width`` values takes in its own plane: bf16, or fp4x's codes (the scale rides in
++    the latent row's pad)."""
++    return width if x8(kind) else 2 * width
++
++
++def rope_zeros(rows: int, width: int, kind: str, device) -> torch.Tensor:
++    if x8(kind):
++        return torch.zeros((rows, width), dtype=torch.uint8, device=device)
++    return torch.zeros((rows, width), dtype=torch.bfloat16, device=device)
++
++
++def index_zeros(rows: int, width: int, kind: str, device) -> torch.Tensor:
++    if x8(kind):
++        if width % 4:
++            raise ValueError(f"an FP8 index key row needs a width divisible by 4, not {width}")
++        return torch.zeros((rows, width + 4), dtype=torch.uint8, device=device)
++    return torch.zeros((rows, width), dtype=torch.bfloat16, device=device)
++
++
++def rope8(rope: torch.Tensor) -> bool:
++    """An fp4x rotary plane (uint8 codes; bf16 otherwise)."""
++    return rope.dtype == torch.uint8
++
++
++def index8(keys: torch.Tensor) -> bool:
++    """An fp4x index key plane (uint8 codes and scale; bf16 otherwise)."""
++    return keys.dtype == torch.uint8
++
++
++def index_width(keys: torch.Tensor) -> int:
++    return keys.shape[-1] - 4 if index8(keys) else keys.shape[-1]
++
++
++def quantize_codes8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """bf16 (or fp32) rows [n, width] -> (e4m3 codes uint8 [n, width], fp32 power-of-two scales [n]): the FP8 rule
++    (``quantize_rows``) on the bf16 row, as the write kernels store them."""
++    x = x.to(torch.bfloat16).float()
++    s = scales(x.abs().amax(dim=1))
++    inv = ((254 - (s.view(torch.int32) >> 23)) << 23).view(torch.float32)
++    return (x * inv[:, None]).to(torch.float8_e4m3fn).view(torch.uint8), s
++
++
++def quantize_index8(x: torch.Tensor) -> torch.Tensor:
++    """bf16 index key rows [n, width] -> fp4x index rows uint8 [n, width + 4] (codes, fp32 scale)."""
++    codes, s = quantize_codes8(x)
++    return torch.cat([codes, s[:, None].contiguous().view(torch.uint8)], dim=1)
++
++
++def dequantize_index8(keys: torch.Tensor) -> torch.Tensor:
++    """fp4x index rows as fp32 [n, width] (exact; bf16-representable)."""
++    w = index_width(keys)
++    codes = keys[..., :w].contiguous().view(torch.float8_e4m3fn).float()
++    return codes * keys[..., w:w + 4].contiguous().view(torch.float32)
++
++
++def rope_scales(latent: torch.Tensor) -> torch.Tensor:
++    """The rotary rows' fp32 scales [n] held in an FP4 latent cache's rows."""
++    word = rope_scale_word(width(latent))
++    return latent.view(torch.uint8)[..., 4 * word:4 * word + 4].contiguous().view(torch.float32)[..., 0]
++
++
++def dequantize_rope8(rope: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
++    """An fp4x rotary plane's rows as fp32 [n, width] (exact), their scales from the latent rows beside them."""
++    return rope.view(torch.float8_e4m3fn).float() * rope_scales(latent)[:, None]
++
++
++@triton.jit
++def store_codes8(VALS, row, k, x, RS: tl.constexpr):
++    """Row ``row`` (int64) of an e4m3 plane (VALS: an fp8 pointer, rows RS bytes apart) <- codes of x (fp32 of a bf16
++    row, [W], at columns ``k``) under the row's power-of-two scale; returns (scale, reciprocal) for the caller to
++    store where the format keeps it."""
++    s, inv = scale_of(tl.max(tl.abs(x), 0))
++    tl.store(VALS + row * RS + k, (x * inv).to(tl.float8e4nv))
++    return s, inv
++
++
++@triton.jit
++def load_codes8(VALS, SCL, rows, ok, k, RS: tl.constexpr, SW: tl.constexpr, SRS: tl.constexpr):
++    """e4m3 rows ``rows`` (int64 [N]; VALS an fp8 pointer, RS bytes apart) at columns ``k`` as an exact bf16 tile
++    [N, len(k)]: each code times its row's power-of-two scale, the scale at fp32 word SW of row ``rows`` of SCL (rows
++    SRS words apart: the index plane itself, or the FP4 latent rows holding the rotary scales). Rows not ok: zeros."""
++    c = tl.load(VALS + rows[:, None] * RS + k[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
++    sc = tl.load(SCL + rows * SRS + SW, mask=ok, other=1.0)
++    return (c * sc[:, None]).to(tl.bfloat16)
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+index de91a11..1729b69 100644
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -472,13 +472,25 @@ def _tile_v(q, kv, vv, ks, m, l, o, valid, SCALE: tl.constexpr, FP8: tl.constexp
+     return next_m, l, o
+ 
+ 
++@triton.jit
++def _rope_tile(KR, LS, rows, ok, j, ROPE: tl.constexpr, RS: tl.constexpr, RSW: tl.constexpr, R8: tl.constexpr):
++    """Rotary key rows ``rows`` (int64 [N]; not ok: zeros) as a bf16 tile [N, ROPE]: bf16 rows as they are, or (R8,
++    TF_GLM_KV=fp4x) e4m3 codes times the row's power-of-two scale from word RSW of its FP4 latent row (LS: the latent
++    cache's fp32 view, rows RS bytes apart): exactly the bf16 values the writer quantized."""
++    if R8:
++        return kv8.load_codes8(KR, LS, rows, ok, j, ROPE, RSW, RS // 4)
++    return tl.load(KR + rows[:, None] * ROPE + j[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++
++
+ @triton.jit
+ def _dense_chunks(QA, LC, LS, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr, CH: tl.constexpr,
+                   SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr,
+-                  QP=None, KR=None, ROPE: tl.constexpr = 0, FP4: tl.constexpr = 0):
++                  QP=None, KR=None, ROPE: tl.constexpr = 0, FP4: tl.constexpr = 0, R8: tl.constexpr = 0,
++                  RSW: tl.constexpr = 0):
+     """Program (row, head block, chunk): causal attention of HB heads of row r over keys [c CH, (c + 1) CH); cache
+     rows RS elements apart (FP8: codes, their scales through LS). ROPE: rotary queries QP [R, H, ROPE] and the rotary
+-    key cache KR [slots, ROPE] (bf16) join the scores (``_tile``)."""
++    key cache KR [slots, ROPE] (bf16) join the scores (``_tile``). R8 (TF_GLM_KV=fp4x): KR e4m3 codes, each row's
++    scale at fp32 word RSW of its FP4 latent row (``_rope_tile``: the exact bf16 rows)."""
+     r = tl.program_id(0)
+     hb = tl.program_id(1)
+     c = tl.program_id(2)
+@@ -508,8 +520,7 @@ def _dense_chunks(QA, LC, LS, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.conste
+                 ks = row_scales(LS, ki.to(tl.int64), ok, LW, RS) if FP8 else None
+             kr = None
+             if ROPE:
+-                kr = tl.load(KR + ki[:, None].to(tl.int64) * ROPE + j[None, :], mask=ok[:, None],
+-                             other=0.0).to(tl.bfloat16)
++                kr = _rope_tile(KR, LS, ki.to(tl.int64), ok, j, ROPE, RS, RSW, R8)
+             m, l, o = _tile(q, kv, ks, m, l, o, ok, SCALE, FP8, qp, kr, ROPE)
+     base = (c * R + r) * H + hh
+     tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
+@@ -520,8 +531,10 @@ def _dense_chunks(QA, LC, LS, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.conste
+ @triton.jit
+ def _sparse_chunks(QA, LC, LS, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr,
+                    CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, RS: tl.constexpr,
+-                   FP8: tl.constexpr, QP=None, KR=None, ROPE: tl.constexpr = 0, FP4: tl.constexpr = 0):
+-    """Program (row, head block, chunk): HB heads of row r over its selected tokens [c CH, (c + 1) CH) in list order."""
++                   FP8: tl.constexpr, QP=None, KR=None, ROPE: tl.constexpr = 0, FP4: tl.constexpr = 0,
++                   R8: tl.constexpr = 0, RSW: tl.constexpr = 0):
++    """Program (row, head block, chunk): HB heads of row r over its selected tokens [c CH, (c + 1) CH) in list order
++    (rotary keys as in ``_dense_chunks``)."""
+     r = tl.program_id(0)
+     hb = tl.program_id(1)
+     c = tl.program_id(2)
+@@ -549,7 +562,7 @@ def _sparse_chunks(QA, LC, LS, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.c
+                 ks = row_scales(LS, tok, ok, LW, RS) if FP8 else None
+             kr = None
+             if ROPE:
+-                kr = tl.load(KR + tok[:, None] * ROPE + j[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++                kr = _rope_tile(KR, LS, tok, ok, j, ROPE, RS, RSW, R8)
+             m, l, o = _tile(q, kv, ks, m, l, o, ok, SCALE, FP8, qp, kr, ROPE)
+     base = (c * R + r) * H + hh
+     tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
+@@ -720,18 +733,23 @@ class LatentScratch:
+         self.dummy = torch.zeros((1,), dtype=torch.int32, device=device)
+ 
+ 
+-def _rope_args(qp: torch.Tensor | None, rope: torch.Tensor | None, R: int, H: int):
+-    """(QP, KR, ROPE) kernel arguments: full GLM-5.3's rotary queries [R, H, rope] and rotary key cache [slots, rope]
+-    (bf16, contiguous), or none (GLM-5.3-Flash: ROPE 0)."""
++def _rope_args(qp: torch.Tensor | None, rope: torch.Tensor | None, R: int, H: int, cache: torch.Tensor | None = None):
++    """(QP, KR, ROPE, R8, RSW) kernel arguments: full GLM-5.3's rotary queries [R, H, rope] and rotary key cache
++    [slots, rope] (bf16, contiguous; or TF_GLM_KV=fp4x's e4m3 codes, uint8, whose scales sit in ``cache``, the FP4
++    latent cache: R8 1, RSW their fp32 word in a latent row), or none (GLM-5.3-Flash: ROPE 0)."""
+     if qp is None and rope is None:
+-        return None, None, 0
++        return None, None, 0, 0, 0
+     if qp is None or rope is None:
+         raise ValueError("latent attention: rotary queries and the rotary key cache go together")
+     n = rope.shape[1]
+     if (qp.shape[0] < R or qp.shape[1] != H or qp.shape[2] != n or not qp.is_contiguous() or not rope.is_contiguous()
+-            or rope.dtype != torch.bfloat16):
++            or rope.dtype not in (torch.bfloat16, torch.uint8)):
+         raise ValueError(f"latent attention: rotary queries {tuple(qp.shape)} for {R} x {H}, cache {tuple(rope.shape)}")
+-    return qp, rope, n
++    if not kv8.rope8(rope):
++        return qp, rope, n, 0, 0
++    if cache is None or not kv8.fp4(cache) or cache.shape[0] != rope.shape[0]:
++        raise ValueError("latent attention: an FP8 rotary plane (TF_GLM_KV=fp4x) goes with its FP4 latent cache")
++    return qp, rope.view(torch.float8_e4m3fn), n, 1, kv8.rope_scale_word(kv8.width(cache))
+ 
+ 
+ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: LatentScratch, *, scale: float,
+@@ -750,10 +768,10 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: Laten
+     if hb not in (HB, HB_WIDE):
+         raise ValueError(f"latent attention: {hb} heads a tile, not {HB} or {HB_WIDE}")
+     vals, scl, rs, fp8 = _cache_parts(cache, LW)
+-    QP, KR, ROPE = _rope_args(qp, rope, R, H)
++    QP, KR, ROPE, R8, RSW = _rope_args(qp, rope, R, H, cache)
+     _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, pos, s.po[:n * LW], s.pm[:n], s.pl[:n], R, H=H, LW=LW,
+                                                 CH=CHUNK, SCALE=scale, HBT=hb, KTT=key_tile(cache), RS=rs, FP8=fp8, QP=QP, KR=KR,
+-                                                ROPE=ROPE, FP4=int(kv8.fp4(cache)), num_warps=8,
++                                                ROPE=ROPE, FP4=int(kv8.fp4(cache)), R8=R8, RSW=RSW, num_warps=8,
+                                                 num_stages=chunk_stages(cache))
+     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
+     return out
+@@ -772,10 +790,10 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
+     pl = torch.empty((n,), dtype=torch.float32, device=qa.device)
+     hb = head_block(R)
+     vals, scl, rs, fp8 = _cache_parts(cache, LW)
+-    QP, KR, ROPE = _rope_args(qp, rope, R, H)
++    QP, KR, ROPE, R8, RSW = _rope_args(qp, rope, R, H, cache)
+     _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, vals, scl, tokens, counts, po, pm, pl, R, W=W, H=H, LW=LW,
+                                                  CH=CHUNK, SCALE=scale, HBT=hb, KTT=key_tile(cache), RS=rs, FP8=fp8, QP=QP, KR=KR,
+-                                                 ROPE=ROPE, FP4=int(kv8.fp4(cache)), num_warps=8,
++                                                 ROPE=ROPE, FP4=int(kv8.fp4(cache)), R8=R8, RSW=RSW, num_warps=8,
+                                                 num_stages=chunk_stages(cache))
+     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
+ 
+@@ -805,7 +823,9 @@ def sparse_onepass(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor,
+     hbt, kt, split = tile or ONEPASS_TILE
+     warps, stages, prefetch = launch or ONEPASS_LAUNCH
+     hbt = max(16, min(hbt, triton.next_power_of_2(H)))            # tensor-core tiles need 16 rows
+-    QP, KR, ROPE = _rope_args(qp, rope, R, H)
++    QP, KR, ROPE, R8, _ = _rope_args(qp, rope, R, H, cache)
++    if R8:
++        raise ValueError("sparse_onepass: bf16 rotary keys only (TF_GLM_KV=fp4x takes sparse_attention)")
+     _sparse_onepass[(R, triton.cdiv(H, hbt), split)](qa, vals, scl, tokens, counts, out, W=tokens.shape[1], H=H,
+                                                      LW=LW, SCALE=scale, HBT=hbt, KTT=kt, SPLIT=split, STAGES=stages,
+                                                      PREFETCH=bool(prefetch), RS=rs, FP8=fp8, QP=QP, KR=KR, ROPE=ROPE,
+diff --git tensorfold/families/glm5_next/cuda/msa.cpp tensorfold/families/glm5_next/cuda/msa.cpp
+index aac65e2..f9007fc 100644
+--- tensorfold/families/glm5_next/cuda/msa.cpp
++++ tensorfold/families/glm5_next/cuda/msa.cpp
+@@ -8,8 +8,9 @@ void msa_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, co
+ void prompt(const at::Tensor& qa, const at::Tensor& qp, const at::Tensor& cache, const at::Tensor& rope,
+             const at::Tensor& tokens, const at::Tensor& counts, at::Tensor out, double scale) {
+     auto ok = [](const at::Tensor& x, at::ScalarType t) { return x.is_cuda() && x.scalar_type() == t && x.is_contiguous(); };
+-    TORCH_CHECK(ok(qa, at::kBFloat16) && ok(qp, at::kBFloat16) && ok(rope, at::kBFloat16) && ok(out, at::kBFloat16),
+-                "msa: contiguous bf16 queries, rotary keys and output");
++    TORCH_CHECK(ok(qa, at::kBFloat16) && ok(qp, at::kBFloat16) && (ok(rope, at::kBFloat16) || ok(rope, at::kByte)) &&
++                    ok(out, at::kBFloat16),
++                "msa: contiguous bf16 queries, rotary keys (bf16, or fp4x's e4m3 codes) and output");
+     TORCH_CHECK(ok(cache, at::kByte), "msa: a contiguous FP8 (uint8) latent cache");
+     TORCH_CHECK(ok(tokens, at::kInt) && ok(counts, at::kInt), "msa: contiguous int32 token lists and counts");
+     TORCH_CHECK(qp.size(0) >= qa.size(0) && qp.size(1) == qa.size(1) && out.sizes() == qa.sizes() &&
+@@ -27,7 +28,8 @@ void prompt_lse(const at::Tensor& qa, const at::Tensor& qp, const at::Tensor& ca
+                     lse.size(0) == qa.size(0) && lse.size(1) == qa.size(1),
+                 "msa: a contiguous fp32 [R, H] lse");
+     auto ok = [](const at::Tensor& x, at::ScalarType t) { return x.is_cuda() && x.scalar_type() == t && x.is_contiguous(); };
+-    TORCH_CHECK(ok(qa, at::kBFloat16) && ok(qp, at::kBFloat16) && ok(rope, at::kBFloat16) && ok(out, at::kBFloat16) &&
++    TORCH_CHECK(ok(qa, at::kBFloat16) && ok(qp, at::kBFloat16) && (ok(rope, at::kBFloat16) || ok(rope, at::kByte)) &&
++                    ok(out, at::kBFloat16) &&
+                     ok(cache, at::kByte) && ok(tokens, at::kInt) && ok(counts, at::kInt) && out.sizes() == qa.sizes(),
+                 "msa: shapes and types as prompt");
+     c10::cuda::CUDAGuard guard(qa.device());
+diff --git tensorfold/families/glm5_next/cuda/msa.cu tensorfold/families/glm5_next/cuda/msa.cu
+index 1ad8331..3b4cc7e 100644
+--- tensorfold/families/glm5_next/cuda/msa.cu
++++ tensorfold/families/glm5_next/cuda/msa.cu
+@@ -11,6 +11,11 @@
+ //   O [heads x 512] += P^T (P times each key's scale, bf16) . V (V the latent rows; warp: 64 output columns).
+ // The output O / l in bf16, as the Triton kernels'. A row's bits depend on its query, its token list and the cache
+ // only, never on the other rows or the launch.
++//
++// TF_GLM_KV=fp4x (R8, with an FP4 latent cache only): the rotary keys arrive as 64 e4m3 codes a key (64 bytes, kv8),
++// their row's fp32 power-of-two scale in the FP4 latent row's pad (word ROPE_SW, staged with the latent row); the
++// dequantize step writes code times scale as bf16 (exact) into the key tile's rotary columns, the same values the
++// Triton kernels' _rope_tile gives; nothing else changes.
+ 
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+@@ -29,6 +34,8 @@ constexpr int KT = 32;                   // keys a tile
+ constexpr int QH = 24;                   // query rows held (heads; 2 m tiles of 16, rows past QH read a zero row)
+ constexpr int CROW = LW + 16;            // an FP8 cache row: codes, fp32 scale, 12 zero bytes (kv8)
+ constexpr int CROW4 = LW / 2 + LW / 16 + 16;   // an FP4 row: e2m1 codes, e4m3 block scales, fp32 scale, pad (kv8)
++constexpr int ROPE_SW = (LW / 2 + LW / 16) / 4 + 1;   // fp4x: the fp32 word of an FP4 row holding its rotary scale
++static_assert(4 * ROPE_SW + 4 <= CROW4, "the rotary scale lies within the FP4 row");
+ constexpr int NWARP = 8;
+ constexpr int NTHREADS = NWARP * 32;
+ constexpr int PS = KT + 8;               // P^T row stride (halves)
+@@ -82,12 +89,21 @@ __device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint16_t c) {
+     return *reinterpret_cast<const uint32_t*>(&b);
+ }
+ 
++// two e4m3 codes (low byte first) times a power-of-two scale as a bf16 pair, exact (fp4x's rotary keys)
++__device__ __forceinline__ uint32_t e4m3x2_scaled_bf16x2(uint16_t c, float s) {
++    __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)c, __NV_E4M3);
++    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
++    const __nv_bfloat162 b = __floats2bfloat162_rn(f.x * s, f.y * s);
++    return *reinterpret_cast<const uint32_t*>(&b);
++}
++
+ // The cp.async of a tile's cache rows (scale included) and rotary keys: thread (key tid / 8, part tid % 8) moves its
+-// key's latent pieces part, part + 8, .. (R / 16 of 16 bytes a row: 33 FP8, 19 FP4) and rotary piece part; ``tok``
+-// its key's token id (-1 past the list: zero-filled from row 0's address)
+-template <int R>
++// key's latent pieces part, part + 8, .. (R / 16 of 16 bytes a row: 33 FP8, 19 FP4) and rotary piece part (R8:
++// pieces 0 .. 3 of the 64-byte e4m3 row, parts 4 .. 7 none); ``tok`` its key's token id (-1 past the list:
++// zero-filled from row 0's address). The staged rotary row keeps its bf16 slot (RD * 2 bytes) either way.
++template <int R, bool R8>
+ __device__ __forceinline__ void stage_tile(unsigned char* smem, const uint8_t* __restrict__ cache,
+-                                           const __nv_bfloat16* __restrict__ rope, int tok) {
++                                           const unsigned char* __restrict__ rope, int tok) {
+     const int key = threadIdx.x >> 3, part = threadIdx.x & 7;
+     const bool ok = tok >= 0;
+     const long long tk = ok ? tok : 0;
+@@ -95,8 +111,11 @@ __device__ __forceinline__ void stage_tile(unsigned char* smem, const uint8_t* _
+     const uint8_t* src = cache + tk * R;
+ #pragma unroll
+     for (int p = part; p < R / 16; p += 8) cp_async16(C + p * 16, src + p * 16, ok);
+-    cp_async16(smem + SM_R + (size_t)key * RD * 2 + part * 16,
+-               reinterpret_cast<const unsigned char*>(rope) + tk * RD * 2 + part * 16, ok);
++    if constexpr (R8) {
++        if (part < RD / 16) cp_async16(smem + SM_R + (size_t)key * RD * 2 + part * 16, rope + tk * RD + part * 16, ok);
++    } else {
++        cp_async16(smem + SM_R + (size_t)key * RD * 2 + part * 16, rope + tk * RD * 2 + part * 16, ok);
++    }
+ }
+ 
+ // this thread's key's token id of the tile at t0 (-1 past n)
+@@ -107,11 +126,12 @@ __device__ __forceinline__ int tile_token(const int* __restrict__ toks, int t0,
+ 
+ __constant__ float E2M1[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+ 
+-template <bool FP4>
++template <bool FP4, bool R8>
+ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+     const __nv_bfloat16* __restrict__ qa, const __nv_bfloat16* __restrict__ qp, const uint8_t* __restrict__ cache,
+-    const __nv_bfloat16* __restrict__ rope, const int* __restrict__ tokens, const int* __restrict__ counts,
++    const unsigned char* __restrict__ rope, const int* __restrict__ tokens, const int* __restrict__ counts,
+     __nv_bfloat16* __restrict__ out, float* __restrict__ lse, int H, int W, float scale) {
++    static_assert(FP4 || !R8, "fp4x's rotary scales live in FP4 latent rows");
+     extern __shared__ __align__(16) unsigned char smem[];
+     const int r = blockIdx.x;
+     const int n = counts[r];
+@@ -136,7 +156,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+     const int* toks = tokens + (size_t)r * W;
+ 
+     constexpr int R = FP4 ? CROW4 : CROW;                  // a cache row's bytes in global memory
+-    stage_tile<R>(smem, cache, rope, tile_token(toks, 0, n));
++    stage_tile<R, R8>(smem, cache, rope, tile_token(toks, 0, n));
+     cp_async_commit();
+     int next_tok = tile_token(toks, KT, n);              // a tile ahead of the gather it feeds
+     // queries (rows past H zero) and the zero row
+@@ -221,13 +241,25 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+                 *reinterpret_cast<uint4*>(dst + q4 * 16 + 8) = make_uint4(b[4], b[5], b[6], b[7]);
+             }
+             }
+-            *reinterpret_cast<uint4*>(K + (size_t)key * KS + LW + sl * 8) =
+-                *reinterpret_cast<const uint4*>(smem + SM_R + (size_t)key * RD * 2 + sl * 16);
++            if constexpr (R8) {
++                // rotary values 8 sl .. 8 sl + 7: e4m3 codes times the row's power-of-two scale (word ROPE_SW of the
++                // staged FP4 row), bf16, exact
++                const float rs = *reinterpret_cast<const float*>(smem + SM_C + (size_t)key * CROW + 4 * ROPE_SW);
++                const uint2 c = *reinterpret_cast<const uint2*>(smem + SM_R + (size_t)key * RD * 2 + sl * 8);
++                *reinterpret_cast<uint4*>(K + (size_t)key * KS + LW + sl * 8) =
++                    make_uint4(e4m3x2_scaled_bf16x2((uint16_t)(c.x & 0xffffu), rs),
++                               e4m3x2_scaled_bf16x2((uint16_t)(c.x >> 16), rs),
++                               e4m3x2_scaled_bf16x2((uint16_t)(c.y & 0xffffu), rs),
++                               e4m3x2_scaled_bf16x2((uint16_t)(c.y >> 16), rs));
++            } else {
++                *reinterpret_cast<uint4*>(K + (size_t)key * KS + LW + sl * 8) =
++                    *reinterpret_cast<const uint4*>(smem + SM_R + (size_t)key * RD * 2 + sl * 16);
++            }
+             if (sl == 0)
+                 ksh[key] = *reinterpret_cast<const float*>(smem + SM_C + (size_t)key * CROW + (FP4 ? LW / 2 + LW / 16 : LW));
+         }
+         __syncthreads();                         // the key tile is ready; the staging area is free
+-        if (t0 + KT < n) stage_tile<R>(smem, cache, rope, next_tok);
++        if (t0 + KT < n) stage_tile<R, R8>(smem, cache, rope, next_tok);
+         cp_async_commit();
+         next_tok = tile_token(toks, t0 + 2 * KT, n);
+ 
+@@ -411,18 +443,25 @@ void msa_prompt_cuda(const at::Tensor& qa, const at::Tensor& qp, const at::Tenso
+     const int R = (int)qa.size(0), H = (int)qa.size(1);
+     TORCH_CHECK(H <= QH, "msa: at most ", QH, " heads a rank");
+     const bool fp4 = cache.size(1) == CROW4;
++    const bool r8 = rope.scalar_type() == at::kByte;       // fp4x: e4m3 rotary codes, scales in the FP4 rows
+     TORCH_CHECK(qa.size(2) == LW && qp.size(2) == RD && rope.size(1) == RD && (cache.size(1) == CROW || fp4),
+                 "msa: a 512-wide FP8 latent cache with 64 rotary values");
++    TORCH_CHECK(!r8 || fp4, "msa: e4m3 rotary keys (TF_GLM_KV=fp4x) go with an FP4 latent cache");
+     static bool once = [] {
+-        C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM));
+-        C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM));
++        C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                            (int)SMEM));
++        C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                            (int)SMEM));
++        C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                            (int)SMEM));
+         return true;
+     }();
+     (void)once;
+     if (R == 0) return;
+-    (fp4 ? msa_kernel<true> : msa_kernel<false>)<<<R, NTHREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(
++    (r8 ? msa_kernel<true, true> : fp4 ? msa_kernel<true, false> : msa_kernel<false, false>)
++        <<<R, NTHREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(
+         reinterpret_cast<const __nv_bfloat16*>(qa.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(qp.data_ptr()),
+-        cache.data_ptr<uint8_t>(), reinterpret_cast<const __nv_bfloat16*>(rope.data_ptr()), tokens.data_ptr<int>(),
++        cache.data_ptr<uint8_t>(), reinterpret_cast<const unsigned char*>(rope.data_ptr()), tokens.data_ptr<int>(),
+         counts.data_ptr<int>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), lse, H, (int)tokens.size(1),
+         (float)scale);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+diff --git tensorfold/families/glm5_next/cuda/msa.py tensorfold/families/glm5_next/cuda/msa.py
+index 5713c69..f000ae4 100644
+--- tensorfold/families/glm5_next/cuda/msa.py
++++ tensorfold/families/glm5_next/cuda/msa.py
+@@ -17,13 +17,16 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_msa_v5", sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
++    return load(name="tensorfold_glm_msa_v6", sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
+                 extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
+ 
+ 
+ def supported(qa: torch.Tensor, cache: torch.Tensor, rope: torch.Tensor | None) -> bool:
+-    return (rope is not None and ((cache.dtype == torch.uint8 and cache.shape[-1] == 528) or
+-                                  (cache.dtype == torch.int8 and cache.shape[-1] == 304))
++    """FP8 or FP4 latent caches with bf16 rotary keys, or (TF_GLM_KV=fp4x) an FP4 one with e4m3 rotary codes whose
++    scales ride in its rows."""
++    fp4 = cache.dtype == torch.int8 and cache.shape[-1] == 304
++    return (rope is not None and ((cache.dtype == torch.uint8 and cache.shape[-1] == 528) or fp4)
++            and (rope.dtype == torch.bfloat16 or (rope.dtype == torch.uint8 and fp4))
+             and qa.shape[-1] == 512 and qa.shape[1] <= HEADS and rope.shape[-1] == 64)
+ 
+ 
