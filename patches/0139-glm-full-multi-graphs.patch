@@ -1,0 +1,588 @@
+diff --git tensorfold/families/glm5_next/cuda/dspark_multi.py tensorfold/families/glm5_next/cuda/dspark_multi.py
+index 269a653..dc3ec4f 100644
+--- tensorfold/families/glm5_next/cuda/dspark_multi.py
++++ tensorfold/families/glm5_next/cuda/dspark_multi.py
+@@ -8,9 +8,10 @@ candidate buffers. So a stream's drafts are exactly those its own solo drafter w
+ same weights and the same context rows), and a context duck-types the solo drafter wherever one stream's context is
+ handled on its own (``decode.prefill_chunk``'s taps, ``multi``'s kept prompts: ``ring``, ``window``, ``kc``, ``vc``).
+ 
+-Milestone 2 (eager): proposals run one stream after another (a block pass each, its candidates gathered over the
+-ranks as alone), context updates one stream after another; no CUDA graphs for the contexts yet (the solo drafter's
+-graphs bind its own buffers, so a context starts without them). Unlike ``dflash2_multi.MultiDrafter`` (DFlash2's
++Proposals run one stream after another (a block pass each, its candidates gathered over the ranks as alone), context
++updates one stream after another. A context starts without graphs (the solo drafter's bind its own buffers);
++``capture`` (milestone 4) takes each context's block pass and context updates as CUDA graphs of its own buffers in
++one shared pool. Unlike ``dflash2_multi.MultiDrafter`` (DFlash2's
+ block is the anchor plus block - 1 drafts), a DSpark pass gives ``block`` drafts (8): a stream may draft up to 8.
+ 
+ API (the ``dflash2_multi.MultiDrafter`` calls ``multi.MultiDecoder`` makes; both ranks call it identically):
+@@ -84,11 +85,39 @@ class DSparkMulti:
+         for c in self.contexts:
+             c.reset()
+ 
+-    def capture(self) -> None:
+-        """No CUDA graphs for the stream contexts yet (milestone 2 runs them eagerly)."""
++    @torch.no_grad()
++    def capture(self, pool=None, capturer=None) -> int:
++        """CUDA graphs of every stream context's block pass and context updates of 1 .. tap_rows rows (the solo
++        drafter's ``capture``, a context's own buffers), all in one ``pool`` (default a new one; the engine passes the
++        shared pool: no two run at once), both ranks together (the passes gather). Before any stream is admitted:
++        each context is reset after its captures. Returns the graphs' count."""
++
++        from .full_seg import capture_graph
++
++        capturer = capture_graph if capturer is None else capturer
++        if pool is None:
++            pool = torch.cuda.graph_pool_handle()
++        self.pool = pool
++        n = 0
++        for c in self.contexts:
++            c.pool = pool
++            c.reset()
++            c.tap_in.zero_()
++            c.ids[0] = 0
++            for rows in range(1, c.tap_rows + 1):
++                c.tap_graphs[rows] = capturer(lambda c=c, rows=rows: c._taps_compute(rows), pool)
++                c.reset()
++            c.block_graph = capturer(c._block_compute, pool)
++            c.reset()
++            n += len(c.tap_graphs) + 1
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++        return n
+ 
+     def drop_graphs(self) -> None:
+-        pass
++        for c in self.contexts:
++            c.block_graph = None
++            c.tap_graphs = {}
+ 
+     def _own(self, ctx) -> None:
+         if getattr(ctx, "owner", None) is not self:
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 8a8a455..45761da 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -358,11 +358,20 @@ PARALLEL_MOST = 4                     # --parallel: concurrent requests at most
+ def multi_drafts(multi) -> str:
+     """--parallel's startup line: how the streams draft."""
+ 
++    if multi.full:
++        n = getattr(multi, "graph_counts", {})
++        v = type(multi.verify).__name__
++        how = {"FullSegVerify": "one launch a piece for every stream's rows", "FullBatchedVerify": "a call a stream",
++               "SerialVerify": "a forward a stream"}.get(v, v)
++        verify = (f"batched verify windows of at most {multi.window_rows} rows ({how}; "
++                  + (f"{n['verify']} CUDA graphs by rows and token bucket, TF_GLM_MULTI_GRAPHS" if n.get("verify")
++                     else "eager") + ")")
++        if multi.drafts is None:
++            return f"no drafts, {verify}"
++        drafts = (f"{n['drafts']} CUDA graphs" if n.get("drafts") else "eager")
++        return f"DSpark drafts (a context a stream, {drafts}), {verify}"
+     if multi.drafts is None:
+         return "no drafts"
+-    if multi.full:
+-        return (f"DSpark drafts (a context a stream, eager), each round's windows at most {multi.window_rows} rows "
+-                "(full GLM-5.3: eager batched verify, no CUDA graphs yet but a lone stream's)")
+     return "DFlash2 drafts"
+ MULTI_WINDOW = 32                     # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW)
+ 
+@@ -466,6 +475,38 @@ def full_multi_bytes(t: dict, parallel: int, slots: int, *, world: int, share, k
+             + parallel * 16)
+ 
+ 
++GRAPH_POOL_SLACK = 64 << 20          # --parallel, full GLM-5.3: what the multi-stream graphs may add to the shared pool
++
++
++def full_seg_multi_bytes(t: dict, parallel: int, slots: int, *, graphs: bool, verify: str = "seg",
++                         mode: str = "all", draft_layers: int = 0, draft_graphs: bool = True,
++                         tap_rows: int = 16) -> int:
++    """--parallel N on full GLM-5.3 with the segmented verify (TF_GLM_MULTI_VERIFY=seg, the default): what
++    ``full_seg.FullSegVerify`` holds beyond ``FullBatchedVerify`` (its row tables and the selection's fp32 scores over
++    the pool of N windows, ``full_seg.seg_bytes``) and, when the engine captures graphs, the multi-stream CUDA graphs'
++    executables: a verify graph a (rows, token bucket) (``full_seg.graph_count``: 16 x (1 + the buckets a stream of
++    ``slots`` tokens reaches); TF_GLM_MULTI_GRAPHS=top: 16 x 2) x its kernel nodes (``full_seg.verify_graph_bytes``),
++    the DSpark contexts' block passes and updates (``full_seg.draft_graph_bytes``; ``draft_layers`` 0: no DSpark),
++    and GRAPH_POOL_SLACK of temporaries in the shared pool. Counted as if the engine kept index caches (the most)."""
++
++    from .full_seg import draft_graph_bytes, graph_count, seg_bytes, verify_graph_bytes
++    from .verify import FULL_MAX_ROWS
++
++    if parallel <= 1:
++        return 0
++    k = int(t.get("index_topk", 2048))
++    total = seg_bytes(FULL_MAX_ROWS, parallel * slots, k, indexed=True) if verify == "seg" else 0
++    if not graphs:
++        return total
++    layers = int(t["num_hidden_layers"])
++    if verify == "seg" and mode != "0":
++        n = graph_count(FULL_MAX_ROWS, parallel * slots, slots + FULL_MAX_ROWS, indexed=True, mode=mode)
++        total += verify_graph_bytes(layers, n)
++    if draft_layers and draft_graphs:
++        total += draft_graph_bytes(draft_layers, parallel, tap_rows)
++    return total + GRAPH_POOL_SLACK
++
++
+ def dspark_multi_bytes(draft_dir, parallel: int, rank: int, world: int, *, capacity: int, ring: bool) -> int:
+     """--parallel N with a DSpark speculator: its N stream contexts (``dspark_multi.DSparkMulti``) beside the solo
+     drafter's, each a context ring (~35 MiB a stream at three ranks) and its tap and candidate buffers, all sharing
+@@ -781,10 +822,23 @@ class GlmEngine:
+                                       minimum_slots=DENSE_CAPACITY, cp=self.cp, cp_raw_q=cp_raw_q)
+                 if parallel == 1:
+                     return g
+-                # --parallel: the window is each stream's; the other streams' caches and the batched verify buffers
++                # --parallel: the window is each stream's; the other streams' caches and the batched verify buffers,
++                # the segmented verify's selection scratch and the multi-stream CUDA graphs
++                from .full_seg import graph_mode
++                from .multi import verify_kind
++
++                draft_layers = 0
++                if is_dspark(drafter):
++                    from .dspark import DSparkConfig
++
++                    draft_layers = DSparkConfig.read(Path(drafter)).layers
++                seg = dict(graphs=bool(graphs), verify=verify_kind(full=True), mode=graph_mode(),
++                           draft_layers=draft_layers, tap_rows=MAX_ROWS,
++                           draft_graphs=os.environ.get("TF_GLM_MULTI_DRAFT_GRAPHS", "1") != "0")
+                 return Geometry(lambda slots: g.bytes_at(slots) + full_multi_bytes(
+                     text, parallel, slots, world=world, share=share, kv=kv, mtp=self.mtp_on,
+-                    prompt_split_k=dense_kind() not in ("q4",)), g.reserve, g.minimum_slots)
++                    prompt_split_k=dense_kind() not in ("q4",)) + full_seg_multi_bytes(text, parallel, slots, **seg),
++                    g.reserve, g.minimum_slots)
+             g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT,
+                              prefill_rows=prompt_buffer_rows,
+                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
+@@ -840,14 +894,23 @@ class GlmEngine:
+ 
+         verify_code = 0
+         if parallel > 1:                      # serial and batched verify windows make different collectives
+-            from .multi import verify_kind
++            from .multi import VERIFY_KINDS, verify_kind
+ 
+-            verify_code = 1 + ("batched", "serial").index(verify_kind())
++            verify_code = 1 + VERIFY_KINDS.index(verify_kind(full=cfg.full))
+             from .multi_tune import MultiSettings
+ 
+             from .sliced_fill import budget_ms
+ 
+-            verify_code = [verify_code] + MultiSettings.from_env().code() + _f64_ints(budget_ms())
++            # the multi-stream graphs gather while they are captured: every rank takes the same ones or none
++            if cfg.full:
++                from .full_seg import graph_mode
++
++                graphs_code = ("all", "top", "0").index(graph_mode())
++            else:
++                graphs_code = int(os.environ.get("TF_GLM_MULTI_GRAPHS", "1") != "0")
++            draft_graphs_code = int(os.environ.get("TF_GLM_MULTI_DRAFT_GRAPHS", "1") != "0")
++            verify_code = ([verify_code] + MultiSettings.from_env().code() + _f64_ints(budget_ms())
++                           + [graphs_code, draft_graphs_code])
+         else:
+             verify_code = [verify_code]
+         # every rank must run the same calls: refuse to start when they were given different settings
+@@ -872,6 +935,7 @@ class GlmEngine:
+                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
++                               "TF_GLM_MULTI_GRAPHS, TF_GLM_MULTI_DRAFT_GRAPHS, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_DISK_CACHE, TF_GLM_CP_RAW_Q, "
+                                "TF_GLM_CP_PARTS_EDGE): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+diff --git tensorfold/families/glm5_next/cuda/full_seg.py tensorfold/families/glm5_next/cuda/full_seg.py
+index c430469..e3b2189 100644
+--- tensorfold/families/glm5_next/cuda/full_seg.py
++++ tensorfold/families/glm5_next/cuda/full_seg.py
+@@ -27,7 +27,14 @@ CUDA graphs: every launch's shape is a function of the window's total rows R and
+ alone (``rows_bucket``; 0: no row is sparse, no selection), everything else is in device tables that ``FullRows.set``
+ refreshes before a replay (pinned copy, ordered on the stream), and the scratch (``RowsScratch``: scores, token lists,
+ counts) is static: a graph per (R, NT) serves every mix of streams, positions and extents. ``FullSegVerify`` is the
+-eager verifier on these pieces (``FullBatchedVerify``'s interface)."""
++verifier on these pieces (``FullBatchedVerify``'s interface): ``capture`` takes a graph a (R, NT) (milestone 4: R 1 ..
++16, NT 0 and every bucket a stream reaches, in the engine's shared graph pool), a forward stages its ids and tables
++(pinned copies) and replays the graph of its shape, else runs the same launches eagerly (``FullSegVerify._run``).
++
++Memory (``seg_bytes``, ``graph_count``, ``verify_graph_bytes``, ``draft_graph_bytes``; the engine counts them for
++--parallel > 1): the selection's fp32 scores [16, pool tokens], and a graph's executable, about its kernel nodes x
++GRAPH_NODE_BYTES (78 layers x LAYER_LAUNCHES + HEAD_LAUNCHES ~ 5,000 nodes, ~10 MiB at most a graph); the
++temporaries live in the shared pool, reused by every graph (none replays while another runs)."""
+ 
+ from __future__ import annotations
+ 
+@@ -184,12 +191,109 @@ def dsa_full_seg_rows(layer, w, b, rows: FullRows, R: int, lc: torch.Tensor, kr:
+     return topk
+ 
+ 
++# -- CUDA graphs of the batched verify (multi-stream milestone 4) ----------------------------------------------------
++# A window's launches depend on its rows R and the selection's bucket NT alone (everything else is in FullRows' device
++# tables, the static token ids and the static scratch), so one graph a (R, NT) serves every mix of streams, positions
++# and extents: R 1 .. 16, NT 0 (no sparse row: no selection) and every bucket a stream's context can reach. The graphs
++# share one memory pool (the engine's, when it has graphs: the windows never run at the same time), and what a graph
++# holds beyond the pool is its executable (its kernel nodes).
++
++GRAPH_NODE_BYTES = 2048        # device memory a captured kernel node takes, at most (estimate; tests/gpu measures it)
++LAYER_LAUNCHES = 64            # kernels (and collectives) a full GLM-5.3 layer launches in a batched window, at most
++HEAD_LAUNCHES = 32             # the embedding, the final norm, the head, the taps
++DRAFT_LAYER_LAUNCHES = 24      # a DSpark layer's kernels in a block pass or a context update, at most
++DRAFT_HEAD_LAUNCHES = 48       # a DSpark block pass's embedding gather, norms, head, top-k, candidates, confidence
++
++
++def graph_mode(value: str | None = None) -> str:
++    """TF_GLM_MULTI_GRAPHS (full GLM-5.3 under --parallel): "all" (default; "1"): a graph a window's rows R (1 ..
++    16) and token bucket NT (0 and every bucket a stream reaches); "top": a graph a R for windows without sparse rows
++    and one for sparse windows at the largest bucket (every sparse window then runs at that bucket, eager or replayed:
++    the same bits, as a row's selection reads only its own columns, fewer graphs); "0": eager."""
++
++    import os
++
++    value = (os.environ.get("TF_GLM_MULTI_GRAPHS", "") if value is None else value).strip().lower()
++    if value in ("", "1", "all"):
++        return "all"
++    if value in ("0", "top"):
++        return value
++    raise ValueError(f"TF_GLM_MULTI_GRAPHS: 1 (all), top or 0, not {value!r}")
++
++
++def reach_buckets(capacity: int, most: int | None = None) -> list[int]:
++    """The selection buckets (``dsa_full.rows_bucket``) a window can take when its streams see at most ``most``
++    tokens (default: the selection's ``capacity``), ascending."""
++
++    capacity = int(capacity)
++    most = capacity if most is None else min(capacity, int(most))
++    out, b = [], dsa_full.MIN_BUCKET
++    while True:
++        out.append(min(capacity, b))
++        if b >= most or b >= capacity:
++            return sorted(set(out))
++        b *= 2
++
++
++def graph_keys(rows: int, nts: Sequence[int]) -> list[tuple[int, int]]:
++    """The (R, NT) graphs of windows of 1 .. ``rows`` rows and buckets ``nts`` (0: no sparse row)."""
++
++    return [(R, NT) for NT in nts for R in range(1, int(rows) + 1)]
++
++
++def graph_count(rows: int, capacity: int, most: int | None, *, indexed: bool, mode: str = "all") -> int:
++    """How many verify graphs ``FullSegVerify.capture`` takes (``mode``: ``graph_mode``)."""
++
++    if mode == "0":
++        return 0
++    if not indexed:
++        return int(rows)
++    nb = len(reach_buckets(capacity, most))
++    return int(rows) * (1 + (min(nb, 1) if mode == "top" else nb))
++
++
++def verify_graph_bytes(layers: int, graphs: int) -> int:
++    """The verify graphs' executables beyond the shared pool: ``graphs`` x (its kernel nodes x GRAPH_NODE_BYTES)."""
++
++    return int(graphs) * (int(layers) * LAYER_LAUNCHES + HEAD_LAUNCHES) * GRAPH_NODE_BYTES
++
++
++def draft_graph_bytes(draft_layers: int, streams: int, tap_rows: int) -> int:
++    """The DSpark stream contexts' graphs (``dspark_multi.DSparkMulti.capture``): per context a block pass and a
++    context update of 1 .. ``tap_rows`` rows."""
++
++    nodes = int(draft_layers) * DRAFT_LAYER_LAUNCHES + DRAFT_HEAD_LAUNCHES
++    return int(streams) * (int(tap_rows) + 1) * nodes * GRAPH_NODE_BYTES
++
++
++def seg_bytes(rows: int, capacity: int, k: int, *, indexed: bool) -> int:
++    """``FullSegVerify``'s own device buffers beyond ``FullBatchedVerify``'s: the row tables and (with index caches)
++    the selection's scratch (``RowsScratch``: fp32 scores [rows, capacity], lists [rows, k], counts)."""
++
++    tables = 4 * int(rows) * 4
++    if not indexed:
++        return tables
++    return tables + int(rows) * (int(capacity) * 4 + int(k) * 4 + 4)
++
++
++def capture_graph(fn, pool, warm: int = 2):
++    """A CUDA graph of ``fn()`` in ``pool``, after ``warm`` eager runs (Triton's compiles, the allocator)."""
++
++    for _ in range(warm):
++        fn()
++    torch.cuda.synchronize()
++    g = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(g, pool=pool):
++        fn()
++    return g
++
++
+ class FullSegVerify(FullBatchedVerify):
+     """``FullBatchedVerify`` (the same ``forward`` / ``commit``, the same bits) with each layer's attention on every
+     segment's rows at once (``dsa_full_seg_rows``) instead of a call per segment: the window's tables staged once a
+-    forward (``FullRows``), the selection's scratch static (``RowsScratch``). Eager; the launches are those a CUDA
+-    graph keyed (R, NT) would capture. ``capacity``: the largest extent a stream may hold (default the pool's
+-    rows)."""
++    forward (``FullRows``), the selection's scratch static (``RowsScratch``). ``capture`` takes a CUDA graph a (R,
++    NT); a forward replays the graph of its shape and runs eagerly otherwise, the same launches either way
++    (``_run``). ``capacity``: the largest extent a stream may hold (default the pool's rows)."""
+ 
+     def __init__(self, e, *, taps: Sequence[int] = (), rows: int | None = None, capacity: int | None = None) -> None:
+         from .verify import FULL_MAX_ROWS
+@@ -198,23 +302,69 @@ class FullSegVerify(FullBatchedVerify):
+         w = self.w
+         self.meta = FullRows(self.rows_max, w.device)
+         cap = int(e.caches.rows if capacity is None else capacity)
+-        self.sel = (RowsScratch(self.rows_max, cap, w.cfg.index_topk, w.device) if e.caches.index is not None
+-                    else None)
++        self.indexed = e.caches.index is not None
++        self.sel = RowsScratch(self.rows_max, cap, w.cfg.index_topk, w.device) if self.indexed else None
++        self.capacity = cap
++        # the layer maps every state on the pool has (``forward.State``)
++        dsa = [l for l in w.layers if l.kind == "dsa"]
++        self.dsa_index = {l.index: i for i, l in enumerate(dsa)}
++        full = [l.index for l in dsa if l.dsa is not None and l.dsa.index is not None]
++        self.index_of = {layer: i for i, layer in enumerate(full)}
+         self.NT = 0
+         self.seg_topk = None
++        self.top = None                       # TF_GLM_MULTI_GRAPHS=top: every sparse window at this bucket
++        self.graphs: dict[tuple[int, int], object] = {}
++        self.pool = None
++        self.replays = {"graph": 0, "eager": 0}
++
++    def nbytes(self) -> int:
++        """The buffers beyond FullBatchedVerify's (``seg_bytes``)."""
++        held = [self.meta.dev] + ([self.sel.scores, self.sel.tokens, self.sel.counts] if self.sel is not None else [])
++        return sum(t.numel() * t.element_size() for t in held)
++
++    def bucket(self) -> int:
++        """The staged window's selection bucket (0: no sparse row), at ``top`` under TF_GLM_MULTI_GRAPHS=top."""
++        if not self.indexed:
++            return 0
++        NT = self.meta.bucket(self.capacity)
++        return self.top if NT and self.top is not None and NT <= self.top else NT
+ 
+     @torch.no_grad()
+     def forward(self, segments: Sequence[Segment]) -> Verified:
+-        self._check(segments)
++        R = self._check(segments)
+         c = self.w.cfg
+-        st0 = segments[0].st
+-        self.indexed = st0.index is not None
++        if any((s.st.index is not None) != self.indexed for s in segments):
++            raise ValueError("the segments' states and the verifier disagree on the index caches")
+         self.meta.set([(s.st.base, s.st.pos, len(s.tokens), s.st.capacity) for s in segments],
+                       dense_limit=c.dense_limit, indexed=self.indexed)
+-        self.NT = self.meta.bucket(self.sel.capacity if self.sel is not None else None) if self.indexed else 0
+-        self.dsa_index, self.index_of = st0.dsa_index, st0.index_of
+-        self.seg_topk = None
+-        return super().forward(segments)
++        NT = self.bucket()
++        self._stage([t for seg in segments for t in seg.tokens])
++        self.segments = list(segments)
++        g = self.graphs.get((R, NT))
++        if g is not None:
++            self.replays["graph"] += 1
++            self.R, self.NT, self.seg_topk = R, NT, None
++            g.replay()
++            logits = self.b.logits[:R]
++        else:
++            self.replays["eager"] += 1
++            logits = self._run(R, NT)
++        out, taps, at = [], [], 0
++        for seg in segments:
++            n = len(seg.tokens)
++            out.append(logits[at:at + n])
++            taps.append(torch.cat([t[at:at + n] for t in self.b.taps], dim=1) if self.taps else None)
++            at += n
++        return Verified(out, taps)
++
++    def _run(self, R: int, NT: int):
++        """The window's launches for R rows and bucket NT (its ids and tables staged): what a graph of (R, NT)
++        captures and what an eager forward runs."""
++
++        from .forward import compute
++
++        self.R, self.NT, self.seg_topk = R, NT, None
++        return compute(self.w, None, self.b, R, mixer=self._mixer)
+ 
+     def _mixer(self, layer):
+         from .forward import dsa_full_front, dsa_full_out
+@@ -228,3 +378,61 @@ class FullSegVerify(FullBatchedVerify):
+             self.seg_topk = dsa_full_seg_rows(layer, w, b, self.meta, R, lc, kr, keys, self.NT, self.sel,
+                                               self.seg_topk, indexed=self.indexed)
+             return dsa_full_out(layer, w, b, R)
++
++    # -- CUDA graphs -----------------------------------------------------------------------------------------------
++    def graph_buckets(self, most: int | None = None, mode: str = "all") -> list[int]:
++        """The buckets to capture: 0, and (with index caches) every bucket a window reaches when its streams see at
++        most ``most`` tokens (``reach_buckets``; "top": only the largest)."""
++
++        if not self.indexed:
++            return [0]
++        nts = reach_buckets(self.capacity, most)
++        return [0] + (nts[-1:] if mode == "top" else nts)
++
++    def _dummy(self, R: int, NT: int) -> None:
++        """A capture's window: ids 0, one stream at the pool's first rows, its rows sparse when NT > 0 (the warm-up
++        runs write those rows of every plane: capture before any stream is admitted)."""
++
++        c = self.w.cfg
++        cap = min(self.capacity, self.e.caches.rows) if self.indexed else self.e.caches.rows
++        pos = c.dense_limit if NT else 0
++        pos = max(0, min(pos, cap - R))
++        self._stage([0] * R)
++        self.meta.set([(0, pos, R, cap)], dense_limit=c.dense_limit, indexed=self.indexed)
++
++    @torch.no_grad()
++    def capture(self, *, most: int | None = None, mode: str | None = None, pool=None, rows: Sequence[int] | None = None,
++                nts: Sequence[int] | None = None, capturer=None) -> int:
++        """CUDA graphs of the window for every (R, NT) (``graph_buckets``; R 1 .. rows), all ranks together (the
++        graphs gather), in ``pool`` (default a new one; the engine passes its graphs' pool). ``most``: the most
++        tokens a stream sees (the buckets past it are never used); ``mode``: ``graph_mode``; ``rows`` / ``nts``:
++        only these (tests). Returns the graphs' count. Before any stream is admitted (``_dummy`` writes the pool's
++        first rows)."""
++
++        mode = graph_mode() if mode is None else mode
++        if mode == "0":
++            return 0
++        capturer = capture_graph if capturer is None else capturer
++        every = self.graph_buckets(most, mode)
++        self.top = every[-1] if mode == "top" and every[-1] else None
++        nts = every if nts is None else list(nts)
++        if pool is None:
++            pool = torch.cuda.graph_pool_handle()
++        self.pool = pool
++        was = prof.active
++        prof.active = False
++        try:
++            for NT in nts:
++                for R in (rows or range(1, self.rows_max + 1)):
++                    self._dummy(R, NT)
++                    self.graphs[(R, NT)] = capturer(lambda R=R, NT=NT: self._run(R, NT), pool)
++        finally:
++            prof.active = was
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++        self.segments = []
++        return len(self.graphs)
++
++    def drop_graphs(self) -> None:
++        self.graphs.clear()
++        self.top = None
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index c4a1a44..ee6e4f8 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -31,14 +31,17 @@ ranks cannot be trusted to agree: ``broken`` latches and every later call fails
+ 
+ Multi-stream mode drafts with DFlash2 only: MTP policies are remapped to DFlash2 ones (drafts never change a reply).
+ 
+-Full GLM-5.3 (glm_moe_dsa, milestone 2: eager, no context parallelism) runs the same scheduler, messages, prompt
+-chunks, kept prompts, acceptance and keyed sampling with its own pieces: no KDA states (a slot holds only device
+-positions); rounds verified by ``verify.FullBatchedVerify`` (one eager forward, each segment's attention on its own
+-stream's caches) or ``SerialVerify``, every round's windows together at most ``verify.FULL_MAX_ROWS`` (16) rows, so
+-each stream drafts at most its share (16 // streams - 1) and ``trim`` cuts the rest; DSpark drafts
++Full GLM-5.3 (glm_moe_dsa, no context parallelism) runs the same scheduler, messages, prompt chunks, kept prompts,
++acceptance and keyed sampling with its own pieces: no KDA states (a slot holds only device positions); rounds verified
++(TF_GLM_MULTI_VERIFY) by ``full_seg.FullSegVerify`` (seg, the default: one forward, each layer's attention on every
++stream's rows in one launch a piece, a CUDA graph a (rows, token bucket) replayed when the window's shape has one,
++TF_GLM_MULTI_GRAPHS), ``verify.FullBatchedVerify`` (segments: one eager forward, each segment's attention a call on
++its own stream's caches) or ``SerialVerify``; every round's windows together at most ``verify.FULL_MAX_ROWS`` (16)
++rows, so each stream drafts at most its share (16 // streams - 1) and ``trim`` cuts the rest; DSpark drafts
+ (``dspark_multi.DSparkMulti``: a context a stream over one weight set, proposals one stream after another, up to the
+-speculator's 8 drafts; auto requests take TF_GLM_DSPARK_MULTI_POLICY); multi-prompt chunks through
+-``multi_prefill.PieceMixer``'s full GLM split. A lone stream still moves home to the one-stream graphs."""
++speculator's 8 drafts, each context's block pass and updates as CUDA graphs; auto requests take
++TF_GLM_DSPARK_MULTI_POLICY); multi-prompt chunks through ``multi_prefill.PieceMixer``'s full GLM split. The multi-stream
++graphs share the engine's graph pool. A lone stream still moves home to the one-stream graphs."""
+ 
+ from __future__ import annotations
+ 
+@@ -301,13 +304,26 @@ def dspark_policy(value: str | None = None) -> str:
+ 
+ 
+ # -- the verify seam -------------------------------------------------------------------------------------------------
+-def verify_kind(value: str | None = None) -> str:
+-    """TF_GLM_MULTI_VERIFY: how a round's windows are verified: batched (the default: one forward over every stream's
+-    rows, the segmented kernels) or serial (the reference: each stream's window as its own forward)."""
+-
+-    value = (os.environ.get("TF_GLM_MULTI_VERIFY", "") if value is None else value).strip().lower() or "batched"
++VERIFY_KINDS = ("batched", "serial", "seg", "segments")
++
++
++def verify_kind(value: str | None = None, *, full: bool = False) -> str:
++    """TF_GLM_MULTI_VERIFY: how a round's windows are verified. GLM-5.3-Flash: batched (the default: one forward over
++    every stream's rows, the segmented kernels) or serial (the reference: each stream's window as its own forward).
++    Full GLM-5.3: seg (the default, also "batched": one forward, each layer's attention on every stream's rows in one
++    launch a piece, ``full_seg.FullSegVerify``, CUDA graphs a window shape), segments (one forward, each layer's
++    attention a call per stream, ``verify.FullBatchedVerify``, eager) or serial."""
++
++    value = (os.environ.get("TF_GLM_MULTI_VERIFY", "") if value is None else value).strip().lower()
++    if full:
++        value = "seg" if value in ("", "batched") else value
++        if value not in ("seg", "segments", "serial"):
++            raise ValueError(f"TF_GLM_MULTI_VERIFY (full GLM-5.3): seg, segments or serial, not {value!r}")
++        return value
++    value = value or "batched"
+     if value not in ("batched", "serial"):
+-        raise ValueError(f"TF_GLM_MULTI_VERIFY: batched or serial, not {value!r}")
++        raise ValueError(f"TF_GLM_MULTI_VERIFY: batched or serial, not {value!r}"
++                         + (" (seg / segments are full GLM-5.3's)" if value in ("seg", "segments") else ""))
+     return value
+ 
+ 
+@@ -442,18 +458,27 @@ class MultiDecoder:
+                 raise ValueError("TF_GLM_MULTI_PREFILL=1 needs the latent cache (TF_GLM_LATENT=1)")
+         self.unit = fill_unit(self.grid)
+         self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
+-        # full GLM-5.3 (glm_moe_dsa): no KDA states, DSpark drafts (a context per stream, eager), the eager batched
+-        # verify of milestone 2 (``verify.FullBatchedVerify``: at most FULL_MAX_ROWS rows a round, every stream's)
++        # full GLM-5.3 (glm_moe_dsa): no KDA states, DSpark drafts (a context per stream), the batched verify
++        # (``full_seg.FullSegVerify``, CUDA graphs a window shape; at most FULL_MAX_ROWS rows a round, every stream's)
+         self.full = bool(self.w.cfg.full)
+         self.window_rows = FULL_MAX_ROWS if self.full else MAX_WINDOW
+         if self.full and int(self.w.meta.get("cp", 1)) > 1:
+             raise ValueError("context parallelism (TF_GLM_CP=1) serves one request at a time: --parallel 1")
+         self.drafts = drafts
++        # full GLM-5.3's CUDA graphs (the DSpark contexts', the batched verify's) share one pool: the engine's graphs'
++        # (nothing replays two at once); TF_GLM_MULTI_GRAPHS / TF_GLM_MULTI_DRAFT_GRAPHS=0: eager (the same bits)
++        self.graph_pool = None
++        self.graph_counts = {"verify": 0, "drafts": 0}
++        full_graphs = self.full and torch.cuda.is_available() and getattr(e, "graphs", None) is not None
+         if self.drafts is None and engine.drafter is not None:
+             if type(engine.drafter).__module__.endswith(".dspark"):
+                 from .dspark_multi import DSparkMulti
+ 
+-                self.drafts = DSparkMulti(engine.drafter, streams=streams)      # eager (no graphs yet)
++                self.drafts = DSparkMulti(engine.drafter, streams=streams)
++                graphs = (os.environ.get("TF_GLM_MULTI_DRAFT_GRAPHS", "1") != "0" if draft_graphs is None
++                          else draft_graphs)
++                if graphs and full_graphs:
++                    self.graph_counts["drafts"] = self.drafts.capture(pool=self._graph_pool())
+             else:
+                 from .dflash2_multi import MultiDrafter
+ 
+@@ -464,7 +489,16 @@ class MultiDecoder:
+                     self.drafts.capture()
+         if verify is None and self.full:
+             taps = engine.drafter.tap_layers if engine.drafter is not None else ()
+-            if verify_kind() == "batched":
++            kind = verify_kind(full=True)
++            if kind == "seg":
++                from .full_seg import FullSegVerify, graph_mode
++
++                verify = FullSegVerify(e, taps=taps, rows=FULL_MAX_ROWS)
++                if full_graphs and graph_mode() != "0":
++                    # every (rows, bucket) a window can take: a stream sees at most the window and a round's rows
++                    self.graph_counts["verify"] = verify.capture(most=int(engine.limit) + FULL_MAX_ROWS,
++                                                                 pool=self._graph_pool())
++            elif kind == "segments":
+                 verify = FullBatchedVerify(e, taps=taps, rows=FULL_MAX_ROWS)
+             else:
+                 verify = SerialVerify(e, taps=self.drafts is not None)
+@@ -517,6 +551,13 @@ class MultiDecoder:
+         if self.fill_budget:
+             self.fill_costs = self._time_prompt_layers()
+ 
++    def _graph_pool(self):
++        """The pool full GLM-5.3's multi-stream graphs share: the engine's graphs' (else a new one)."""
++        if self.graph_pool is None:
++            graphs = getattr(self.e, "graphs", None)
++            self.graph_pool = getattr(graphs, "pool", None) or torch.cuda.graph_pool_handle()
++        return self.graph_pool
++
+     # -- the scheduler's view ----------------------------------------------------------------------------------------
+     @property
+     def streams(self) -> dict[int, Stream]:

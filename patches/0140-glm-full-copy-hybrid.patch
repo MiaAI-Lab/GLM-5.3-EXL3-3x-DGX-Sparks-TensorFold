@@ -1,0 +1,927 @@
+diff --git tensorfold/families/glm5_next/cuda/copy_drafts.py tensorfold/families/glm5_next/cuda/copy_drafts.py
+index 10860da..f4bb274 100644
+--- tensorfold/families/glm5_next/cuda/copy_drafts.py
++++ tensorfold/families/glm5_next/cuda/copy_drafts.py
+@@ -15,14 +15,23 @@ Three refinements, off by default (they only change what is proposed, never what
+   rows and a captured width is padded to that width by repeating its last draft, so the window replays a CUDA graph
+   instead of running eagerly. Padded drafts are drafts like any other: kept only where they equal the sample.
+ 
++Hybrid copies (``hybrid``, TF_GLM_COPY_HYBRID=1, with a DSpark drafter): a copy no longer replaces the drafter's
++block. The block runs, and each copy continuation (from up to ``sources`` earlier occurrences, latest first) is walked
++through DSpark's slots with the Markov bias conditioned on the copy's own previous token: the copy agrees at a slot
++while its token is among DSpark's ``rank`` best picks there (the same score, keyed noise and target filter as
++``dspark.Drafter.chain``). The best-agreeing continuation wins (ties: the latest occurrence); see ``hybrid`` for
++how its agreed prefix, DSpark's own chain and the copy's tail past the block's slots make the proposal. A copy that
++agreed at every slot and was kept whole may draft its next round without the block (``skip``): the drafter's taps
++still join every round, so its context stays the committed reply's.
++
+ Both ranks hold the same prompt and sample the same tokens, so each computes the same proposals with no exchange.
+ Pure numpy (no torch), so it is testable anywhere."""
+ 
+ from __future__ import annotations
+ 
+ import os
+-from dataclasses import dataclass
+-from typing import Sequence
++from dataclasses import dataclass, field
++from typing import Callable, Sequence
+ 
+ import numpy as np
+ 
+@@ -30,6 +39,11 @@ MATCH = 8        # the context's last this many tokens must have occurred before
+ MOST = 5         # drafts a round (TF_GLM_COPY_MAX, up to 15): graphs cover windows of 8 rows, wider ones run eagerly
+ 
+ 
++RANK = 1          # a copy token agrees with DSpark at a slot when it is among its best this many picks there
++SOURCES = 4       # earlier occurrences whose continuations are walked (distinct ones, latest first)
++SCAN = 64         # occurrences looked at for them, latest first
++SHORT = 4        # the hybrid's index match (TF_GLM_COPY_SHORT)
++TRUST_REPLY = 24  # a reply occurrence matching this many tokens is copied unvetted (TF_GLM_COPY_TRUST_REPLY)
+ GRAPHED = 8      # verify windows up to this many rows always replay CUDA graphs (engine.GRAPH_ROWS)
+ 
+ 
+@@ -40,6 +54,7 @@ class CopySettings:
+     reply_match: int = 0             # 0: occurrences in the reply need ``match`` tokens like the prompt's
+     pad: tuple[int, ...] = ()        # window widths past GRAPHED rows that replay CUDA graphs (TF_GLM_WIDE_GRAPHS)
+     miss_most: int = 0               # 0: off; else drafts a copied round after one that missed
++    hybrid: HybridSettings | None = None     # TF_GLM_COPY_HYBRID: copies vetted by DSpark's block
+ 
+     @classmethod
+     def from_env(cls, max_drafts: int, env=None, pad: Sequence[int] = ()) -> CopySettings | None:
+@@ -68,30 +83,36 @@ class CopySettings:
+             raise ValueError(f"TF_GLM_COPY_REPLY_MATCH: 0 (off) or more than TF_GLM_COPY_MATCH ({match}), not {reply}")
+         widths = tuple(sorted(int(r) for r in pad if GRAPHED < int(r) <= max_drafts + 1))
+         most = number("TF_GLM_COPY_MAX", min(MOST, max_drafts), 1, max_drafts)
+-        return cls(match, most, reply, widths, number("TF_GLM_COPY_MISS_MAX", 0, 0, most))
++        return cls(match, most, reply, widths, number("TF_GLM_COPY_MISS_MAX", 0, 0, most), HybridSettings.from_env(env))
+ 
+     def code(self) -> list[int]:
+         """The settings as ints both ranks compare at startup (zeros: off; the pad widths are the engine's
+         TF_GLM_WIDE_GRAPHS, compared on their own)."""
+ 
+-        return [self.match, self.most, self.reply_match, self.miss_most]
++        h = self.hybrid.code() if self.hybrid is not None else [0] * len(HybridSettings().code())
++        return [self.match, self.most, self.reply_match, self.miss_most] + h
+ 
+-    def drafts(self, context: Sequence[int]) -> CopyDrafts:
+-        """A request's index: ``context`` is its prompt and pending token (the reply's first token)."""
++    def drafts(self, context: Sequence[int], hybrid: bool = True) -> CopyDrafts:
++        """A request's index: ``context`` is its prompt and pending token (the reply's first token); ``hybrid``: the
++        request drafts with DSpark (``dflash_decode``), so TF_GLM_COPY_HYBRID applies (its short match)."""
+ 
+-        return CopyDrafts(context, self.match, self.most, prompt=max(len(context) - 1, 0),
+-                          reply_match=self.reply_match, pad=self.pad, miss_most=self.miss_most)
++        h = self.hybrid if hybrid else None
++        return CopyDrafts(context, h.match if h is not None else self.match, self.most,
++                          prompt=max(len(context) - 1, 0), reply_match=self.reply_match, pad=self.pad,
++                          miss_most=self.miss_most, hybrid=h)
+ 
+ 
+ class CopyDrafts:
+     """One sequence's context (prompt, then committed reply tokens and the pending one) and its copy proposals."""
+ 
+     def __init__(self, context: Sequence[int], match: int = MATCH, most: int = MOST, *, prompt: int = 0,
+-                 reply_match: int = 0, pad: Sequence[int] = (), miss_most: int = 0) -> None:
++                 reply_match: int = 0, pad: Sequence[int] = (), miss_most: int = 0,
++                 hybrid: HybridSettings | None = None) -> None:
+         """``prompt``: how many leading context tokens are the prompt (occurrences starting at or past it are the
+         reply's, which need ``reply_match`` tokens when that is more than ``match``); ``pad``: window widths past
+         GRAPHED rows to pad a proposal's window up to (``propose``); ``miss_most``: drafts a copied round after one
+-        that missed (0: ``most`` always)."""
++        that missed (0: ``most`` always); ``hybrid``: the request's rounds take ``plan`` and DSpark's vetting
++        (``hybrid``) instead of ``propose``."""
+ 
+         if match < 1 or most < 1:
+             raise ValueError("match and most must be positive")
+@@ -100,8 +121,11 @@ class CopyDrafts:
+         self.reply_match = int(reply_match) if int(reply_match) > self.match else 0
+         self.pad = tuple(sorted(int(r) for r in pad if int(r) > GRAPHED))
+         self.miss_most = int(miss_most)
++        self.hybrid = hybrid
+         self.proposed = 0              # drafts of the last proposal not yet settled by ``extend``
+         self.missed = False            # the last settled copied round kept fewer than all of its drafts
++        self.trail: tuple[int, int] | None = None   # a trusted hybrid proposal: (occurrence start, drafts)
++        self.trusted = -1              # where that occurrence continues after it was kept whole (-1: none)
+         n = len(context)
+         self.buf = np.empty((max(1024, 2 * n),), dtype=np.int32)
+         self.buf[:n] = np.asarray(context, dtype=np.int32) if n else 0
+@@ -123,6 +147,12 @@ class CopyDrafts:
+         if self.proposed:
+             self.missed = k <= self.proposed
+             self.proposed = 0
++        self.trusted = -1
++        if self.trail is not None:
++            start, q = self.trail
++            self.trail = None
++            if k >= q + 1:             # every copied draft kept: the occurrence continues k tokens on
++                self.trusted = start + k
+         if self.length + k > self.buf.shape[0]:
+             grown = np.empty((2 * (self.length + k),), dtype=np.int32)
+             grown[:self.length] = self.buf[:self.length]
+@@ -178,6 +208,88 @@ class CopyDrafts:
+         self.proposed = len(out)                  # the copied drafts (a pad's repeats may miss without counting)
+         return self.padded(out, room)
+ 
++    def continuations(self, room: int | None = None, sources: int = SOURCES) -> list[tuple[int, list[int]]]:
++        """(start, up to ``min(most, room)`` tokens that followed it) of the latest ``sources`` earlier occurrences
++        whose continuations differ (among the latest SCAN): latest first those with that many tokens after them, then
++        the others, earliest (longest) first ([] when the suffix never occurred before)."""
++
++        k = self.most if room is None else min(self.most, int(room))
++        self.trail = None
++        if k < 1:
++            return []
++        L, n = self.length, self.match
++        hits = self.starts()[::-1][:SCAN]               # a common short match in a long prompt: the latest SCAN
++        # those with k tokens after them first (a run's latest occurrences overlap the suffix: little follows them)
++        hits = np.concatenate([hits[hits <= L - n - k], hits[hits > L - n - k][::-1]])
++        out: list[tuple[int, list[int]]] = []
++        seen: set[bytes] = set()
++        for s in hits:
++            c = self.buf[int(s) + n:min(int(s) + n + k, L)]
++            key = c.tobytes()
++            if c.size and key not in seen:
++                seen.add(key)
++                out.append((int(s), c.tolist()))
++                if len(out) >= sources:
++                    break
++        return out
++
++    def match_length(self, start: int, most: int = 64) -> int:
++        """How many tokens before the occurrence's continuation equal the context's last ones (at least ``match``
++        for an occurrence ``starts`` found; at most ``most``)."""
++
++        L, n, end = self.length, self.match, int(start) + self.match
++        k = 0
++        while k < most and end - 1 - k >= 0 and self.buf[end - 1 - k] == self.buf[L - 1 - k]:
++            k += 1
++        return k
++
++    def follow(self, start: int, drafts: int) -> None:
++        """The round proposes ``drafts`` tokens copied from the occurrence at ``start`` that DSpark agreed with at
++        every slot (or a trusted continuation of one): ``extend`` notes whether they were all kept."""
++
++        self.trail = (int(start), int(drafts))
++
++    def trusted_drafts(self, room: int | None = None, least: int = 1) -> tuple[int, list[int]]:
++        """After a trusted copy was kept whole: (start, its continuation, up to ``min(most, room)`` tokens) when the
++        occurrence still matches the context's suffix and at least ``least`` tokens follow it; else (-1, [])."""
++
++        s = self.trusted
++        self.trusted = -1
++        k = self.most if room is None else min(self.most, int(room))
++        if s < 0 or k < max(1, least):
++            return -1, []
++        L, n = self.length, self.match
++        if s + n >= L or not np.array_equal(self.buf[s:s + n], self.buf[L - n:L]):
++            return -1, []
++        c = self.buf[s + n:min(s + n + k, L)].tolist()
++        return (s, c) if len(c) >= least else (-1, [])
++
++    def plan(self, h: HybridSettings, room: int | None = None, least: int = 1) -> Plan:
++        """The copy side of a hybrid round: a trusted copy kept whole last round that still matches ("s": its
++        continuation, at least ``least`` tokens: the block's slots); else among the latest ``h.sources`` distinct
++        continuations, of those whose match reaches the trust of their source (prompt or reply), the one with the
++        most tokens after it (then the longest match, then the latest): alone, it is copied ("c"); beside other
++        continuations it is ``trusted`` while the block vets them all ("v"); else every continuation for the block
++        to vet ("v"); else none ("")."""
++
++        if h.skip:
++            start, drafts = self.trusted_drafts(room, least)
++            if drafts:
++                return Plan("s", start, drafts, copied=len(drafts))
++        self.trusted = -1
++        conts = self.continuations(room, h.sources)
++        if not conts:
++            return Plan()
++        best, top = -1, (-1, -1)
++        for k, (start, cont) in enumerate(conts):
++            n = self.match_length(start)
++            trust = h.trust_prompt if start < self.prompt else h.trust_reply
++            if trust and n >= trust and (len(cont), n) > top:
++                best, top = k, (len(cont), n)
++        if best >= 0 and len(conts) == 1:
++            return Plan("c", conts[best][0], conts[best][1], copied=len(conts[best][1]))
++        return Plan("v", conts=conts, trusted=best)
++
+     def padded(self, drafts: list[int], room: int | None = None) -> list[int]:
+         """``drafts`` filled up to the next ``pad`` width's window by repeating the last one, when their window is
+         wider than GRAPHED rows, narrower than that width, and ``room`` (default ``most``) leaves space for it."""
+@@ -189,3 +301,152 @@ class CopyDrafts:
+         if width <= rows or width - 1 > (self.most if room is None else int(room)):
+             return drafts
+         return drafts + [drafts[-1]] * (width - rows)
++
++
++# -- hybrid copies: a copy checked (and extended) by DSpark's block ------------------------------------------------
++# slot(d, prev) -> (pick scores over slot d's candidates [K], -inf where the target's rule excludes one; slot d's
++# confidence), given the previous draft is slot d - 1's candidate ``prev`` (-1: the anchor, the pending token). The
++# engine's comes from ``dspark.Drafter.slot_scorer``, the offline replay's from a dump record (``copy_sim``): the same
++# float64 terms, so both walk the same chains.
++Slot = Callable[[int, int], tuple[np.ndarray, float]]
++
++
++
++@dataclass(frozen=True)
++class HybridSettings:
++    match: int = SHORT            # the index's match (shorter than MATCH: DSpark vets what a short match proposes)
++    rank: int = RANK
++    sources: int = SOURCES
++    skip: bool = True             # a whole-kept trusted copy drafts its next round without the block
++    trust_prompt: int = MATCH     # a prompt occurrence matching at least this many tokens is copied unvetted
++    trust_reply: int = TRUST_REPLY    # likewise one in the reply (0: never)
++
++    @classmethod
++    def from_env(cls, env=None) -> HybridSettings | None:
++        """TF_GLM_COPY_HYBRID=1 (off by default; it needs DSpark): copies vetted by the drafter's block, with
++        TF_GLM_COPY_SHORT (the index's match, 2 to 64), TF_GLM_COPY_RANK (1 to 8), TF_GLM_COPY_SOURCES (1 to 16),
++        TF_GLM_COPY_SKIP (0 or 1), TF_GLM_COPY_TRUST_PROMPT and TF_GLM_COPY_TRUST_REPLY (0: never, else at least the
++        short match, up to 64)."""
++
++        env = os.environ if env is None else env
++        on = env.get("TF_GLM_COPY_HYBRID", "0").strip()
++        if on in ("", "0"):
++            return None
++        if on != "1":
++            raise ValueError(f"TF_GLM_COPY_HYBRID: 0 or 1, not {on!r}")
++
++        def number(name: str, default: int, low: int, high: int) -> int:
++            text = env.get(name, "").strip()
++            if text == "":
++                return default
++            if not text.isdecimal() or not low <= int(text) <= high:
++                raise ValueError(f"{name}: {low} to {high}, not {text!r}")
++            return int(text)
++
++        short = number("TF_GLM_COPY_SHORT", SHORT, 2, 64)
++        trust = [number(f"TF_GLM_COPY_TRUST_{k}", d, 0, 64) for k, d in (("PROMPT", MATCH), ("REPLY", TRUST_REPLY))]
++        for k, t in zip(("PROMPT", "REPLY"), trust):
++            if 0 < t < short:
++                raise ValueError(f"TF_GLM_COPY_TRUST_{k}: 0 (never) or at least TF_GLM_COPY_SHORT ({short}), not {t}")
++        return cls(short, number("TF_GLM_COPY_RANK", RANK, 1, 8), number("TF_GLM_COPY_SOURCES", SOURCES, 1, 16),
++                   bool(number("TF_GLM_COPY_SKIP", 1, 0, 1)), *trust)
++
++    def code(self) -> list[int]:
++        return [1, self.match, self.rank, self.sources, int(self.skip), self.trust_prompt, self.trust_reply]
++
++
++@dataclass
++class Plan:
++    """A hybrid round's copy side (``CopyDrafts.plan``): ``drafts`` to propose without the block ("s": a trusted
++    copy kept whole last round, "c": a long-matching one), or ``conts`` for the block to vet ("v"), or nothing."""
++
++    kind: str = ""
++    start: int = -1
++    drafts: list[int] = field(default_factory=list)
++    conts: list[tuple[int, list[int]]] = field(default_factory=list)
++    copied: int = 0               # the drafts' copied tokens (``follow``; ``padded`` may add repeats after them)
++    trusted: int = -1             # "v": the continuation trusted unless the block agrees with one at every slot
++
++
++def best_depth(q, round_ms) -> int:
++    """``dflash2.best_depth`` (same arithmetic; that module needs torch): the k maximizing E[tokens] / round_ms[k]."""
++
++    alive = np.concatenate([[1.0], np.cumprod(np.asarray(q, dtype=np.float64))])
++    expect = np.cumsum(alive)
++    ms = np.asarray(round_ms[:len(q) + 1], dtype=np.float64)
++    return int(np.argmax(expect / ms))
++
++
++def walk(tokens: np.ndarray, slot: Slot, most: int, confidence: float = 0.0, round_ms=None,
++         prefix: Sequence[int] = ()) -> tuple[list[int], list[int]]:
++    """DSpark's chain over ``tokens`` [D, K] (``dspark.Drafter.chain``'s rule): (drafts, their candidate indices).
++    ``prefix``: candidate indices forced at the first slots (a copy's agreed tokens), whose confidences count in the
++    product; the chain continues after them to ``most`` drafts in all (at least the prefix)."""
++
++    depth = min(max(int(most), len(prefix)), tokens.shape[0])
++    idx: list[int] = []
++    conf: list[float] = []
++    alive = 1.0
++    for d in range(depth):
++        pick, c = slot(d, idx[-1] if d else -1)
++        j = int(prefix[d]) if d < len(prefix) else int(np.argmax(pick))
++        conf.append(c)
++        if d >= len(prefix) and round_ms is None and confidence > 0:
++            alive *= c
++            if d > 0 and alive < confidence:
++                conf.pop()
++                break
++        elif round_ms is None and confidence > 0:
++            alive *= c
++        idx.append(j)
++    if round_ms is not None:
++        idx = idx[:max(best_depth(conf, round_ms), len(prefix))]
++    return [int(tokens[d, j]) for d, j in enumerate(idx)], idx
++
++
++def agreement(tokens: np.ndarray, slot: Slot, cont: Sequence[int], rank: int = RANK) -> list[int]:
++    """Candidate indices of ``cont``'s leading tokens that DSpark agrees with: at slot d (prev: the copy's token
++    d - 1) the copy's token is a candidate the target's rule keeps, and fewer than ``rank`` candidates pick before it
++    (higher score, or the same score at a lower index: ``np.argmax``'s order)."""
++
++    idx: list[int] = []
++    for d in range(min(len(cont), tokens.shape[0])):
++        pick, _ = slot(d, idx[-1] if d else -1)
++        where = np.flatnonzero(tokens[d] == int(cont[d]))
++        if not where.size:
++            break
++        j = int(where[0])
++        p = pick[j]
++        if not np.isfinite(p) or int((pick > p).sum()) + int((pick[:j] == p).sum()) >= rank:
++            break
++        idx.append(j)
++    return idx
++
++
++def hybrid(tokens: np.ndarray, slot: Slot, conts: Sequence[Sequence[int]], *, chain_most: int,
++           confidence: float = 0.0, round_ms=None, rank: int = RANK, most: int = MOST
++           ) -> tuple[list[int], str, int, int]:
++    """A round's drafts from DSpark's block (``tokens`` [D, K], ``slot``) and copy continuations ``conts`` (latest
++    occurrence first): (drafts, kind, the continuation used (-1: none), its agreed slots).
++
++    * no continuation agrees at slot 0: DSpark's own chain (``chain_most`` slots, ``confidence`` / ``round_ms``),
++      kind "d";
++    * the best continuation (most agreed slots; ties: the latest) agrees at every one of the block's D slots: the
++      copy, up to ``most`` drafts (past the block's slots: what followed the occurrence), kind "x";
++    * else its agreed prefix, then DSpark's chain conditioned on it (``walk`` with the prefix forced; no more than
++      ``chain_most`` drafts unless the prefix is longer), kind "h".
++    """
++
++    D = tokens.shape[0]
++    best, agreed = -1, []
++    for k, c in enumerate(conts):
++        a = agreement(tokens, slot, c, rank)
++        if len(a) > len(agreed) or (a and len(a) == len(agreed) and len(c) > len(conts[best])):
++            best, agreed = k, a
++    if not agreed:
++        return walk(tokens, slot, chain_most, confidence, round_ms)[0], "d", -1, 0
++    c = conts[best]
++    if len(agreed) == D:
++        return [int(t) for t in c[:most]], "x", best, D
++    drafts, _ = walk(tokens, slot, chain_most, confidence, round_ms, prefix=agreed)
++    return drafts[:max(most, len(agreed))], "h", best, len(agreed)
+diff --git tensorfold/families/glm5_next/cuda/copy_sim.py tensorfold/families/glm5_next/cuda/copy_sim.py
+new file mode 100644
+index 0000000..ec50a1d
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/copy_sim.py
+@@ -0,0 +1,295 @@
++"""Offline replay of copy drafts with DSpark over ``draft_dump`` records (TF_GLM_DRAFT_DUMP with DRAFTER=dspark).
++
++A dump is a serial reply with DSpark's view at every position (``dspark_sim``); a copy index over the reply (and the
++prompt, when the dump holds its ids: ``prompt``, dump version 2) gives the copy continuations a round would see.
++``simulate`` follows the decode as ``decode.dflash_decode`` would under a policy: each round proposes from the record
++at its position (DSpark's slots through ``record_slot``, the same float64 terms as the drafter's), the verifier keeps
++the drafts equal to the reply's next tokens, and the round costs its verify window plus the block when it ran.
++
++Policies: "dspark" (no copies), "prod" (today's copies: a copy replaces the block, the latest occurrence), and the
++hybrid (TF_GLM_COPY_HYBRID: ``decode.hybrid_round`` itself, over a ``RecordDrafter``). Rounds cost the measured verify
++table (past 9 rows: the slope plus ``--eager`` ms for an uncaptured window) and the block where it ran.
++``--scenario edit|mixed``: a synthetic prompt quoting the reply (``prompt_ids``) for dumps without prompt ids; DSpark's
++recorded view never saw it, so vetted copies are understated there.
++
++    python3 -m tensorfold.families.glm5_next.cuda.copy_sim <dump dir or .npz> ... [--eager MS] [--block MS]
++        [--scenario none|edit|mixed]
++"""
++
++from __future__ import annotations
++
++import sys
++from dataclasses import dataclass
++from pathlib import Path
++
++import numpy as np
++
++from . import copy_drafts as cd
++from .dspark_sim import Record, load
++
++# measured verify ms of 1..9 rows (graphs; 2026-10-04) and the DSpark block
++VERIFY = (52.4, 64.3, 74.7, 84.4, 95.4, 104.1, 112.3, 121.0, 127.9)
++BLOCK = 3.4
++EAGER = 25.0          # assumed extra ms of an eager (uncaptured) window past 9 rows; wider rows extrapolate the slope
++KINDS = ("prose", "prose", "prose", "chat", "chat", "code", "code", "code", "code", "math")   # lab/dump_collect.py
++RUNS = ("sampled", "sampled", "greedy", "sampled-think")
++
++
++def verify_ms(rows: int, eager: float = EAGER, table=VERIFY) -> float:
++    if rows <= len(table):
++        return table[rows - 1]
++    slope = (table[-1] - table[-4]) / 3
++    return table[-1] + slope * (rows - len(table)) + eager
++
++
++@dataclass(frozen=True)
++class Policy:
++    name: str
++    copies: str = "none"          # none | prod | hybrid
++    match: int = cd.MATCH
++    most: int = 15                # copy drafts at most (TF_GLM_COPY_MAX)
++    chain_most: int = 5           # DSpark's chain (production fc5:0.3)
++    confidence: float = 0.3
++    hybrid: cd.HybridSettings = cd.HybridSettings()
++
++
++def record_slot(r: Record, i: int) -> cd.Slot:
++    """``copy_drafts.Slot`` of record i: ``dspark_sim.chain``'s arithmetic (``Drafter.chain``'s), memoized."""
++
++    from .dspark import target_kept
++
++    m = r.meta
++    sampled = r.sampling is not None
++    temp = float(r.sampling.temperature) if sampled else 1.0
++    weight, use_filter = m["dspark_noise"], m["dspark_filter"]
++    memo: dict[tuple[int, int], tuple[np.ndarray, float]] = {}
++
++    def slot(d: int, prev: int) -> tuple[np.ndarray, float]:
++        key = (d, prev if d else -1)
++        if key in memo:
++            return memo[key]
++        bias = r.mb0[i] if d == 0 else r.mbs[i, d - 1, prev]
++        score = (r.vals[i, d] + bias) / temp
++        pick = score + weight * r.noise[i, d] if sampled else score
++        if sampled and use_filter:
++            pick = np.where(target_kept(score, r.cand[i, d], r.sampling), pick, -np.inf)
++        if m["learned_conf"]:
++            z = float(r.hconf[i, d]) + m["conf_b"] + (float(r.cm0[i]) if d == 0 else float(r.cms[i, d - 1, prev]))
++            c = float(1.0 / (1.0 + np.exp(-z)))
++        else:
++            e = np.exp(score - score.max())
++            c = float(e[int(np.argmax(pick))] / e.sum())
++        memo[key] = (pick, c)
++        return memo[key]
++
++    return slot
++
++
++SCENARIO = "none"
++
++
++@dataclass
++class _Rule:
++    """``decode.DepthPolicy``'s part a round reads: production's confidence product (fc5:0.3), no cost rule."""
++
++    confidence: float
++    chain_rule = {}
++
++
++class RecordDrafter:
++    """A dump record standing in for ``dspark.Drafter`` at reply position i (its block's view there)."""
++
++    def __init__(self, r: Record, i: int) -> None:
++        self.r, self.i = r, i
++        self.block = r.cand.shape[1]
++        self._slot = None
++
++    def slot(self) -> cd.Slot:
++        if self._slot is None:
++            self._slot = record_slot(self.r, self.i)
++        return self._slot
++
++    def propose(self, pending, depth, sampling, confidence=0.0, **_) -> list[int]:
++        return cd.walk(self.r.cand[self.i], self.slot(), min(depth, self.block), confidence)[0]
++
++    def propose_hybrid(self, pending, conts, depth, sampling, confidence=0.0, *, rank=1, most=15, **_):
++        drafts, kind, k, _ = cd.hybrid(self.r.cand[self.i], self.slot(), conts, chain_most=min(depth, self.block),
++                                       confidence=confidence, rank=rank, most=most)
++        return drafts, kind, k
++
++
++def prompt_ids(r: Record) -> list[int]:
++    """The dump's prompt ids (version 2 dumps), or with SCENARIO a synthetic prompt quoting the reply: "edit" (the
++    whole reply, ~3% of its tokens substituted, deleted or inserted), "mixed" (half of its 40-token pieces verbatim,
++    the rest absent). Synthetic: DSpark's recorded view never saw that prompt (a real one would agree more)."""
++
++    ids = [int(t) for t in r.prompt] if r.prompt is not None else []
++    if SCENARIO == "none":
++        return ids
++    rng = np.random.default_rng(int(r.meta.get("seed", 0)) * 7919 + len(r.tokens))
++    reply = [int(t) for t in r.tokens[1:]]
++    out: list[int] = []
++    if SCENARIO == "edit":
++        for t in reply:
++            u = rng.random()
++            if u < 0.01:
++                continue                                      # deleted
++            out.append(int(rng.choice(reply)) if u < 0.02 else t)   # substituted
++            if 0.02 <= u < 0.03:
++                out.append(int(rng.choice(reply)))            # inserted
++    elif SCENARIO == "mixed":
++        for a in range(0, len(reply), 40):
++            if rng.random() < 0.5:
++                out += reply[a:a + 40]
++    else:
++        raise ValueError(SCENARIO)
++    return ids + out
++
++
++def simulate(r: Record, p: Policy, eager: float = EAGER, block: float = BLOCK, *, check: bool = False) -> dict:
++    """Rounds, tokens, ms and per-kind counts of decoding the reply under p (``check``: assert the no-copy chain is
++    the recorded production chain at every round)."""
++
++    toks = [int(t) for t in r.tokens]
++    n, count = len(toks) - 1, int(r.meta["count"])
++    prompt = prompt_ids(r)
++    copies = None
++    if p.copies != "none":
++        match = p.hybrid.match if p.copies == "hybrid" else p.match
++        copies = cd.CopyDrafts(prompt + toks[:1], match, p.most, prompt=len(prompt),
++                               hybrid=p.hybrid if p.copies == "hybrid" else None)
++    i = rounds = 0
++    ms = 0.0
++    kinds: dict[str, list[int]] = {}         # kind -> [rounds, drafted, kept]
++    while i < n:
++        room = count - (i + 1) - 1
++        depth = min(p.chain_most, count - (i + 1))
++        ran = True
++        kind = "d"
++        if copies is not None and p.copies == "prod":
++            drafts = copies.propose(room)
++            if drafts:
++                kind, ran = "c", False
++        else:
++            drafts = []
++        if copies is not None and p.copies == "hybrid":         # the engine's own round (``decode.hybrid_round``)
++            from .decode import hybrid_round
++
++            drafts, kind = hybrid_round(RecordDrafter(r, i), copies, p.hybrid, toks[i], depth, room, r.sampling,
++                                        _Rule(p.confidence))
++            ran = kind not in ("s", "c")
++            if kind == "d" and check:
++                want = [int(t) for t in r.prod[i] if t >= 0][:depth]
++                assert drafts == want or depth < 5, (i, drafts, want)
++        if kind == "d" and p.copies != "hybrid":
++            drafts = cd.walk(r.cand[i], record_slot(r, i), depth, p.confidence)[0] if depth > 0 else []
++            if check:
++                want = [int(t) for t in r.prod[i] if t >= 0][:depth]
++                assert drafts == want or depth < 5, (i, drafts, want)
++        acc = 0
++        while acc < len(drafts) and i + 1 + acc <= n and drafts[acc] == toks[i + 1 + acc]:
++            acc += 1
++        keep = acc + 1
++        ms += verify_ms(1 + len(drafts), eager) + (block if ran else 0.0)
++        k3 = kinds.setdefault(kind, [0, 0, 0])
++        k3[0] += 1
++        k3[1] += len(drafts)
++        k3[2] += acc
++        if copies is not None:
++            copies.extend(toks[i + 1:i + 1 + keep])
++        i += keep
++        rounds += 1
++    return dict(tokens=n, rounds=rounds, ms=ms, kinds=kinds)
++
++
++def label(path: Path, r: Record) -> tuple[str, str]:
++    """(kind, run) of a lab/dump_collect.py dump by its sequence number (dumps 1-2: warm-up requests)."""
++
++    if "kind" in r.meta:
++        return r.meta["kind"], r.meta.get("run", "?")
++    seq = int(path.stem.rsplit("-", 1)[-1]) - 3
++    if seq < 0:
++        return "warmup", "greedy" if r.sampling is None else "sampled"
++    return KINDS[seq % 10], RUNS[(seq // 10) % 4]
++
++
++H = cd.HybridSettings
++POLICIES = [
++    Policy("dspark only (fc5:0.3)"),
++    Policy("production copies (max 15)", copies="prod"),
++    Policy("production copies (max 8)", copies="prod", most=8),
++    Policy("hybrid (default, max 15)", copies="hybrid"),
++    Policy("hybrid (max 8)", copies="hybrid", most=8),
++    Policy("hybrid, vetted only", copies="hybrid", hybrid=H(trust_prompt=0, trust_reply=0)),
++    Policy("hybrid, no skip", copies="hybrid", hybrid=H(skip=False)),
++    Policy("hybrid, 3-token match", copies="hybrid", hybrid=H(3)),
++    Policy("hybrid, rank 2", copies="hybrid", hybrid=H(rank=2)),
++    Policy("hybrid, 1 source", copies="hybrid", hybrid=H(sources=1)),
++]
++
++
++def main(argv: list[str]) -> None:
++    eager, block = EAGER, BLOCK
++    if "--eager" in argv:
++        k = argv.index("--eager")
++        eager = float(argv[k + 1])
++        argv = argv[:k] + argv[k + 2:]
++    global SCENARIO
++    if "--scenario" in argv:
++        k = argv.index("--scenario")
++        SCENARIO = argv[k + 1]
++        argv = argv[:k] + argv[k + 2:]
++    if "--block" in argv:
++        k = argv.index("--block")
++        block = float(argv[k + 1])
++        argv = argv[:k] + argv[k + 2:]
++    files = []
++    for a in argv:
++        q = Path(a)
++        files += sorted(q.glob("*.npz")) if q.is_dir() else [q]
++    rows = []          # (kind, run, policy, result)
++    for f in files:
++        r = load(f)
++        kind, run = label(f, r)
++        for p in POLICIES:
++            rows.append((kind, run, p.name, simulate(r, p, eager, block, check=True)))
++        del r
++        print(f"{f.name}: {kind} {run}", file=sys.stderr, flush=True)
++    report(rows, eager, block)
++
++
++def report(rows, eager, block) -> None:
++    print(f"verify ms 1..9 rows {VERIFY}, past 9 rows +{eager} ms eager; block {block} ms")
++
++    def group(sel, title):
++        sub = [x for x in rows if sel(x)]
++        if not sub:
++            return
++        base = None
++        print(f"-- {title}: {len(sub) // len(POLICIES)} replies")
++        for p in POLICIES:
++            rs = [x[3] for x in sub if x[2] == p.name]
++            t, rd, ms = sum(x["tokens"] for x in rs), sum(x["rounds"] for x in rs), sum(x["ms"] for x in rs)
++            tps = 1000.0 * t / ms
++            base = tps if base is None else base
++            agg: dict[str, list[int]] = {}
++            for x in rs:
++                for k, v in x["kinds"].items():
++                    a = agg.setdefault(k, [0, 0, 0])
++                    for z in range(3):
++                        a[z] += v[z]
++            ks = " ".join(f"{k}:{v[0]}r/{v[2]}of{v[1]}" for k, v in sorted(agg.items()))
++            print(f"  {p.name:>28}: tok/round {t / rd:.3f}, est {tps:5.1f} tok/s ({100 * (tps / base - 1):+5.1f}%)  "
++                  + ks)
++
++    group(lambda x: x[0] != "warmup", "all")
++    for run in RUNS[1:]:
++        group(lambda x, run=run: x[1] == run and x[0] != "warmup", run)
++    for kind in ("prose", "chat", "code", "math"):
++        group(lambda x, kind=kind: x[0] == kind, kind)
++        for run in ("sampled", "greedy", "sampled-think"):
++            group(lambda x, kind=kind, run=run: x[0] == kind and x[1] == run, f"{kind} / {run}")
++
++
++if __name__ == "__main__":
++    main(sys.argv[1:])
+diff --git tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+index f69ba7f..9d566f1 100644
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -757,7 +757,9 @@ class DecodeResult:
+     stages: dict[str, float] = field(default_factory=dict)
+     depths: list[int] = field(default_factory=list)
+     keeps: list[int] = field(default_factory=list)
+-    arms: str = ""                          # auto_decode: each round's drafter, "m" (MTP), "f" (DFlash2) or "c" (copy)
++    # auto_decode: each round's drafter, "m" (MTP), "f" (DFlash2) or "c" (copy); dflash_decode with
++    # TF_GLM_COPY_HYBRID: each round's kind (``hybrid_round``)
++    arms: str = ""
+     pending: torch.Tensor | None = None     # auto_decode: MTP input rows of committed positions not absorbed yet
+     copy_rounds: int = 0                    # rounds whose drafts were copied from the context (``copy_drafts``)
+     copy_drafted: int = 0
+@@ -996,14 +998,22 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+     _sync(w)
+     start = time.perf_counter()
+     depth = min(policy.next(0, 0), count - len(out))
++    hybrid = getattr(copies, "hybrid", None) if hasattr(drafter, "propose_hybrid") else None
++    kinds: list[str] = []
+     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos) and not stopped(e):
+         t0 = time.perf_counter()
+-        copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+-        if copied:
+-            drafts = copied
++        if hybrid is not None:
++            drafts, kind = hybrid_round(drafter, copies, hybrid, out[-1], depth, copy_room(copies, count, out),
++                                        sampling, policy)
++            copied = kind != "d"
++            kinds.append(kind)
+         else:
+-            drafts = (drafter.propose(out[-1], depth, sampling, policy.confidence, **policy.chain_rule)
+-                      if depth > 0 else [])
++            copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
++            if copied:
++                drafts = copied
++            else:
++                drafts = (drafter.propose(out[-1], depth, sampling, policy.confidence, **policy.chain_rule)
++                          if depth > 0 else [])
+         t1 = time.perf_counter()
+         tokens = e.verify_window([out[-1]] + drafts)
+         drafts = tokens[1:]
+@@ -1045,4 +1055,30 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
+     late.flush()
+     _sync(w)
+     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps,
+-                        copy_rounds=c_rounds, copy_drafted=c_drafted, copy_accepted=c_accepted)
++                        "".join(kinds), copy_rounds=c_rounds, copy_drafted=c_drafted, copy_accepted=c_accepted)
++
++
++def hybrid_round(drafter, copies, h, pending: int, depth: int, room: int, sampling: Sampling | None,
++                 policy: DepthPolicy) -> tuple[list[int], str]:
++    """A round's drafts under TF_GLM_COPY_HYBRID (``copy_drafts.CopyDrafts.plan`` and ``hybrid``) and its kind: "s"
++    / "c" (a trusted copy, no block), "x" / "h" (a copy DSpark's block agreed with, extended / then its chain), "t"
++    (a trusted copy among others none of which the block agreed with throughout), "d" (DSpark's chain). Host
++    arithmetic on what every rank holds alike: the same drafts on every rank."""
++
++    plan = copies.plan(h, room, drafter.block)
++    if plan.drafts:
++        copies.follow(plan.start, plan.copied)
++        return copies.padded(plan.drafts, room), plan.kind
++    if depth < 1:
++        return [], "d"
++    if not plan.conts:
++        return drafter.propose(pending, depth, sampling, policy.confidence, **policy.chain_rule), "d"
++    drafts, kind, k = drafter.propose_hybrid(pending, [c for _, c in plan.conts], depth, sampling, policy.confidence,
++                                             rank=h.rank, most=min(copies.most, room), **policy.chain_rule)
++    if kind != "x" and plan.trusted >= 0:      # no continuation agreed throughout: the trusted one, as "c" would
++        k, kind = plan.trusted, "t"
++        drafts = plan.conts[k][1][:min(copies.most, room)]
++    if kind in ("x", "t"):
++        copies.follow(plan.conts[k][0], len(drafts))
++        drafts = copies.padded(drafts, room)
++    return drafts, kind
+diff --git tensorfold/families/glm5_next/cuda/draft_dump.py tensorfold/families/glm5_next/cuda/draft_dump.py
+index 2c2bc8f..34cbfde 100644
+--- tensorfold/families/glm5_next/cuda/draft_dump.py
++++ tensorfold/families/glm5_next/cuda/draft_dump.py
+@@ -6,7 +6,8 @@ one token a round instead, through the same one-row verify as ``serial_decode``,
+ (``draft: false``). Before each round it runs the DFlash2 block for the pending token as ``dflash_decode`` would and
+ records, for the block's positions: the merged candidates and their logits, the selector's edge scores between
+ consecutive candidates, the request's keyed Gumbel draws for them, the drafter's projected rows, and the chain the
+-production rule (``fc5:0.3``) would propose; after the verify, the target's top-32 logits and the committed token.
++production rule (``fc5:0.3``) would propose; after the verify, the target's top-32 logits and the committed token;
++and the prompt's ids (``prompt``, version 2: the copy-draft replay's index).
+ Both ranks run every call (the block and the target's top-32 gather are collectives); rank 0 writes one ``.npz`` per
+ request into <dir>. Off (unset), nothing here runs.
+ """
+@@ -30,7 +31,7 @@ from .decode import DecodeResult, _sync, commit, stopped
+ 
+ DUMP_ENV = "TF_GLM_DRAFT_DUMP"
+ TARGET_K = 32          # the target's top candidates kept a row (>= top_k 20 + MARGIN 8, so its sample re-derives)
+-VERSION = 1
++VERSION = 2            # 2: the prompt's ids (``prompt``), for the copy-draft replay (``copy_sim``)
+ PROD_MOST, PROD_CONFIDENCE = 5, 0.3      # engine.DFLASH_POLICY, the chain recorded as ``prod_chain``
+ 
+ _count = 0
+@@ -105,7 +106,8 @@ def target_top(w, row: torch.Tensor, k: int = TARGET_K) -> tuple[np.ndarray, np.
+ 
+ @torch.no_grad()
+ def dump_decode(e, drafter, pending: int, count: int, sampling: Sampling | None, *, out_dir: Path | None,
+-                stop_eos: bool = False, on_tokens=None, meta: dict | None = None) -> DecodeResult:
++                stop_eos: bool = False, on_tokens=None, meta: dict | None = None,
++                prompt: Sequence[int] | None = None) -> DecodeResult:
+     """``serial_decode``'s tokens (one-row verifies), with the DFlash2 block run and recorded before each; rank 0
+     passes ``out_dir`` and writes the records there, every rank runs the same calls."""
+ 
+@@ -187,11 +189,12 @@ def dump_decode(e, drafter, pending: int, count: int, sampling: Sampling | None,
+                     top_p=float(sampling.top_p) if sampling is not None else 1.0,
+                     min_p=float(sampling.min_p) if sampling is not None else 0.0,
+                     sha256=hashlib.sha256(json.dumps(out).encode()).hexdigest()[:16])
+-        res.dump_path = str(write(out_dir, info, out, rec, depth, drafter.top_k))
++        res.dump_path = str(write(out_dir, info, out, rec, depth, drafter.top_k, prompt))
+     return res
+ 
+ 
+-def write(out_dir: Path, meta: dict, tokens: Sequence[int], rec: dict, depth: int, k: int) -> Path:
++def write(out_dir: Path, meta: dict, tokens: Sequence[int], rec: dict, depth: int, k: int,
++          prompt: Sequence[int] | None = None) -> Path:
+     """One request's records as a compressed .npz (written to a temporary name, then renamed)."""
+ 
+     global _count
+@@ -211,6 +214,7 @@ def write(out_dir: Path, meta: dict, tokens: Sequence[int], rec: dict, depth: in
+                   prod_chain=stack("prod_chain", (depth,), np.int32), tgt_ids=stack("tgt_ids", (TARGET_K,), np.int32),
+                   tgt_vals=stack("tgt_vals", (TARGET_K,), np.float32),
+                   tgt_lse=np.asarray(rec["tgt_lse"], dtype=np.float64).reshape(n))
++    arrays["prompt"] = np.asarray(list(prompt) if prompt is not None else [], dtype=np.int64)
+     if rec["cm0"]:                          # DSpark: the confidence head's Markov parts (edge0 / edges: Markov biases)
+         arrays.update(cm0=np.asarray(rec["cm0"], dtype=np.float64), cms=stack("cms", (max(depth - 1, 0), k), np.float64))
+     name = f"dump-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{_count:04d}"
+diff --git tensorfold/families/glm5_next/cuda/dspark.py tensorfold/families/glm5_next/cuda/dspark.py
+index dd723a4..208f29e 100644
+--- tensorfold/families/glm5_next/cuda/dspark.py
++++ tensorfold/families/glm5_next/cuda/dspark.py
+@@ -578,6 +578,57 @@ class Drafter(_DFlash2):
+             out = out[:best_depth(conf, round_ms)]
+         return out
+ 
++    def slot_scorer(self, tokens: np.ndarray, values: np.ndarray, hconf: np.ndarray, anchor: int, first: int,
++                    sampling: Sampling | None):
++        """``copy_drafts.Slot`` over a pass's candidates: ``chain``'s per-slot arithmetic (Markov bias after any of
++        the previous slot's candidates, keyed noise, the target filter, the confidence), memoized."""
++
++        sampled = sampling is not None and sampling.temperature > 0
++        temp = float(sampling.temperature) if sampled else 1.0
++        noise = None
++        if sampled:
++            noise = -np.log(-np.log(uniform_rows(sampling.seed, first + np.arange(tokens.shape[0]), tokens)))
++        memo: dict[tuple[int, int], tuple[np.ndarray, float]] = {}
++
++        def slot(d: int, prev: int) -> tuple[np.ndarray, float]:
++            key = (d, prev if d else -1)
++            if key in memo:
++                return memo[key]
++            emb = self.markov_embed(anchor if d == 0 else int(tokens[d - 1, prev]))
++            score = (values[d] + self.markov_bias(tokens[d], emb)) / temp
++            pick = score + DSPARK_NOISE * noise[d] if noise is not None else score
++            if sampled and DSPARK_FILTER:
++                pick = np.where(target_kept(score, tokens[d], sampling), pick, -np.inf)
++            if self.conf_h is not None:
++                z = float(hconf[d]) + self.conf_b
++                if self.conf_m is not None and emb is not None:
++                    z += float(self.conf_m @ emb)
++                c = float(1.0 / (1.0 + np.exp(-z)))
++            else:
++                p = np.exp(score - score.max())
++                c = float(p[int(np.argmax(pick))] / p.sum())
++            memo[key] = (pick, c)
++            return memo[key]
++
++        return slot
++
++    def propose_hybrid(self, pending: int, conts, depth: int, sampling: Sampling | None, confidence: float = 0.0,
++                       *, rank: int = 1, most: int = 15, beta: float = 0.0,
++                       round_ms: tuple[float, ...] | None = None) -> tuple[list[int], str, int]:
++        """``copy_drafts.hybrid`` over this pass: every block slot vets the copy continuations ``conts`` (latest
++        first); DSpark's own chain (``depth`` drafts at most, ``propose``'s rule) where none agrees. (drafts, kind
++        "d" / "h" / "x", the continuation used or -1)."""
++
++        from .copy_drafts import hybrid
++
++        if self.context_end == 0:
++            return [], "d", -1
++        tokens, values, hconf = self.candidates(pending, self.block)
++        slot = self.slot_scorer(tokens, values, hconf, pending, self.context_end + 1, sampling)
++        drafts, kind, k, _ = hybrid(tokens, slot, conts, chain_most=min(depth, self.block), confidence=confidence,
++                                    round_ms=round_ms, rank=rank, most=most)
++        return drafts, kind, k
++
+     def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0, *,
+                 beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> list[int]:
+         """Up to ``depth`` (<= block) drafts for the positions after the pending token (at context_end). ``round_ms``
+diff --git tensorfold/families/glm5_next/cuda/dspark_sim.py tensorfold/families/glm5_next/cuda/dspark_sim.py
+index f160963..9098b6c 100644
+--- tensorfold/families/glm5_next/cuda/dspark_sim.py
++++ tensorfold/families/glm5_next/cuda/dspark_sim.py
+@@ -51,6 +51,7 @@ class Record:
+     noise: np.ndarray | None              # [n, D, K] or None (greedy)
+     prod: np.ndarray                      # [n, D] the production chain (-1 padded)
+     sampling: Sampling | None = field(default=None)
++    prompt: np.ndarray | None = field(default=None)     # the prompt's ids (dump version 2), else None
+ 
+ 
+ def load(path: Path) -> Record:
+@@ -64,7 +65,8 @@ def load(path: Path) -> Record:
+         s = Sampling(temperature=meta["temperature"], top_k=meta["top_k"], top_p=meta["top_p"], min_p=meta["min_p"],
+                      seed=meta["seed"])
+     return Record(meta, z["tokens"], z["cand_ids"].astype(np.int64), z["cand_vals"].astype(np.float64),
+-                  z["proj"].astype(np.float64), z["edge0"], z["cm0"], z["edges"], z["cms"], noise, z["prod_chain"], s)
++                  z["proj"].astype(np.float64), z["edge0"], z["cm0"], z["edges"], z["cms"], noise, z["prod_chain"], s,
++                  z["prompt"].astype(np.int64) if "prompt" in z.files else None)
+ 
+ 
+ def chain(r: Record, i: int, p: Policy) -> list[int]:
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 45761da..0778e7b 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -915,7 +915,8 @@ class GlmEngine:
+             verify_code = [verify_code]
+         # every rank must run the same calls: refuse to start when they were given different settings
+         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
+-                prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else [0, 0, 0, 0]) + \
++                prefill_rows, self.grid, KVB_KINDS.index(kvb)] + (self.copy.code() if self.copy is not None else
++                                                                  [0] * len(CopySettings().code())) + \
+             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+@@ -1053,6 +1054,13 @@ class GlmEngine:
+                     print(f"[tensorfold] note: a full {prefill_rows}-row prompt chunk runs unsplit at {world} ranks "
+                           "(only shorter ones split)", flush=True)
+         c = self.copy
++        if rank == 0 and c is not None and c.hybrid is not None:
++            h = c.hybrid
++            print(f"[tensorfold] copy drafts vetted by DSpark (TF_GLM_COPY_HYBRID): {h.match}-token matches, a copy "
++                  f"agreeing with its top {h.rank} at every block slot extends to {c.most} drafts; unvetted when "
++                  f"matching {h.trust_prompt or 'never'} (prompt) / {h.trust_reply or 'never'} (reply) tokens"
++                  + ("" if hasattr(self.drafter, "propose_hybrid") else "; inactive: the drafter is not DSpark"),
++                  flush=True)
+         if rank == 0 and (WIDE_GRAPHS or MAX_ROWS != 16 or (c is not None and (c.reply_match or c.miss_most))):
+             print(f"[tensorfold] verify windows up to {MAX_ROWS} rows, CUDA graphs for "
+                   f"{', '.join(map(str, GRAPH_ROWS + WIDE_GRAPHS))} rows (TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS)"
+@@ -1612,7 +1620,9 @@ class GlmEngine:
+         policy = decode_policy(code, self.costs)
+         copies = None
+         if policy is not None and self.copy is not None:     # prompt and pending token, alike on both ranks
+-            copies = self.copy.drafts(list(prompt) + [first])
++            # TF_GLM_COPY_HYBRID: only dflash_decode with a DSpark drafter vets copies (``decode.hybrid_round``)
++            hybrid = use_dflash and not auto and hasattr(self.drafter, "propose_hybrid")
++            copies = self.copy.drafts(list(prompt) + [first], hybrid=hybrid)
+         if policy is None:
+             res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
+         elif self.dump is not None and drafter is not None:      # serial's reply, the drafter's view recorded
+@@ -1622,7 +1632,8 @@ class GlmEngine:
+                 prompt_tokens=len(prompt), cached=cut, policy=list(code), images=feed is not None,
+                 prompt_sha256=hashlib.sha256(json.dumps(list(prompt)).encode()).hexdigest()[:16])
+             res = dump_decode(self.e, drafter, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
+-                              out_dir=self.dump if self.rank == 0 else None, meta=meta)
++                              out_dir=self.dump if self.rank == 0 else None, meta=meta,
++                              prompt=list(prompt) if self.rank == 0 else None)
+             if self.rank == 0:
+                 stats["draft_dump"] = res.dump_path
+         elif auto:

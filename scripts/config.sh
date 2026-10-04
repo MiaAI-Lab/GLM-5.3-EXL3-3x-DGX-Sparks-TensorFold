@@ -133,6 +133,10 @@ COPY="${COPY:-1}"
 export TF_GLM_COPY_DRAFTS="$COPY"
 COPY_MAX="${COPY_MAX:-15}"
 export TF_GLM_COPY_MAX="$COPY_MAX"
+# Copies checked by DSpark (0140): a copy that DSpark agrees with extends past its block, a partial one hands over to
+# DSpark's chain (same replies; +8% on prose edits, +4% on JSON edits, 0 on plain text: boots cpyon / cp500b).
+COPY_HYBRID="${COPY_HYBRID:-1}"
+export TF_GLM_COPY_HYBRID="$COPY_HYBRID"
 # Conversations sharing a system prompt reuse its prompt state (same replies).
 SHARED_PREFIX="${SHARED_PREFIX:-1}"
 export TF_GLM_SHARED_PREFIX="$SHARED_PREFIX"

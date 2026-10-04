@@ -58,3 +58,10 @@
   against fp4's 39,072 (~24% more context in the same memory, ~618k instead of 499,712 under CP). Quality suite
   against fp4 (boot fp4x500): equal on short questions, arithmetic and Python tasks, ledger tracking 31/40 against
   35/40 (p 0.34, not significant). `fp4` stays the long-context setting.
+- Concurrent requests with CUDA graphs (0138 segmented kernels a stream, 0139 graphs of the batched windows): boot
+  par2g 37.8 tok/s for two requests together (eager 35.5-35.9), par4g 48.2 tok/s for four (12.1-14.0 each); exact
+  12/12 and the same reply hashes alone and together. GPU tests 21/21 (multi kernels, multi graphs, fp4x).
+- Copy drafts checked by DSpark (0140, `COPY_HYBRID=1` by default): +8.4% on prose edits, +3.6% on JSON edits, 0 on
+  plain text (boots cpyon / cp500b, every reply identical with it on and off).
+- Tried and not adopted: 12 variants of the decode expert kernels (fused epilogues, one prep launch, 4-tile CTAs,
+  higher occupancy): all bit-identical, none faster than ~1% on 3-9-row windows (GPU bench, 2026-10-04).

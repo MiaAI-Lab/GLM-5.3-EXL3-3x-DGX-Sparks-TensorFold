@@ -1,0 +1,696 @@
+diff --git tensorfold/families/glm5_next/cuda/dsa_full.py tensorfold/families/glm5_next/cuda/dsa_full.py
+index e5cd29a..7bf6550 100644
+--- tensorfold/families/glm5_next/cuda/dsa_full.py
++++ tensorfold/families/glm5_next/cuda/dsa_full.py
+@@ -48,12 +48,16 @@ def _rotate(x_even, x_odd, pos, FREQ, HALF: tl.constexpr):
+ 
+ 
+ @triton.jit
+-def _q_rope(Q, q_stride, head_stride, OUT, POS, FREQ, H: tl.constexpr, OFF: tl.constexpr, HALF: tl.constexpr):
++def _q_rope(Q, q_stride, head_stride, OUT, POS, FREQ, H: tl.constexpr, OFF: tl.constexpr, HALF: tl.constexpr,
++            SEG: tl.constexpr = 0):
+     """Program (row, head): the head's rotary dims Q[r, h, OFF:OFF + 2 HALF] (interleaved pairs) at position
+-    pos + r -> OUT[r, h, :] (half-split, bf16)."""
++    pos + r -> OUT[r, h, :] (half-split, bf16). SEG: the row's own position POS[r] (several streams' rows)."""
+     r = tl.program_id(0)
+     h = tl.program_id(1)
+-    pos = tl.load(POS) + r
++    if SEG:
++        pos = tl.load(POS + r)
++    else:
++        pos = tl.load(POS) + r
+     i = tl.arange(0, HALF)
+     base = Q + r * q_stride + h * head_stride + OFF
+     xe = tl.load(base + 2 * i).to(tl.float32)
+@@ -80,12 +84,15 @@ def q_rope(q: torch.Tensor, out: torch.Tensor, pos: torch.Tensor, freq: torch.Te
+ 
+ 
+ @triton.jit
+-def _qi_rope(QI, q_stride, POS, FREQ, D: tl.constexpr, HALF: tl.constexpr):
++def _qi_rope(QI, q_stride, POS, FREQ, D: tl.constexpr, HALF: tl.constexpr, SEG: tl.constexpr = 0):
+     """Program (row, head): the head's first 2 HALF dims of QI[r, h D:(h + 1) D] rotated in place at pos + r
+-    (interleaved pairs in, half-split out; the program reads the pairs before it writes them)."""
++    (interleaved pairs in, half-split out; the program reads the pairs before it writes them). SEG: at POS[r]."""
+     r = tl.program_id(0)
+     h = tl.program_id(1)
+-    pos = tl.load(POS) + r
++    if SEG:
++        pos = tl.load(POS + r)
++    else:
++        pos = tl.load(POS) + r
+     i = tl.arange(0, HALF)
+     base = QI + r * q_stride + h * D
+     xe = tl.load(base + 2 * i).to(tl.float32)
+@@ -177,17 +184,22 @@ def k_rope_write(k: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, freq:
+ 
+ @triton.jit
+ def _index_write(KR, k_stride, LNW, LNB, IK, POS, FREQ, eps, RANK, D: tl.constexpr, HALF: tl.constexpr,
+-                 CP: tl.constexpr = 1, OUTR: tl.constexpr = 0):
++                 CP: tl.constexpr = 1, OUTR: tl.constexpr = 0, BASE=None, SEG: tl.constexpr = 0):
+     """Row r: LayerNorm(k_raw[r, :D]) (fp32 statistics, weight and bias), rounded to bf16 as the bf16 LayerNorm
+     returns it, then RoPE on its first 2 HALF dims at position pos + r -> IK[pos + r] (bf16). CP > 1: only
+     positions p with p % CP == RANK, at row p // CP. OUTR (TF_GLM_KV=fp4x's first pass): every row r into IK[r] (a
+-    bf16 scratch the encoder reads); the arithmetic is the same code either way."""
++    bf16 scratch the encoder reads); the arithmetic is the same code either way. SEG (several streams' rows, not with
++    CP): position POS[r], at row BASE[r] + POS[r] (OUTR: still row r)."""
+     r = tl.program_id(0)
+-    pos = tl.load(POS) + r
+-    slot = pos.to(tl.int64)
++    if SEG:
++        pos = tl.load(POS + r)
++        slot = tl.load(BASE + r).to(tl.int64) + pos.to(tl.int64)
++    else:
++        pos = tl.load(POS) + r
++        slot = pos.to(tl.int64)
+     if OUTR:
+         slot = r.to(tl.int64)
+-    elif CP > 1:
++    elif CP > 1:                          # (SEG callers pass CP 1)
+         if slot % CP != RANK:
+             return
+         slot = slot // CP
+@@ -288,14 +300,21 @@ def _order_key(s):
+ 
+ 
+ @triton.jit
+-def _select(S, s_stride, TOK, CNT, POS, NT, K: tl.constexpr, BLOCK: tl.constexpr):
++def _select(S, s_stride, TOK, CNT, POS, NT, K: tl.constexpr, BLOCK: tl.constexpr, CAP=None,
++            SEG: tl.constexpr = 0):
+     """Program r: the K best of the row's first min(NT, max(pos + r + 1, K)) scores by a radix select (8 bits a
+     pass), ties to the lower token, written ascending into TOK[r] (int32); CNT[r] = K when the row sees more than K
+-    tokens (sparse), else 0 (the row keeps dense attention and nothing reads its list)."""
++    tokens (sparse), else 0 (the row keeps dense attention and nothing reads its list). SEG (several streams' rows):
++    the row's own position POS[r] and extent capacity CAP[r], its first min(NT, CAP[r], max(POS[r] + 1, K)) scores
++    (the columns a lone window's bucket covers: the same scores, so the same tokens; ``select_rows``)."""
+     r = tl.program_id(0).to(tl.int64)
+     row = S + r * s_stride
+-    vis = tl.load(POS) + r + 1
+-    NP = tl.minimum(NT, tl.maximum(vis, K))
++    if SEG:
++        vis = tl.load(POS + r) + 1
++        NP = tl.minimum(tl.minimum(NT, tl.load(CAP + r)), tl.maximum(vis, K))
++    else:
++        vis = tl.load(POS) + r + 1
++        NP = tl.minimum(NT, tl.maximum(vis, K))
+     bins = tl.arange(0, 256)
+     prefix = tl.zeros((), dtype=tl.uint32)
+     fixed = tl.zeros((), dtype=tl.uint32)
+@@ -451,6 +470,167 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos:
+     return tokens, counts
+ 
+ 
++# -- several streams' rows in one launch (multi-stream verify windows) --------------------------------------------
++# A window of several streams' rows back to back, each stream's per-token caches in its own extent of shared planes:
++# per-row device tables (``full_seg.FullRows``: position in the stream ``pos``, extent base ``base``, extent capacity
++# ``cap``) replace the single-stream kernels' one position (POS[0] + r). Each row keeps its single-stream kernel's
++# arithmetic (the same functions, tiles and masks), so it gets the bits of its stream's window run alone; the caches
++# passed are the whole planes (a stream's token t at row base + t).
++
++def q_rope_rows(q: torch.Tensor, out: torch.Tensor, pos: torch.Tensor, freq: torch.Tensor, offset: int) -> torch.Tensor:
++    """``q_rope`` with each row at its own position ``pos`` [>= R] (device int32)."""
++
++    R, H = q.shape[0], q.shape[1]
++    half = freq.numel()
++    if out.shape[0] < R or out.shape[1] != H or out.shape[2] != 2 * half or not out.is_contiguous():
++        raise ValueError(f"q_rope_rows: out {tuple(out.shape)} for {R} rows of {H} heads, {2 * half} rotary dims")
++    if q.stride(2) != 1 or pos.numel() < R:
++        raise ValueError("q_rope_rows: a head's dims contiguous, a position a row")
++    if R:
++        _q_rope[(R, H)](q, q.stride(0), q.stride(1), out, pos, freq, H=H, OFF=int(offset), HALF=half, SEG=1,
++                        num_warps=1)
++    return out
++
++
++def index_q_rope_rows(qi: torch.Tensor, heads: int, pos: torch.Tensor, freq: torch.Tensor) -> torch.Tensor:
++    """``index_q_rope`` with each row at its own position ``pos`` [>= R] (device int32), in place."""
++
++    R = qi.shape[0]
++    D = qi.shape[1] // heads
++    if qi.stride(1) != 1 or qi.dtype != torch.bfloat16 or 2 * freq.numel() > D or pos.numel() < R:
++        raise ValueError("index_q_rope_rows: bf16 rows of heads x dims, unit stride, a position a row")
++    if R:
++        _qi_rope[(R, heads)](qi, qi.stride(0), pos, freq, D=D, HALF=freq.numel(), SEG=1, num_warps=1)
++    return qi
++
++
++def k_rope_write_rows(k: torch.Tensor, plane: torch.Tensor, pos: torch.Tensor, base: torch.Tensor,
++                      freq: torch.Tensor, latent: torch.Tensor | None = None) -> None:
++    """``k_rope_write`` with row r rotated at pos[r] into plane row base[r] + pos[r] (its stream's extent).
++    TF_GLM_KV=fp4x: the plane's e4m3 codes, each row's scale into ``latent`` (the layer's FP4 latent plane) at the
++    same row, as ``k_rope_write``."""
++
++    half = freq.numel()
++    if k.shape[1] < 2 * half or k.stride(1) != 1 or plane.dtype not in (torch.bfloat16, torch.uint8) \
++            or plane.shape[1] != 2 * half:
++        raise ValueError(f"k_rope_write_rows: rows of {k.shape[1]} into a plane of {tuple(plane.shape)}")
++    KR, LS, LRS, RSW, R8 = rope8_args(plane, latent)
++    if R8:
++        KR = plane                       # code bytes (kv8.e4m3_code), as k_rope_write
++    if k.shape[0]:
++        _k_rope_write[(k.shape[0],)](k, k.stride(0), KR, pos, base, freq, 0, HALF=half, SEG=True, LS=LS, LRS=LRS,
++                                     RSW=RSW, R8=R8, num_warps=1)
++
++
++def index_write_rows(k_raw: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor, plane: torch.Tensor,
++                     pos: torch.Tensor, base: torch.Tensor, freq: torch.Tensor, eps: float = 1e-6) -> None:
++    """``index_write`` with row r's key (rotated at pos[r]) into plane row base[r] + pos[r]. TF_GLM_KV=fp4x: as
++    ``index_write``, two passes: the bf16 kernel's rows into a scratch [R, D] (OUTR), then ``kv8.quant_rows8`` to
++    rows base[r] + pos[r] (the one encoder: the bytes of the single-stream write)."""
++
++    D = kv8.index_width(plane)
++    if plane.dtype not in (torch.bfloat16, torch.uint8) or not plane.is_contiguous() or k_raw.stride(1) != 1 \
++            or k_raw.shape[1] < D:
++        raise ValueError("index_write_rows: bf16 (or fp4x) key rows, contiguous")
++    R = k_raw.shape[0]
++    if not R:
++        return
++    if not kv8.index8(plane):
++        _index_write[(R,)](k_raw, k_raw.stride(0), ln_w, ln_b, plane, pos, freq, float(eps), 0, D=D,
++                           HALF=freq.numel(), BASE=base, SEG=1, num_warps=1)
++        return
++    rows = torch.empty((R, D), dtype=torch.bfloat16, device=plane.device)
++    _index_write[(R,)](k_raw, k_raw.stride(0), ln_w, ln_b, rows, pos, freq, float(eps), 0, D=D, HALF=freq.numel(),
++                       OUTR=1, BASE=base, SEG=1, num_warps=1)
++    kv8.quant_rows8(rows, plane, plane.view(torch.float32), pos, rs=D + 4, srs=(D + 4) // 4, sw=D // 4, base=base)
++
++
++@triton.jit
++def _scores_rows(QI, W, w_stride, KEYS, OUT, o_stride, POS, BASE, CAP, NT, scale, wscale, K: tl.constexpr,
++                 H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, BTT: tl.constexpr, G: tl.constexpr, KS=None,
++                 K8: tl.constexpr = 0):
++    """Program (row, g): _scores (RB = 1) for a row of its own stream: its keys from KEYS row BASE[r], visible
++    through POS[r]; token blocks g, g + G, .. of the NP = min(NT, CAP[r], max(POS[r] + 1, K)) columns its selection
++    reads (-inf past its position). Each block's dot is _scores' [HP, BTT] tile with its masks, so every score has
++    the lone window's bits (K8, TF_GLM_KV=fp4x: ``key_tile``'s exact bf16 rows from the e4m3 codes and scales)."""
++    r = tl.program_id(0)
++    g = tl.program_id(1)
++    P = tl.load(POS + r)
++    B = tl.load(BASE + r).to(tl.int64)
++    n = P + 1
++    NP = tl.minimum(tl.minimum(NT, tl.load(CAP + r)), tl.maximum(n, K))
++    d = tl.arange(0, D)
++    hh = tl.arange(0, HP)
++    hok = hh < H
++    nb = (NP + BTT - 1) // BTT
++    for tb in range(g, nb, G):
++        t = tb * BTT + tl.arange(0, BTT)
++        if tb * BTT >= n:
++            tl.store(OUT + r * o_stride + t, float("-inf"), mask=t < NP)
++        else:
++            k = key_tile(KEYS, KS, B + t.to(tl.int64), t < n, d, D, K8)                                 # [BTT, D]
++            q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
++            kr = tl.where((t < n)[:, None], k, 0.0)
++            dots = tl.dot(q, tl.trans(kr))                                                            # [HP, BTT]
++            w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
++            sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
++            tl.store(OUT + r * o_stride + t, tl.where(t < n, sc, float("-inf")), mask=t < NP)
++
++
++def rows_bucket(vis_max: int, cap_max: int) -> int:
++    """Token columns a window of several streams scores (``bucket`` over its rows: the longest visible context
++    rounded up to a power of two, at least MIN_BUCKET, at most the largest extent): one of ``buckets(cap_max)``, the
++    CUDA graphs' second key beside the row count."""
++    return min(int(cap_max), max(MIN_BUCKET, 1 << (int(vis_max) - 1).bit_length()))
++
++
++def score_rows(qi: torch.Tensor, wts: torch.Tensor, plane: torch.Tensor, pos: torch.Tensor, base: torch.Tensor,
++               cap: torch.Tensor, R: int, NT: int, out: torch.Tensor, k: int = TOPK) -> torch.Tensor:
++    """fp32 scores of R rows, each over its own stream's keys (plane rows base[r] ..) through pos[r]: out[r, :NP_r]
++    with NP_r = min(NT, cap[r], max(pos[r] + 1, k)) (the columns ``select_rows`` reads; the rest untouched)."""
++
++    H = wts.shape[1]
++    D = kv8.index_width(plane)
++    if qi.shape[1] != H * D or not qi.is_contiguous() or wts.stride(1) != 1 \
++            or plane.dtype not in (torch.bfloat16, torch.uint8) or not plane.is_contiguous():
++        raise ValueError("index scores: contiguous index queries [R, H * D], unit-stride weights, bf16 (or fp4x) keys")
++    KEYS, KS, K8 = key_args(plane)
++    if out.shape[1] < NT or out.stride(1) != 1:
++        raise ValueError(f"score_rows: {NT} columns into scores of {tuple(out.shape)}")
++    if R:
++        g = min(ROW_G, triton.cdiv(NT, BT))
++        _scores_rows[(R, g)](qi, wts, wts.stride(0), KEYS, out, out.stride(0), pos, base, cap, int(NT), D ** -0.5,
++                             _wscale(H), K=int(k), H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BTT=BT, G=g,
++                             KS=KS, K8=K8, num_warps=4)
++    return out
++
++
++def select_rows(scores: torch.Tensor, pos: torch.Tensor, cap: torch.Tensor, R: int, NT: int, tokens: torch.Tensor,
++                counts: torch.Tensor, k: int = TOPK) -> None:
++    """``select`` for rows of several streams: row r's k best of its first min(NT, cap[r], max(pos[r] + 1, k))
++    scores, ascending stream-local tokens (ties to the lower one), counts k for rows that see more than k tokens."""
++
++    if R == 0:
++        return
++    if k > MIN_BUCKET:
++        raise ValueError(f"select_rows: top-{k} past the smallest bucket {MIN_BUCKET}")
++    block, warps = (4096, 8) if NT > 1024 else (1024, 4)
++    _select[(R,)](scores, scores.stride(0), tokens, counts, pos, int(NT), K=k, BLOCK=block, CAP=cap, SEG=1,
++                  num_warps=warps)
++
++
++def select_tokens_rows(qi: torch.Tensor, wts: torch.Tensor, plane: torch.Tensor, pos: torch.Tensor,
++                       base: torch.Tensor, cap: torch.Tensor, R: int, NT: int, scores: torch.Tensor,
++                       tokens: torch.Tensor, counts: torch.Tensor, k: int = TOPK) -> tuple[torch.Tensor, torch.Tensor]:
++    """The DSA selection of R rows of several streams (``select_tokens`` of a decode window, a row at a time over
++    its own stream): tokens[:R] [R, k] int32 (stream-local, ascending) and counts[:R]. ``NT``: the window's bucket
++    (``rows_bucket``), at least every row's columns; ``scores`` [>= R, >= NT] fp32 scratch."""
++
++    score_rows(qi, wts, plane, pos, base, cap, R, NT, scores, k)
++    select_rows(scores, pos, cap, R, NT, tokens, counts, k)
++    return tokens[:R], counts[:R]
++
++
+ # -- the embedding split by vocabulary rows over the ranks -------------------------------------------------------------
+ 
+ @triton.jit
+diff --git tensorfold/families/glm5_next/cuda/full_seg.py tensorfold/families/glm5_next/cuda/full_seg.py
+new file mode 100644
+index 0000000..c430469
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/full_seg.py
+@@ -0,0 +1,230 @@
++"""Full GLM-5.3's multi-stream attention in one launch per piece (multi-stream milestone 3, the kernel layer).
++
++A verify window of several streams' rows back to back ([s1: rows][s2: rows]...; ``verify.FullBatchedVerify``), each
++stream's caches in its own extent of the shared ``forward.Caches`` planes (non-CP: a stream's token t at plane row
++base + t of every latent, rotary and index plane). ``FullRows`` holds per row, on the device, its position in its
++stream, its extent's base and capacity, and whether it attends sparsely; ``dsa_full_seg_rows`` then runs one layer's
++attention between ``forward.dsa_full_front`` and ``forward.dsa_full_out`` for ALL rows with one launch per piece:
++
++- cache writes (latents, rotary keys, index keys) at base[r] + pos[r] (``latent.latent_write_rows``,
++  ``dsa_full.k_rope_write_rows`` / ``index_write_rows``), query and indexer-query RoPE at pos[r]
++  (``dsa_full.q_rope_rows`` / ``index_q_rope_rows``);
++- the selection (full indexer layers): each row scores its own stream's index keys through its position and
++  selects its top-k, stream-local tokens with ties to the lower one (``dsa_full.select_tokens_rows``); a single
++  selection [R, k] carries through the shared indexer layers (each row its own);
++- dense and sparse latent attention with the rotary plane in one chunk pass and one merge
++  (``latent.attention_rows``).
++
++Bits: every per-row kernel is its single-stream kernel's code with the row's position / base read from the tables
++instead of POS[0] + r (the same functions, tiles, masks, accumulation order, launch widths), the row-independent ones
++(the indexer's projections, the absorb) are the lone window's on more rows (qmm and the absorb keep rows apart up to
++16), the selection reads exactly the columns a lone window's bucket reads (the rest are -inf either way), and the
++attention merges a row's chunks in the same order (chunks past its keys are empty, merged as nothing). So each
++stream's rows get the bits of its window run alone (``verify.FullBatchedVerify``'s per-segment loop;
++tests/cpu/test_multi_kernels.py).
++
++CUDA graphs: every launch's shape is a function of the window's total rows R and the selection's token bucket NT
++alone (``rows_bucket``; 0: no row is sparse, no selection), everything else is in device tables that ``FullRows.set``
++refreshes before a replay (pinned copy, ordered on the stream), and the scratch (``RowsScratch``: scores, token lists,
++counts) is static: a graph per (R, NT) serves every mix of streams, positions and extents. ``FullSegVerify`` is the
++eager verifier on these pieces (``FullBatchedVerify``'s interface)."""
++
++from __future__ import annotations
++
++from typing import Sequence
++
++import torch
++
++from . import dsa_full, latent, prof
++from .verify import FullBatchedVerify, Segment, Verified
++
++
++class FullRows:
++    """Device tables of a window of up to ``rows`` rows (one int32 tensor [4, rows], a pinned host twin): per row
++    ``pos`` (its position in its stream), ``base`` (its stream's extent's first plane row), ``cap`` (the extent's
++    capacity: the tokens its selection may score) and ``sparse`` (1: attends to its selected tokens; 0: dense over
++    keys 0 .. pos). Rows past the window's R are left as they were (no launch reads them)."""
++
++    def __init__(self, rows: int, device) -> None:
++        self.rows = int(rows)
++        pin = torch.cuda.is_available() and torch.device(device).type == "cuda"
++        self.host = torch.zeros((4, self.rows), dtype=torch.int32, pin_memory=pin)
++        self.dev = torch.zeros((4, self.rows), dtype=torch.int32, device=device)
++        self.pos, self.base, self.cap, self.sparse = self.dev.unbind(0)
++        self.staged = torch.cuda.Event() if pin else None
++        self.R = 0
++        self.vis_max = 0
++        self.cap_max = 0
++        self.any_sparse = False
++
++    def fill(self, segments: Sequence[tuple[int, int, int, int]], *, dense_limit: int, indexed: bool):
++        """Host tables [4, rows] (numpy int32) and R for ``segments`` [(base, pos, rows, capacity)] in window order:
++        a row at position p is sparse when the engine has index caches and p >= ``dense_limit`` (full GLM-5.3's
++        top-k: exactly the rows that see more than k tokens)."""
++
++        R = sum(int(seg[2]) for seg in segments)
++        if not segments or R > self.rows:
++            raise ValueError(f"a window of {R} rows in {len(segments)} segments, the tables hold {self.rows}")
++        t = torch.zeros((4, self.rows), dtype=torch.int32).numpy()
++        r = 0
++        for k, (base, pos, n, cap) in enumerate(segments):
++            if n < 1 or pos < 0 or base < 0 or pos + n > cap:
++                raise ValueError(f"segment {k}: base {base}, position {pos}, {n} rows, capacity {cap}")
++            for i in range(n):
++                t[0, r + i] = pos + i
++                t[1, r + i] = base
++                t[2, r + i] = cap
++                t[3, r + i] = int(indexed and pos + i >= dense_limit)
++            r += n
++        return t, R
++
++    def set(self, segments: Sequence[tuple[int, int, int, int]], *, dense_limit: int, indexed: bool) -> int:
++        """Stage ``segments`` [(base, pos, rows, capacity)] into the device tables; returns the window's rows."""
++
++        t, R = self.fill(segments, dense_limit=dense_limit, indexed=indexed)
++        if self.staged is not None:
++            self.staged.synchronize()            # the previous copy has left the pinned buffer
++        self.host.numpy()[:] = t
++        self.dev.copy_(self.host, non_blocking=True)
++        if self.staged is not None:
++            self.staged.record()
++        self.R = R
++        self.vis_max = max(int(base_pos[1]) + int(base_pos[2]) for base_pos in segments)
++        self.cap_max = max(int(seg[3]) for seg in segments)
++        self.any_sparse = bool(t[3, :R].any())
++        return R
++
++    def bucket(self, capacity: int | None = None) -> int:
++        """The selection's token columns for the staged window (``dsa_full.rows_bucket`` of its longest visible
++        context, at most ``capacity``: default the largest staged extent), 0 when no row is sparse: with R the
++        CUDA graphs' key."""
++
++        if not self.any_sparse:
++            return 0
++        return dsa_full.rows_bucket(self.vis_max, self.cap_max if capacity is None else capacity)
++
++
++class RowsScratch:
++    """The selection's static buffers for windows of up to ``rows`` rows over extents of up to ``capacity`` tokens:
++    fp32 scores [rows, capacity], token lists [rows, k] int32, counts [rows] int32 (a graph's selection lands in
++    the same tensors every replay; the lists carry through the shared indexer layers)."""
++
++    def __init__(self, rows: int, capacity: int, k: int, device) -> None:
++        self.rows, self.capacity, self.k = int(rows), int(capacity), int(k)
++        self.scores = torch.empty((self.rows, self.capacity), dtype=torch.float32, device=device)
++        self.tokens = torch.zeros((self.rows, self.k), dtype=torch.int32, device=device)
++        self.counts = torch.zeros((self.rows,), dtype=torch.int32, device=device)
++
++
++def planes(caches, layer: int, dsa_index: dict, index_of: dict):
++    """The whole planes layer ``layer`` reads: latents, rotary keys and (full indexer layers of an engine with
++    index caches) index keys, or None."""
++
++    ps = caches.arena.planes
++    di = dsa_index[layer]
++    keys = None
++    if caches.index is not None and layer in index_of:
++        keys = ps[caches.index[index_of[layer]][2]].tensor
++    return ps[caches.kc[di]].tensor, ps[caches.kr[di]].tensor, keys
++
++
++def dsa_full_seg_rows(layer, w, b, rows: FullRows, R: int, lc: torch.Tensor, kr: torch.Tensor,
++                      keys: torch.Tensor | None, NT: int, sel: RowsScratch | None, topk=None, *,
++                      indexed: bool = True):
++    """``forward.dsa_full_rows`` for ALL rows 0 .. R of a window of several streams at once (their fronts done):
++    ``rows`` the device tables (``FullRows``), ``lc`` / ``kr`` / ``keys`` the layer's whole latent, rotary and index
++    planes (``planes``), ``NT`` the selection's bucket (``FullRows.bucket``; 0: no sparse row), ``sel`` its scratch.
++    Writes every row's latent, rotary and (full indexer layer) index keys into its stream's extent, rotates the
++    queries at their own positions, selects on a full indexer layer, absorbs, attends: b.lat_s.ol[:R].
++
++    ``topk``: the window's (tokens, counts) from the last full indexer layer, which a shared layer reuses. Returns the
++    selection to carry: this layer's on a full indexer layer (None when NT is 0), else ``topk`` unchanged. One
++    launch per piece; the shapes depend on R and NT only (CUDA graphs)."""
++
++    from .forward import mm
++
++    c = w.cfg
++    a = layer.dsa
++    l0 = c.q_lora + c.kv_lora
++    freq = w.meta["rope_freq"]
++    if int(w.meta.get("cp", 1)) > 1:
++        raise ValueError("segmented full GLM-5.3 rows: no context parallelism (one extent at base 0)")
++    if c.dense_limit != c.index_topk:
++        raise ValueError("segmented full GLM-5.3 rows: sparse rows are those past index_topk (kpool 1)")
++    with prof.timed("dsa: latent write"):
++        latent.latent_write_rows(b.lat[:R], lc, rows.pos, rows.base)
++        dsa_full.k_rope_write_rows(b.dp[:R, l0:], kr, rows.pos, rows.base, freq, latent=lc)
++    qp = dsa_full.q_rope_rows(b.q[:R], b.qp[:R], rows.pos, freq, c.nope)
++    sparse_rows = indexed and NT > 0
++    ix = a.index
++    if ix is not None and keys is not None:
++        with prof.timed("dsa: indexer update"):
++            mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
++            dsa_full.index_write_rows(b.ikr[:R, :c.index_dim], ix.ln_w, ix.ln_b, keys, rows.pos, rows.base, freq)
++        topk = None
++        if sparse_rows:
++            if sel is None or sel.rows < R or sel.capacity < NT or sel.k != c.index_topk:
++                raise ValueError(f"segmented selection: {R} rows, {NT} columns, top-{c.index_topk} past the scratch")
++            with prof.timed("dsa: select tokens"):
++                mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
++                dsa_full.index_q_rope_rows(b.qi[:R], c.index_heads, rows.pos, freq)
++                topk = dsa_full.select_tokens_rows(b.qi[:R], b.ikr[:R, c.index_dim:], keys, rows.pos, rows.base,
++                                                   rows.cap, R, NT, sel.scores, sel.tokens, sel.counts,
++                                                   k=c.index_topk)
++    elif sparse_rows and topk is None:
++        raise RuntimeError(f"layer {layer.index}: a shared indexer layer without a full layer's top-k before it")
++    s = b.lat_s
++    with prof.timed("dsa: absorb"):
++        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
++    tokens, counts = topk if sparse_rows else (None, None)
++    with prof.timed("dsa: attention"):
++        latent.attention_rows(qa, lc, kr, qp, rows.pos, rows.base, rows.sparse, tokens, counts, s,
++                              scale=c.qk_dim ** -0.5, nch=min(s.nch, latent.rows_chunks(c.dense_limit, c.index_topk)),
++                              out=s.ol[:R])
++    return topk
++
++
++class FullSegVerify(FullBatchedVerify):
++    """``FullBatchedVerify`` (the same ``forward`` / ``commit``, the same bits) with each layer's attention on every
++    segment's rows at once (``dsa_full_seg_rows``) instead of a call per segment: the window's tables staged once a
++    forward (``FullRows``), the selection's scratch static (``RowsScratch``). Eager; the launches are those a CUDA
++    graph keyed (R, NT) would capture. ``capacity``: the largest extent a stream may hold (default the pool's
++    rows)."""
++
++    def __init__(self, e, *, taps: Sequence[int] = (), rows: int | None = None, capacity: int | None = None) -> None:
++        from .verify import FULL_MAX_ROWS
++
++        super().__init__(e, taps=taps, rows=FULL_MAX_ROWS if rows is None else rows)
++        w = self.w
++        self.meta = FullRows(self.rows_max, w.device)
++        cap = int(e.caches.rows if capacity is None else capacity)
++        self.sel = (RowsScratch(self.rows_max, cap, w.cfg.index_topk, w.device) if e.caches.index is not None
++                    else None)
++        self.NT = 0
++        self.seg_topk = None
++
++    @torch.no_grad()
++    def forward(self, segments: Sequence[Segment]) -> Verified:
++        self._check(segments)
++        c = self.w.cfg
++        st0 = segments[0].st
++        self.indexed = st0.index is not None
++        self.meta.set([(s.st.base, s.st.pos, len(s.tokens), s.st.capacity) for s in segments],
++                      dense_limit=c.dense_limit, indexed=self.indexed)
++        self.NT = self.meta.bucket(self.sel.capacity if self.sel is not None else None) if self.indexed else 0
++        self.dsa_index, self.index_of = st0.dsa_index, st0.index_of
++        self.seg_topk = None
++        return super().forward(segments)
++
++    def _mixer(self, layer):
++        from .forward import dsa_full_front, dsa_full_out
++
++        if layer.kind != "dsa":
++            raise ValueError(f"layer {layer.index}: full GLM-5.3 has attention layers only")
++        w, b, R = self.w, self.b, self.R
++        with prof.timed("dsa (total)"):
++            dsa_full_front(layer, w, b, 0, R)
++            lc, kr, keys = planes(self.e.caches, layer.index, self.dsa_index, self.index_of)
++            self.seg_topk = dsa_full_seg_rows(layer, w, b, self.meta, R, lc, kr, keys, self.NT, self.sel,
++                                              self.seg_topk, indexed=self.indexed)
++            return dsa_full_out(layer, w, b, R)
+diff --git tensorfold/families/glm5_next/cuda/kv8.py tensorfold/families/glm5_next/cuda/kv8.py
+index 294718c..d4e9f2d 100644
+--- tensorfold/families/glm5_next/cuda/kv8.py
++++ tensorfold/families/glm5_next/cuda/kv8.py
+@@ -423,13 +423,16 @@ def e4m3_code(v):
+ 
+ @triton.jit
+ def _quant_rows8(SRC, src_stride, VALS, SCL, POS, RANK, W: tl.constexpr, RS: tl.constexpr, SRS: tl.constexpr,
+-                 SW: tl.constexpr, CP: tl.constexpr):
++                 SW: tl.constexpr, CP: tl.constexpr, BASE=None, SEG: tl.constexpr = 0):
+     """Row r of bf16 rows SRC -> its e4m3 codes at row pos + r of VALS (uint8, rows RS bytes apart) and its
+     power-of-two scale at fp32 word SW of row pos + r of SCL (rows SRS words apart). CP > 1: only positions p with
+-    p % CP == RANK, at row p // CP."""
++    p % CP == RANK, at row p // CP. SEG (several streams' rows, not with CP): row BASE[r] + POS[r]."""
+     r = tl.program_id(0)
+-    row = (tl.load(POS) + r).to(tl.int64)
+-    if CP > 1:
++    if SEG:
++        row = tl.load(BASE + r).to(tl.int64) + tl.load(POS + r).to(tl.int64)
++    else:
++        row = (tl.load(POS) + r).to(tl.int64)
++    if CP > 1:                            # (SEG callers pass CP 1)
+         if row % CP != RANK:
+             return
+         row = row // CP
+@@ -441,14 +444,18 @@ def _quant_rows8(SRC, src_stride, VALS, SCL, POS, RANK, W: tl.constexpr, RS: tl.
+ 
+ 
+ def quant_rows8(src: torch.Tensor, vals: torch.Tensor, scl: torch.Tensor, pos: torch.Tensor, *, rs: int, srs: int,
+-                sw: int, cp: int = 1, rank: int = 0) -> None:
++                sw: int, cp: int = 1, rank: int = 0, base: torch.Tensor | None = None) -> None:
+     """bf16 rows src [R, W] -> e4m3 rows of a uint8 plane at rows pos + r (``quantize_codes8``'s bytes) and their
+-    scales into fp32 word ``sw`` of rows of ``scl`` (``srs`` words a row): the one fp4x encoder of a bf16 row."""
++    scales into fp32 word ``sw`` of rows of ``scl`` (``srs`` words a row): the one fp4x encoder of a bf16 row.
++    ``base`` (several streams' rows, ``pos`` one a row): row r to base[r] + pos[r]."""
+     if src.dtype != torch.bfloat16 or src.stride(1) != 1 or vals.dtype != torch.uint8 or scl.dtype != torch.float32:
+         raise ValueError("quant_rows8: bf16 rows into a uint8 plane and fp32 scale words")
++    if base is not None and (cp != 1 or base.numel() < src.shape[0] or pos.numel() < src.shape[0]):
++        raise ValueError("quant_rows8: per-row destinations take a position and a base a row, no CP")
+     if src.shape[0]:
+         _quant_rows8[(src.shape[0],)](src, src.stride(0), vals, scl, pos, int(rank), W=src.shape[1], RS=int(rs),
+-                                      SRS=int(srs), SW=int(sw), CP=int(cp), num_warps=1)
++                                      SRS=int(srs), SW=int(sw), CP=int(cp), BASE=base,
++                                      SEG=int(base is not None), num_warps=1)
+ 
+ 
+ @triton.jit
+diff --git tensorfold/families/glm5_next/cuda/latent.py tensorfold/families/glm5_next/cuda/latent.py
+index 1729b69..092cee2 100644
+--- tensorfold/families/glm5_next/cuda/latent.py
++++ tensorfold/families/glm5_next/cuda/latent.py
+@@ -390,16 +390,20 @@ def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor, *, prompt: bool = False)
+ 
+ @triton.jit
+ def _lat_write(LAT, lat_stride, LC, LS, POS, RANK, LW: tl.constexpr, RS: tl.constexpr, FP8: tl.constexpr,
+-               CP: tl.constexpr = 1, FP4: tl.constexpr = 0):
++               CP: tl.constexpr = 1, FP4: tl.constexpr = 0, BASE=None, SEG: tl.constexpr = 0):
+     """Row r -> cache slot pos + r: the bf16 row as it is, or (FP8) its codes and scale (kv8.store_row, a function
+     of the row alone: prompt chunks and decode windows store the same bytes). CP > 1 (context parallelism): only
+-    positions p with p % CP == RANK, at slot p // CP."""
++    positions p with p % CP == RANK, at slot p // CP. SEG (several streams' rows, not with CP): slot BASE[r] +
++    POS[r] of the whole plane."""
+     r = tl.program_id(0)
+-    P = tl.load(POS).to(tl.int64) + r
+-    if CP > 1:
+-        if P % CP != RANK:
+-            return
+-        P = P // CP
++    if SEG:
++        P = tl.load(BASE + r).to(tl.int64) + tl.load(POS + r).to(tl.int64)
++    else:
++        P = tl.load(POS).to(tl.int64) + r
++        if CP > 1:
++            if P % CP != RANK:
++                return
++            P = P // CP
+     k = tl.arange(0, LW)
+     if FP4:                              # TF_GLM_KV=fp4: codes, block scales, row scale (kv8.store_row4)
+         kv8.store_row4(LC, LS, P, tl.load(LAT + r * lat_stride + k).to(tl.float32), LW, RS)
+@@ -418,6 +422,17 @@ def latent_write(lat: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, cp:
+                                 CP=int(cp), FP4=int(kv8.fp4(cache)), num_warps=4)
+ 
+ 
++def latent_write_rows(lat: torch.Tensor, plane: torch.Tensor, pos: torch.Tensor, base: torch.Tensor) -> None:
++    """``latent_write`` for several streams' rows: row r into slot base[r] + pos[r] of the whole plane (its stream's
++    extent), the same bytes (bf16, FP8 or FP4 rows) latent_write stores."""
++    vals, scl, rs, fp8 = kv8.parts(plane)
++    if lat.shape[1] != kv8.width(plane):
++        raise ValueError(f"latent_write_rows: rows of {lat.shape[1]} into a plane of {kv8.width(plane)}")
++    if lat.shape[0]:
++        _lat_write[(lat.shape[0],)](lat, lat.stride(0), vals, scl, pos, 0, LW=lat.shape[1], RS=rs, FP8=fp8,
++                                    FP4=int(kv8.fp4(plane)), BASE=base, SEG=1, num_warps=4)
++
++
+ # --------------------------------------------------------------------------------------------- attention ---
+ 
+ @triton.jit
+@@ -956,3 +971,97 @@ def seg_attention(qa: torch.Tensor, cache: torch.Tensor, rows, tokens: torch.Ten
+                                               num_stages=chunk_stages(cache))
+     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
+     return out
++
++
++# ------------------------------------------------------------------------ full GLM-5.3: several streams' rows ---
++# Full GLM-5.3's multi-stream windows (``full_seg``): rows of several streams back to back, each stream's latents and
++# rotary keys in its own extent of the whole planes; per row its position, extent base and whether it attends
++# sparsely (``full_seg.FullRows``). One chunk pass and one merge for every row, dense or sparse, with the rotary
++# plane: each row's partials are those of _dense_chunks (keys 0 .. pos) or _sparse_chunks (its selected tokens) on
++# its stream alone (the same tiles, masks and _tile math, 16-head tiles as a decode window's head_block), and the
++# merge visits its chunks in the same order (chunks past a row's keys are empty: merged as nothing).
++
++@triton.jit
++def _rows_chunks(QA, LC, LS, POS, BASE, SPR, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.constexpr,
++                 LW: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr,
++                 RS: tl.constexpr, FP8: tl.constexpr, QP=None, KR=None, ROPE: tl.constexpr = 0,
++                 FP4: tl.constexpr = 0, R8: tl.constexpr = 0, RSW: tl.constexpr = 0):
++    """Program (row, head block, chunk): HBT heads of row r over keys [c CH, (c + 1) CH) of its stream: a dense row
++    (SPR 0) over keys 0 .. POS[r] (_dense_chunks), a sparse one over its selected tokens in list order
++    (_sparse_chunks; CNT[r] of them); cache rows BASE[r] + key (latents, scales and rotary keys alike). R8
++    (TF_GLM_KV=fp4x): the rotary rows through ``_rope_tile`` (e4m3 codes, scales in the FP4 latent rows' pad)."""
++    r = tl.program_id(0)
++    hb = tl.program_id(1)
++    c = tl.program_id(2)
++    B = tl.load(BASE + r).to(tl.int64)
++    sp = tl.load(SPR + r) != 0
++    n = tl.where(sp, tl.load(CNT + r, mask=sp, other=0), tl.load(POS + r) + 1)
++    hh = hb * HBT + tl.arange(0, HBT)
++    hok = hh < H
++    k = tl.arange(0, LW)
++    m = tl.full((HBT,), float("-inf"), tl.float32)
++    l = tl.zeros((HBT,), tl.float32)
++    o = tl.zeros((HBT, LW), tl.float32)
++    if c * CH < n:
++        q = tl.load(QA + (r * H + hh[:, None]) * LW + k[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
++        qp = None
++        if ROPE:
++            j = tl.arange(0, ROPE)
++            qp = tl.load(QP + (r * H + hh[:, None]) * ROPE + j[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
++        for t in range(CH // KTT):
++            idx = c * CH + t * KTT + tl.arange(0, KTT)
++            ok = idx < n
++            tok = tl.load(TOK + r * W + idx, mask=ok & sp, other=0).to(tl.int64)
++            rows = B + tl.where(sp, tok, idx.to(tl.int64))
++            if FP4:
++                kv, ks = kv8.load_rows4(LC, LS, rows, ok, k, LW, RS)
++            else:
++                kv = tl.load(LC + rows[:, None] * RS + k[None, :], mask=ok[:, None], other=0.0).to(tl.bfloat16)
++                ks = row_scales(LS, rows, ok, LW, RS) if FP8 else None
++            kr = None
++            if ROPE:
++                kr = _rope_tile(KR, LS, rows, ok, j, ROPE, RS, RSW, R8)
++            m, l, o = _tile(q, kv, ks, m, l, o, ok, SCALE, FP8, qp, kr, ROPE)
++    base = (c * R + r) * H + hh
++    tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
++    tl.store(PM + base, m, mask=hok)
++    tl.store(PL + base, l, mask=hok)
++
++
++def rows_chunks(dense_limit: int, topk: int) -> int:
++    """Chunks a full GLM-5.3 multi-stream window's rows take: a dense row's keys (fewer than the dense limit) or a
++    sparse row's ``topk`` tokens, in CHUNK-key chunks; fixed by the model, so graphs need no chunk dimension."""
++    return max(triton.cdiv(int(dense_limit), CHUNK), triton.cdiv(int(topk), CHUNK))
++
++
++def attention_rows(qa: torch.Tensor, plane: torch.Tensor, rope: torch.Tensor, qp: torch.Tensor, pos: torch.Tensor,
++                   base: torch.Tensor, sparse: torch.Tensor, tokens: torch.Tensor | None,
++                   counts: torch.Tensor | None, s: LatentScratch, *, scale: float, nch: int,
++                   out: torch.Tensor) -> torch.Tensor:
++    """Full GLM-5.3's latent attention of several streams' rows qa [R, H, LW] (rotary queries qp [R, H, rope]) over
++    the whole latent and rotary planes -> out [R, H, LW]: row r dense over its stream's keys 0 .. pos[r] when
++    sparse[r] == 0, else over its ``counts[r]`` selected (stream-local) tokens; cache rows base[r] + key. ``nch``:
++    ``rows_chunks`` (at least every row's chunks). A row gets the bits of ``attention`` (dense, a decode window's
++    16-head tile, any nch covering its keys) or ``sparse_attention`` (sparse) run on its stream alone."""
++    R, H, LW = qa.shape
++    if nch > s.nch or R > s.part_rows or LW != s.lw:
++        raise ValueError(f"attention_rows: {R} rows, {nch} chunks, width {LW} past the scratch's "
++                         f"{s.part_rows}, {s.nch}, {s.lw}")
++    if tokens is None:                   # no sparse rows: nothing reads the lists
++        tokens, counts, W = s.dummy, s.dummy, 1
++    else:
++        W = tokens.shape[1]
++        if not tokens.is_contiguous():
++            raise ValueError("attention_rows: contiguous token lists")
++    if R == 0:
++        return out
++    n = nch * R * H
++    vals, scl, rs, fp8 = _cache_parts(plane, LW)
++    QP, KR, ROPE, R8, RSW = _rope_args(qp, rope, R, H, plane)
++    _rows_chunks[(R, triton.cdiv(H, HB), nch)](qa, vals, scl, pos, base, sparse, tokens, counts, s.po[:n * LW],
++                                               s.pm[:n], s.pl[:n], R, W=W, H=H, LW=LW, CH=CHUNK, SCALE=scale, HBT=HB,
++                                               KTT=key_tile(plane), RS=rs, FP8=fp8, QP=QP, KR=KR, ROPE=ROPE,
++                                               FP4=int(kv8.fp4(plane)), R8=R8, RSW=RSW, num_warps=8,
++                                               num_stages=chunk_stages(plane))
++    _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
++    return out

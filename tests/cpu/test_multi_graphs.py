@@ -70,7 +70,9 @@ class Recorder(TorchDispatchMode):
         super().__init__()
         self.events = []
         self.depth = 0
+        gc.collect()                       # garbage freed mid-run would lend its addresses to temporaries
         self.persistent = live_storages()
+        self.fresh = set()                 # storages the run allocated (temporaries even at a recycled address)
 
     def canon(self, x):
         if isinstance(x, torch.Tensor):
@@ -78,7 +80,7 @@ class Recorder(TorchDispatchMode):
                 ptr = x.untyped_storage().data_ptr()
             except Exception:                              # noqa: BLE001
                 ptr = None
-            where = ("P", ptr) if ptr in self.persistent else ("T",)
+            where = ("P", ptr) if ptr in self.persistent and ptr not in self.fresh else ("T",)
             return where + (x.storage_offset(), tuple(x.shape), tuple(x.stride()), str(x.dtype))
         if isinstance(x, (list, tuple)):
             return tuple(self.canon(v) for v in x)
@@ -96,7 +98,32 @@ class Recorder(TorchDispatchMode):
         kwargs = kwargs or {}
         if self.depth == 0:
             self.events.append(("op", str(func), self.canon(args), self.canon(kwargs)))
-        return func(*args, **kwargs)
+        out = func(*args, **kwargs)
+        if self.depth == 0:
+            seen = {p for p in (_ptr(t) for t in _tensors((args, kwargs))) if p is not None}
+            for t in _tensors(out):
+                p = _ptr(t)
+                if p is not None and p not in seen:      # a new storage (views and in-place ops keep theirs)
+                    self.fresh.add(p)
+        return out
+
+
+def _ptr(t):
+    try:
+        return t.untyped_storage().data_ptr()
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
+def _tensors(x):
+    if isinstance(x, torch.Tensor):
+        yield x
+    elif isinstance(x, (list, tuple)):
+        for v in x:
+            yield from _tensors(v)
+    elif isinstance(x, dict):
+        for v in x.values():
+            yield from _tensors(v)
 
 
 def install_hooks(monkeypatch):

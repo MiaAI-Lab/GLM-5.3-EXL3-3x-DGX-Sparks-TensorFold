@@ -14,7 +14,7 @@
 # Setup: WORKER and WORKER2 in scripts/local.sh (scripts/local.sh.example), key-based ssh; the head exports its
 # Hugging Face cache over NFS to both workers (README "Weights over NFS").
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and their reasons in scripts/config.sh):
-#   serving  CONTEXT, KV, DENSE, MTP, CP, PREFILL_ROWS, PREFILL_SPLIT, PREFILL_OVERLAP, COPY, COPY_MAX,
+#   serving  CONTEXT, KV, DENSE, MTP, CP, PREFILL_ROWS, PREFILL_SPLIT, PREFILL_OVERLAP, COPY, COPY_MAX, COPY_HYBRID,
 #            SHARED_PREFIX, STREAM_SMOOTH, STREAM_SMOOTH_MS, KV_POOL_GIB, MAX_TOKENS, THINKING, COMM, SERVED_NAME,
 #            HOST, PORT
 #   memory   FLOOR_GIB, OVERHEAD_GIB, MEMORY_RESERVE_GIB, GUARD, GUARD_KILL_GIB
@@ -60,7 +60,7 @@ SERVE_ARGS=(--context "$CONTEXT" --max-tokens "$MAX_TOKENS" --drafter "$DRAFT_AR
 [[ "$CP" =~ ^[01]$ ]] || die "CP is 0 or 1"
 [[ "$DRAFTER" =~ ^(mtp|dspark)$ ]] || die "DRAFTER is mtp or dspark, not $DRAFTER"
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
-for v in COPY SHARED_PREFIX STREAM_SMOOTH GUARD; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+for v in COPY COPY_HYBRID SHARED_PREFIX STREAM_SMOOTH GUARD; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$COPY_MAX" =~ ^([1-9]|1[0-5])$ ]] || die "COPY_MAX is 1 to 15, not $COPY_MAX"
 for v in KV_POOL_GIB FLOOR_GIB OVERHEAD_GIB MEMORY_RESERVE_GIB GUARD_KILL_GIB; do
   [[ "${!v}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "$v is a number of GiB, not ${!v}"

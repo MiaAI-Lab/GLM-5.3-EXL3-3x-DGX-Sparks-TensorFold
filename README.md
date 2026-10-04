@@ -86,6 +86,33 @@ Decode speed depends on the text: speculative drafts land more often on predicta
 (a request's reply hash alone equals its hash beside another); greedy decode 26.9 tok/s for one request, 35.5 / 35.9
 tok/s together for two (+33%; 17.7-19.1 each).
 
+With CUDA graphs for the batched windows (0138-0139, on by default under `PARALLEL`; `TF_GLM_MULTI_GRAPHS=top` captures
+fewer graphs for less memory), greedy, the same prompts:
+
+| Boot | Requests together | Total tok/s | Each | Exact |
+| --- | --- | --- | --- | --- |
+| par2g (`PARALLEL=2 CONTEXT=65536`) | 1 / 2 | 27.3 / **37.8** | 27.3 / 18.9-20.0 | 12/12 |
+| par4g (`PARALLEL=4 CONTEXT=32768`) | 1 / 4 | 27.1 / **48.2** | 27.1 / 12.1-14.0 | 12/12 |
+
+A request's reply hash is the same alone and beside 1 or 3 others. One request alone is slower than on the
+single-stream server (`PARALLEL=1`), so `PARALLEL` pays only when several requests really arrive together.
+
+### Copy drafts checked by DSpark (0140)
+
+Prompt-lookup ("copy") drafts used to replace DSpark's block whenever the reply matched earlier text. With 0140
+(`COPY_HYBRID=1`, default) a copy is checked against DSpark's own picks: where they agree it extends past the block,
+where they part DSpark's chain takes over. Proposals only: replies are unchanged (every pair below has the same hash).
+Boots cpyon (on) and cp500b (off), both `KV=fp4 CP=1 CONTEXT=499712`, `work/lab/copy_ab.py`, 1024-token replies,
+greedy + two sampled seeds:
+
+| Prompt | Off tok/s | On tok/s | Change |
+| --- | --- | --- | --- |
+| Return a 140-line Python file with docstrings added | 63.5-63.9 | 56.4-63.9 | -3.7% (one greedy run -11%, likely the first request after the boot; the sampled ones equal) |
+| Return a Markdown text with its spelling fixed | 59.4-61.1 | 63.6-66.6 | **+8.4%** |
+| Return a JSON config with values changed | 43.9-45.8 | 45.4-47.7 | **+3.6%** |
+| Essay (nothing to copy) | 22.9-23.9 | 22.9-23.9 | 0 |
+| New Python module | 28.5-30.4 | 28.5-30.6 | +0.7% |
+
 ### Prompt cache on NVMe (0132)
 
 With `TF_GLM_DISK_CACHE=<dir>` every kept prompt state is also written, in the background, to each Spark's own NVMe
@@ -261,6 +288,7 @@ From the environment, `scripts/local.sh` or `./.env`; every default and its reas
 | `MTP` | 1 | MTP drafts (exact); 0 saves ~1.8 GiB a Spark |
 | `PREFILL_ROWS` | 2048 | prompt chunk rows; 1024 saves ~1 GiB a Spark |
 | `COPY`, `COPY_MAX` | 1, 15 | prompt-lookup drafts for replies that repeat earlier text (exact) |
+| `COPY_HYBRID` | 1 | copies checked by DSpark's picks (0140; same replies) |
 | `SHARED_PREFIX` | 1 | conversations sharing a system prompt reuse its state |
 | `KV_POOL_GIB` | 1 | other conversations' kept prompt states |
 | `THINKING`, `MAX_TOKENS` | 1, 32768 | thinking on; the reply budget of a request without max_tokens |
