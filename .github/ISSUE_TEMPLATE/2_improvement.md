@@ -52,8 +52,8 @@ assignees: ""
        * needle retrieval (tools/needle.py) PASS/FAIL
 
      Before/after pairs are much more useful than a single number, and please say
-     which configuration each number came from (CONTEXT, KV, DENSE, MTP,
-     PREFILL_ROWS) - they move a lot between settings, and so do the GPU clocks.
+     which configuration each number came from (CONTEXT, PARALLEL, KV, CP, DENSE,
+     DRAFTER, PREFILL_ROWS) - they move a lot between settings, and so do the GPU clocks.
 
      If you are comparing two configurations, please use the same sample count for
      both, and alternate restarts: boot-to-boot noise on a Spark is a few percent.

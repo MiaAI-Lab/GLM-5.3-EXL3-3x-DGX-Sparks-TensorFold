@@ -1,4 +1,4 @@
-<h1 align="center">GLM-5.3 EXL3 on three DGX Sparks with TensorFold</h1>
+<h1 align="center">GLM-5.3 EXL3 on DGX Sparks with TensorFold</h1>
 
 <p align="center">
   <sub>by <a href="https://x.com/MiaAI_lab">Mia's AI Lab</a></sub>
@@ -208,6 +208,10 @@ Earlier measurements, on the patches of their day (what each patch changed: [`CH
 - Optional: a Hugging Face token (`~/.cache/huggingface/token` or `HF_TOKEN`).
 
 ## Quick start
+
+<p align="center">
+  <img src=".github/ascii.png" alt="start.sh banner: TensorFold ribbon and MIA AI LAB, GLM-5.3 EXL3 · 3x DGX Sparks" width="100%">
+</p>
 
 On the head:
 

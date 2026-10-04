@@ -28,7 +28,7 @@ assignees: ""
 - Image: <!-- `docker images | grep tensorfold-glm53-full` -->
 - TensorFold version: <!-- `docker exec glm53-full-tf tensorfold --version` -->
 - `start.sh` invocation: <!-- e.g. `./start.sh`, or `CONTEXT=32768 ./start.sh restart --max-tokens 16384` -->
-- Changed settings: <!-- environment, scripts/local.sh or .env: CONTEXT, KV, DENSE, MTP, PREFILL_ROWS, COPY, COMM, FLOOR_GIB, OVERHEAD_GIB, TENSORFOLD_* / TF_GLM_* -->
+- Changed settings: <!-- environment, scripts/local.sh or .env: CONTEXT, PARALLEL, KV, CP, DENSE, DRAFTER, MTP, PREFILL_ROWS, COPY, COPY_HYBRID, COMM, FLOOR_GIB, OVERHEAD_GIB, TENSORFOLD_* / TF_GLM_* -->
 - Startup lines: <!-- `docker logs glm53-full-tf 2>&1 | grep -E "startup estimate|loading GLM|serving|memplan"` -->
 
 ---
@@ -88,7 +88,7 @@ curl -s http://<head-address>:8888/v1/chat/completions \
 <!--
       Paste the log output below between the backticks, and mention whether it came
       from `start.sh`, `scripts/prepare.sh`, `docker logs glm53-full-tf` (rank 0, on the
-      head), `ssh <worker> docker logs glm53-full-tf` (rank 1), or a client.
+      head), `ssh <worker> docker logs glm53-full-tf` (ranks 1 and 2), or a client.
 
       Common culprits worth checking before filing:
         * "this start's memory budget holds a N-token window" -> another GPU workload is
