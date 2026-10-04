@@ -133,6 +133,7 @@ def _rank(folder, rank, world, port, prompt, steps, out_q, kv):
 
     def run(chunks, rows, pipe, decode=False):
         F.CP_PROMPT_ROWS, F.CP_PIPE = rows, pipe
+        F.CP_KV_GATHER = False                   # 0141's path has its own test (test_cp_kv_gather.py)
         rig = Rig(folder, rank, world, Comm(), kv=kv, cp=world)
         a = 0
         for n in chunks:

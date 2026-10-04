@@ -40,6 +40,11 @@ def plan(model_dir: Path, tp: int, context: int, kv: str, dense: str, mtp: bool,
     if not cfg.full:
         raise SystemExit(f"{model_dir}: not a full GLM-5.3 checkpoint (model_type glm_moe_dsa)")
     text = config(model_dir)
+    # TF_GLM_CP_KV_GATHER (0141, on by default under CP): the prompt path's gathered planes, counted when the tree has them
+    import inspect
+    cp_extra = {}
+    if cp > 1 and "cp_kv_gather" in inspect.signature(mla_full_geometry).parameters:
+        cp_extra["cp_kv_gather"] = os.environ.get("TF_GLM_CP_KV_GATHER", "1") != "0"
     out = []
     for rank in range(tp):
         lay = tp_mod.Layout.from_config(cfg, rank, tp)
@@ -58,7 +63,7 @@ def plan(model_dir: Path, tp: int, context: int, kv: str, dense: str, mtp: bool,
         w = estimate_weights(model_dir, tr)
         g = mla_full_geometry(text, tp, max_rows, share=share, decode_rows=max_rows, mtp_rows=min(mtp_rows, max_rows),
                               prefill_rows=prefill_rows, kv=kv, mtp=mtp, prompt_split_k=dense != "q4",
-                              minimum_slots=DENSE_CAPACITY, **({"cp": cp} if cp > 1 else {}))
+                              minimum_slots=DENSE_CAPACITY, **({"cp": cp} if cp > 1 else {}), **cp_extra)
         slots = max(DENSE_CAPACITY, context + max_rows)
         local = -(-slots // cp) + (1 if cp > 1 else 0)          # context parallelism: every cp-th token a rank
         caches = local * full_token_bytes(text, kv, mtp)

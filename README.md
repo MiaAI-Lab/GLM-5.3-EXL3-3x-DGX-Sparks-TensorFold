@@ -14,8 +14,8 @@
 Serve **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**, Z.ai's full model (78 layers of MLA with DeepSeek sparse
 attention, 256 routed experts, an MTP head), from three NVIDIA DGX Sparks (GB10, 128 GB each, joined by a triangle of
 ConnectX-7 cables) through an OpenAI-compatible API. It runs [TensorFold](https://github.com/ashhart/TensorFold) v0.6.0
-on all three Sparks (one rank on each) in NVIDIA's PyTorch container, plus 109 patches (the
-[GLM-5.3-Flash recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)'s 68 of v1.4, and 41
+on all three Sparks (one rank on each) in NVIDIA's PyTorch container, plus 110 patches (the
+[GLM-5.3-Flash recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)'s 68 of v1.4, and 42
 for full GLM-5.3): the 3-rank layout and loader for mixed-width EXL3 experts, our own prompt kernels, DSpark and copy
 drafts, RoCE all-gathers, an FP8 or 4-bit KV cache, context parallelism for a ~500k-token window, 2 to 4 requests at
 once, and a prompt cache on NVMe.
@@ -28,8 +28,8 @@ once, and a prompt cache on NVMe.
   [`RedHatAI/GLM-5.3-speculator.dspark`](https://huggingface.co/RedHatAI/GLM-5.3-speculator.dspark), or the
   checkpoint's own MTP head (`DRAFTER`, see [Configuration](#configuration))
 - API model id: `GLM-5.3-EXL3`
-- Context: **163,840 tokens** by default (FP8 KV cache); **499,712 tokens** in the long-context mode (`KV=fp4 CP=1`,
-  one request at a time); 2 to 4 requests decoded together with `PARALLEL`
+- Context: **499,712 tokens** by default (context parallelism, fp4 KV cache, one request at a time); with `CP=0`
+  163,840 tokens (FP8 KV), or 2 to 4 requests decoded together with `PARALLEL`
 - Exact: a drafted reply equals the serial one, and requests sent together get the replies they get alone
   (`tools/exact.py`)
 - Tool calling, `/tokenize` and `/metrics` (the GLM-5.3-Flash recipe's server)
@@ -44,13 +44,23 @@ and the context parallelism of patches 0112-0113 follows drowzeys' scheme, both 
 
 ## Performance
 
-Three DGX Sparks, one request at a time, at the defaults unless a row says otherwise (FP8 KV cache, 4-bit dense
-weights, DSpark plus copy drafts, RoCE all-gathers). Every figure names the boot it was measured on; a range is three
+Three DGX Sparks, one request at a time, at the defaults unless a row says otherwise (4-bit dense weights, DSpark
+plus copy drafts, RoCE all-gathers). Every figure names the boot it was measured on; a range is three
 runs unless stated. Greedy decode and prefill were measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash)
 through the OpenAI API; sampled decode with 512-token replies at temperature 1.0, top_p 0.95 (a chat client's
 default), seeds 11, 22 and 33; long prompts with `tools/needle.py`.
 
-**Default mode** (`./start.sh`: 163,840-token window, FP8 KV)
+**Default: long-context mode** (`./start.sh`: `CP=1`, 499,712-token window, fp4 KV, 3,072-row prompt chunks)
+
+| | Measured | Boot |
+| --- | --- | --- |
+| Prefill | **563 tok/s** at 9.9k tokens, **545 tok/s** at 94k (needles correct); 607 / 596 / 590 tok/s at 8k / 16k / 32k | hcp: 499,712-token window, 3,072-row chunks, 0141 (before it, cp500b: 448 / 434, and 419 / 491 / 496) |
+| Decode, greedy | prose 31.7-32.5, code 41.8-42.3 tok/s | fp4g627x: the same mode at a 626,688-token window, 2,048-row chunks, patches through 0128 |
+| Decode, sampled | prose 22.9-24.0, code 25.7-29.4 tok/s | fp4g627x |
+| Long prompts | needles correct at 9.9k and 94k tokens (cp500b), and at 314k (fp4g655, 655,360-token window) | |
+| Exact | 12/12 | hcp, cp500b |
+
+**Without context parallelism** (`CP=0 ./start.sh`: 163,840-token window, FP8 KV)
 
 | | Prose | Code |
 | --- | ---: | ---: |
@@ -65,16 +75,6 @@ Boot dflt, patches through 0129. Its start found less free memory than the full 
 again at 155,648 tokens (its fallback, see [Memory](#memory)). On another pair of boots (ovl1 / ovl0, 147,456-token
 window), prefill at 16k / 32k was **684 / 670 tok/s** with 0127's overlapped MoE exchange (the default) and 662 / 649
 with it off, two runs each.
-
-**Long-context mode** (`KV=fp4 CP=1 CONTEXT=499712 PREFILL_ROWS=3072 TF_GLM_CP_GRAPHS=1`)
-
-| | Measured | Boot |
-| --- | --- | --- |
-| Prefill | **448 tok/s** at 9.9k tokens, **434 tok/s** at 94k (needles correct) | cp500b: 499,712-token window, 3,072-row chunks |
-| Decode, greedy | prose 31.7-32.5, code 41.8-42.3 tok/s | fp4g627x: the same mode at a 626,688-token window, 2,048-row chunks, patches through 0128 |
-| Decode, sampled | prose 22.9-24.0, code 25.7-29.4 tok/s | fp4g627x |
-| Long prompts | needles correct at 9.9k and 94k tokens (cp500b), and at 314k (fp4g655, 655,360-token window) | |
-| Exact | 12/12 | cp500b |
 
 Context parallelism (`CP=1`) keeps every third token's caches on each Spark, so the window is about three times the
 default one; decode under it is as fast as without it (fp4g655 below). Sampled replies decode slower than greedy ones:
@@ -244,8 +244,8 @@ curl -s http://<head-address>:8888/v1/chat/completions -H 'Content-Type: applica
 }'
 
 ./start.sh restart                                       # restart all three ranks, e.g. after changing a setting
-KV=fp4 CP=1 CONTEXT=499712 PREFILL_ROWS=3072 TF_GLM_CP_GRAPHS=1 ./start.sh restart   # the long-context mode
-PARALLEL=2 CONTEXT=65536 ./start.sh restart              # two requests decoded together (up to 4; not with CP=1)
+CP=0 ./start.sh restart                                  # without context parallelism: 163,840 tokens, FP8 KV
+CP=0 PARALLEL=2 CONTEXT=65536 ./start.sh restart         # two requests decoded together (up to 4; needs CP=0)
 ./stop.sh                                                # stop all three ranks and free their GPU memory
 docker logs -f glm53-full-tf                             # rank 0's log (here)
 ssh <worker> docker logs -f glm53-full-tf                # rank 1's or rank 2's log
@@ -322,15 +322,16 @@ freezes instead of failing**. So the recipe plans memory before it starts anythi
   server runs, keeps the low-water mark, and stops that Spark's rank below `GUARD_KILL_GIB` (3): a failed rank beats a
   frozen Spark.
 
-Measured (MemAvailable in GiB on spark1 / spark2 / spark3, FP8 KV, q4 dense, MTP on; boots of 2026-10-03):
+Measured (MemAvailable in GiB on spark1 / spark2 / spark3, q4 dense; the first three rows FP8 KV with MTP on, boots of 2026-10-03; the last boot hcp of 2026-10-04):
 
 | Window | At start | TensorFold estimate | Idle | Lowest under the longest prompt | Used past the estimate |
 | --- | --- | --- | --- | --- | --- |
 | 32,768 (boot b1n) | 116.2 / 117.7 / 111.0 | 90.6 / 89.4 / 89.4 | 18.8 / 22.0 / 15.9 | 18.2 / 21.7 / 15.0 (28.3k-token prompt) | 6.2-8.5 |
 | 65,536 (boot b2) | 115.4 / 117.8 / 111.0 | 91.1 / 90.7 / 90.7 | 16.7 / 20.1 / 13.4 | 16.7 / 20.1 / 13.3 (58.2k-token prompt) | |
-| 163,840 (boot p3, defaults) | 115.2 / 117.2 / 111.8 | 96.5 / 96.1 / 96.1 | 11.6 / 14.0 / 7.4 | 11.5 / 14.0 / 3.9 (startup) | ~7 idle, ~3 more at startup |
+| 163,840 (boot p3, `CP=0`) | 115.2 / 117.2 / 111.8 | 96.5 / 96.1 / 96.1 | 11.6 / 14.0 / 7.4 | 11.5 / 14.0 / 3.9 (startup) | ~7 idle, ~3 more at startup |
+| 499,712, `CP=1`, fp4 (boot hcp, the default) | | 93.75 / 93.60 / 93.60 | spark3 7.38 | 10.20 / 12.39 / 5.61 (94k-token prompt) | |
 
-spark3 (rank 2; it also runs other containers) is the tightest: at the default window it keeps ~7.4 GiB at idle and
+spark3 (rank 2; it also runs other containers) is the tightest: at 163,840 tokens without CP (boot p3) it keeps ~7.4 GiB at idle and
 dips to ~3.9 GiB during startup (graph capture and the startup timing of verify windows), just above the guard.
 196,608 tokens took it under the guard at startup (the guard stopped that rank; nothing froze).
 `DRY_RUN=1 CONTEXT=<n> ./start.sh` prints the plan of any window with the Sparks' memory of the moment.
@@ -364,7 +365,7 @@ significant; [Quality](#quality-of-the-4-bit-kv-cache-kvfp4)). Long-context reca
 with it. Use it when the window matters more than that margin:
 
 ```bash
-KV=fp4x CP=1 CONTEXT=618496 PREFILL_ROWS=3072 TF_GLM_CP_GRAPHS=1 ./start.sh restart
+KV=fp4x CONTEXT=618496 ./start.sh restart
 ```
 
 `DRY_RUN=1` with the same settings prints the plan first; `start.sh` lowers the window by itself if the Sparks'
@@ -400,14 +401,14 @@ repository's. The first that sets a value wins: the environment, then `scripts/l
 | `WORKER` / `WORKER2` | empty | the ssh targets of rank 1 and rank 2 (`user@<address>`) |
 | `FABRIC_PEER` / `FABRIC_PEER2` | empty | a worker's CX7 address, when its ssh target is on another network |
 | `MASTER_ADDR` / `MASTER_PORT` / `SOCKET_IFNAME` | the head's LAN address / `29561` / each node's default-route netdev | the ranks' rendezvous, and NCCL's bootstrap netdev |
-| `CONTEXT` | `163840` | prompt + reply window, 4,096 to 1,048,576 (the memory plan checks every start) |
-| `PARALLEL` | `1` | requests decoded together, 1 to 4, each with its own `CONTEXT` window; not with `CP=1` |
-| `KV` | `fp8` | the latent cache as e4m3 rows with a power-of-two scale each (rotary and index keys stay bf16); `bf16`: exact, 1.7x the bytes; `fp4`: 4-bit latent rows, 0.69x FP8's bytes a token, the same measured quality (the long-context setting); `fp4x`: opt-in, 0.56x, ~24% more context than `fp4` |
+| `CONTEXT` | `499712` (`163840` with `CP=0`) | prompt + reply window, 4,096 to 1,048,576 (the memory plan checks every start) |
+| `PARALLEL` | `1` | requests decoded together, 1 to 4, each with its own `CONTEXT` window; needs `CP=0` |
+| `KV` | `fp4` (`fp8` with `CP=0`) | `fp8`: the latent cache as e4m3 rows with a power-of-two scale each (rotary and index keys stay bf16); `bf16`: exact, 1.7x the bytes; `fp4`: 4-bit latent rows, 0.69x FP8's bytes a token, the same measured quality (the long-context setting); `fp4x`: opt-in, 0.56x, ~24% more context than `fp4` |
 | `DENSE` | `q4` | non-expert weights as 4-bit groups of 64 (head FP8, kv_b BF16); `fp8` (~2.8 GiB more a rank) or `bf16` (~9 GiB more: no useful window) |
 | `DRAFTER` | `dspark` | `dspark`: Red Hat AI's DSpark speculator, up to 8 drafts a round (code 39.5-40.4 tok/s against 37.1 with the MTP head, prose the same); `mtp`: the checkpoint's MTP head |
 | `MTP` | `0` with `DRAFTER=dspark`, `1` with `DRAFTER=mtp` | load the checkpoint's MTP head (~1.8 GiB a rank); as fast with or without it beside DSpark |
-| `CP` | `0` | `1`: context parallelism, each Spark keeps every third token's caches (~3x the window; exact; one request at a time) |
-| `PREFILL_ROWS` | `2048` | prompt chunk rows: `1024` (~1 GiB less a rank, slower prompts) or `3072` (one expert call a chunk; ~1.05 GiB more a rank; the long-context mode) |
+| `CP` | `1` | context parallelism, each Spark keeps every third token's caches (~3x the window; exact; one request at a time); `0`: every Spark keeps every token (needed for `PARALLEL`). `CONTEXT`, `KV`, `PREFILL_ROWS` and `TF_GLM_CP_GRAPHS` default by it |
+| `PREFILL_ROWS` | `3072` (`2048` with `CP=0`) | prompt chunk rows: `1024` (~1 GiB less a rank, slower prompts) or `3072` (one expert call a chunk; ~1.05 GiB more a rank; the long-context mode) |
 | `PREFILL_SPLIT` / `PREFILL_OVERLAP` | `1` / `1` | prompt chunks' rows split between the ranks (exact), the exchanges on a second CUDA stream |
 | `COMM` | `roce` | the small all-gathers (up to `TF_ROCE_MAX_KB`, 512) as one-shot RDMA writes over the cables (+10% decode over `nccl`, the same replies); `nccl`: NCCL for all |
 | `COPY` / `COPY_MAX` | `1` / `15` | prompt-lookup drafts for replies that repeat earlier text, up to 15 a round (exact) |
@@ -439,9 +440,10 @@ README names:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `TF_GLM_CP_GRAPHS` | `0` | `1`: captured decode windows under `CP=1` (~2.9 GiB a Spark; the long-context mode sets it) |
+| `TF_GLM_CP_GRAPHS` | `1` with `CP=1` | captured decode windows under `CP=1` (~2.9 GiB a Spark); `0`: eager |
 | `TF_GLM_DISK_CACHE` | off | a folder **inside the container** for the [NVMe prompt cache](#prompt-cache-on-nvme-0132) (`PARALLEL=1` only): `/cache/pcache` is `~/.cache/tensorfold-glm53-full/<image hash>/pcache` on each Spark; `TF_GLM_DISK_CACHE_GIB` (64) and `TF_GLM_DISK_KEEP_FREE_GB` (100) bound it |
 | `TF_GLM_MULTI_GRAPHS` | on | CUDA graphs for the batched verify windows under `PARALLEL`; `top`: fewer graphs, less memory, the same bits; `0`: eager |
+| `TF_GLM_CP_KV_GATHER` | `1` | CP prompt chunks over the gathered rows (0141); `0`: the exchange of queries and partials before it |
 | `TF_GLM_CP_RAW_Q` | `0` (set by `scripts/config.sh`) | `1`: context-parallel prompt chunks gather raw queries (0135, +0.64 GiB a Spark; no faster on cp500a) |
 | `TF_GLM_MOE_OVERLAP` | `1` | prompt chunks' MoE exchange overlapped with the experts' work (0127) |
 | `TF_GLM_PROMPT_EXPERTS` | `mpe` | prompt chunks' routed experts: `mpe` our kernel (0108), `pe` drowzeys' kernels (0106) |
@@ -449,10 +451,10 @@ README names:
 | `TF_GLM_CLEAR_THINKING` | `0` | `1`: drop earlier turns' reasoning from the prompt, as the checkpoint's template does |
 | `TF_GLM_MEM_TRACE` | `0` | `1`: every rank logs its memory after each prompt chunk |
 
-To enable the NVMe prompt cache, for example in the long-context mode:
+To enable the NVMe prompt cache:
 
 ```bash
-TF_GLM_DISK_CACHE=/cache/pcache KV=fp4 CP=1 CONTEXT=499712 PREFILL_ROWS=3072 TF_GLM_CP_GRAPHS=1 ./start.sh restart
+TF_GLM_DISK_CACHE=/cache/pcache ./start.sh restart
 ```
 
 Sampling defaults come from the checkpoint's `generation_config.json` (temperature 1.0, top_p 0.95), as in the
@@ -486,6 +488,7 @@ recipe's:
 | Context parallelism | `0112-glm-full-cp-caches`, `0113-glm-full-context-parallel` | `CP=1`: each rank keeps every third token's latent, rotary and index rows; exact top-k selection across the ranks; attention partials merged by log-sum-exp in rank order (the scheme after drowzeys' fork; the code and kernels ours) | ~3x the window; exact 12/12 (p19) |
 | | `0118-glm-full-cp-graphs`, `0120-glm-full-cp-short-select` | captured decode windows under CP (`TF_GLM_CP_GRAPHS=1`); windows within the top-k take every visible local slot directly | decode as fast as without CP (fp4g655) |
 | | `0129-glm-full-cp-prompt-msa`, `0131-glm-full-cp-prompt-pipe`, `0135-glm-full-cp-prompt-raw-q` | CP prompt chunks through our sparse-attention kernel; then without copies, the exchanges on a side stream and the selection's candidates sent to row owners only; smaller first and last parts (raw queries: `TF_GLM_CP_RAW_Q`, off) | 244 / 236 -> 294 / 297 (0129) -> 378 / 410 (0131) -> 448 / 434 tok/s at 9.9k / 94k (cp500b, with 0136) |
+| | `0141-glm-full-cp-kv-gather` | CP prompt chunks gather every rank's visible latent and rotary rows (~430 B a token at fp4) instead of exchanging every row's queries and attention partials (~50 KB a row and layer); each rank attends its own heads over the whole top-2048 in one call; the fp4 attention kernel decodes its codes arithmetically instead of from a lookup table (the same bits) | 563 / 545 tok/s at 9.9k / 94k (hcp; +26%) |
 | KV formats | `0115-glm-full-kv-fp4` | `KV=fp4`: e2m1 codes, an e4m3 scale per 16 values and a power-of-two row scale, 304 bytes a row (FP8: 528) | the long-context window; no measured quality difference ([Quality](#quality-of-the-4-bit-kv-cache-kvfp4)) |
 | | `0133-glm-full-kv-fp4x`, `0137-glm-full-kv-fp4x-fix` | `KV=fp4x`: also the rotary and index keys as e4m3 codes, from one bit-exact encoder | ~24% more tokens a GiB than `fp4` |
 | Prompt cache | `0132-glm-full-prompt-disk-cache` | kept prompt states on each Spark's NVMe (`TF_GLM_DISK_CACHE`), and kept prompt states under CP | a 94k-token prompt resumed in 3.0 s after a restart (pcacheB) |

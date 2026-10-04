@@ -89,9 +89,17 @@ CONTAINER_NAME="${CONTAINER_NAME:-glm53-full-tf}"   # the same name on every Spa
 SERVED_NAME="${SERVED_NAME:-GLM-5.3-EXL3}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
-# Prompt + reply window. Provisional default (see README "Memory"): start.sh asks scripts/memplan.py whether every
-# rank keeps FLOOR_GIB free with it, and refuses to start otherwise, naming what fits.
-CONTEXT="${CONTEXT:-163840}"
+# CP: context parallelism, 1 (default: each Spark keeps every third token's caches, ~3x the window; exact; one
+# request at a time; captured decode windows) or 0 (every Spark keeps every token: required for PARALLEL > 1). The
+# defaults of CONTEXT, KV, PREFILL_ROWS and TF_GLM_CP_GRAPHS follow it: with CP=1 the long-context mode (499,712
+# tokens, fp4 KV, 3,072-row prompt chunks: boot hcp, README "Performance"), with CP=0 a 163,840-token window with
+# FP8 KV and 2,048-row chunks (boot dflt).
+CP="${CP:-1}"
+export TF_GLM_CP="$CP"
+export TF_GLM_CP_GRAPHS="${TF_GLM_CP_GRAPHS:-$([[ "$CP" == 1 ]] && echo 1 || echo 0)}"
+# Prompt + reply window: start.sh asks scripts/memplan.py whether every rank keeps FLOOR_GIB free with it, and
+# refuses to start otherwise, naming what fits (README "Memory").
+CONTEXT="${CONTEXT:-$([[ "$CP" == 1 ]] && echo 499712 || echo 163840)}"
 # Concurrent requests (patch 0134): 1 (default) decodes one request at a time, others queue; 2-4 decode that many
 # together, each with its own window of CONTEXT tokens (so the KV pool holds PARALLEL x CONTEXT). Not with CP=1.
 PARALLEL="${PARALLEL:-1}"
@@ -102,7 +110,7 @@ PARALLEL="${PARALLEL:-1}"
 # lossy against bf16, yet no measurable difference from fp8 on the README's quality suite: the long-context setting).
 # fp4x: fp4's latent rows plus e4m3 rotary and indexer keys, ~24% more tokens than fp4 in the same memory (opt-in:
 # README "More context").
-KV="${KV:-fp8}"
+KV="${KV:-$([[ "$CP" == 1 ]] && echo fp4 || echo fp8)}"
 export TF_GLM_KV="$KV"
 # The non-expert BF16 weights: q4 (default: the projections as 4-bit groups of 64 with MSE-searched ranges, the head
 # FP8, kv_b BF16; lossy), fp8 (~2.8 GiB more a rank) or bf16 (as stored; ~9 GiB more a rank: does not fit with a
@@ -114,17 +122,14 @@ export TF_GLM_DENSE="$DENSE"
 # MTP head beside it, 3 runs each, 2026-10-03), on with DRAFTER=mtp.
 MTP="${MTP:-$([[ "${DRAFTER:-dspark}" == dspark ]] && echo 0 || echo 1)}"
 export TF_GLM_MTP="$MTP"
-# Rows a prompt chunk runs at once: 2048 (default) or 1024 (~1 GiB less a rank, slower prompts).
-PREFILL_ROWS="${PREFILL_ROWS:-2048}"
+# Rows a prompt chunk runs at once: 3072 (default with CP=1: the routed experts in one call a chunk), 2048 (default
+# with CP=0) or 1024 (~1 GiB less a rank, slower prompts).
+PREFILL_ROWS="${PREFILL_ROWS:-$([[ "$CP" == 1 ]] && echo 3072 || echo 2048)}"
 export TF_GLM_PREFILL_ROWS="$PREFILL_ROWS"
 # Prompt chunks' rows split between the ranks (exact): each rank adds the residual and runs the next norm on its own
 # third of the rows, so a link carries a third of a partial and of the normed rows instead of whole partials.
 # PREFILL_SPLIT: 1 (default) or 0 (whole-partial all-gathers); PREFILL_OVERLAP: 1 (default; the exchanges on a second
 # CUDA stream in row pieces) or 0.
-# CP: context parallelism (1: each Spark keeps every third token's caches: ~3x the window; exact; one request at a
-# time; captured decode windows with TF_GLM_CP_GRAPHS=1) or 0 (default: every Spark keeps every token).
-CP="${CP:-0}"
-export TF_GLM_CP="$CP"
 # CP prompt chunks send absorbed queries (0131); raw queries with every rank absorbing all heads (0135, +0.64 GiB a
 # Spark) measured no faster on boot cp500a vs cp500b (94k: 216 vs 217 s; 9.9k: 25.5 vs 22.1 s): off by default
 export TF_GLM_CP_RAW_Q="${TF_GLM_CP_RAW_Q:-0}"

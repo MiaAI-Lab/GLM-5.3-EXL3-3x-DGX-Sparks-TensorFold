@@ -6,16 +6,15 @@
 # Stop it with ./stop.sh.
 #
 # Usage: ./start.sh [restart] [extra tensorfold serve args]
-#   ./start.sh                         # scripts/config.sh's defaults: a 163,840-token window, FP8 KV cache, DSpark
-#                                      # drafts, 4-bit dense weights, one request at a time
+#   ./start.sh                         # scripts/config.sh's defaults: the long-context mode, a 499,712-token window
+#                                      # (context parallelism, fp4 KV cache), DSpark drafts, one request at a time
 #                                      # (if the server already runs, says so and leaves it alone)
 #   ./start.sh restart                 # stop all three ranks (./stop.sh), then start them again, e.g. to apply changed
 #                                      # settings or patches; the new arguments are checked before stopping
-#   KV=fp4 CP=1 CONTEXT=499712 PREFILL_ROWS=3072 TF_GLM_CP_GRAPHS=1 ./start.sh restart
-#                                      # the long-context mode: a 499,712-token window (README "Performance")
-#   KV=fp4x CP=1 CONTEXT=618496 PREFILL_ROWS=3072 TF_GLM_CP_GRAPHS=1 ./start.sh restart
+#   CP=0 ./start.sh restart            # without context parallelism: a 163,840-token window, FP8 KV cache
+#   KV=fp4x CONTEXT=618496 ./start.sh restart
 #                                      # opt-in: ~24% more context than fp4 (README "More context")
-#   PARALLEL=2 CONTEXT=65536 ./start.sh restart   # two requests decoded together (up to 4; not with CP=1)
+#   CP=0 PARALLEL=2 CONTEXT=65536 ./start.sh restart   # two requests decoded together (up to 4; needs CP=0)
 #   CONTEXT=32768 ./start.sh restart   # another window (the memory plan checks it first)
 #   DRY_RUN=1 ./start.sh               # print the memory plan and every rank's docker command; change nothing
 # Extra arguments go to every rank after the defaults, so they win (the last value of a flag counts).
@@ -56,7 +55,7 @@ if [[ "$DRAFTER" == dspark ]]; then              # DSpark: its snapshot, the pin
 fi
 SERVE_ARGS=(--context "$CONTEXT" --max-tokens "$MAX_TOKENS" --drafter "$DRAFT_ARG")
 [[ "$PARALLEL" =~ ^[1-4]$ ]] || die "PARALLEL is 1 to 4, not $PARALLEL"
-(( PARALLEL > 1 && CP == 1 )) && die "PARALLEL=$PARALLEL needs CP=0: context parallelism serves one request at a time"
+(( PARALLEL > 1 && CP == 1 )) && die "PARALLEL=$PARALLEL needs CP=0 (context parallelism, the default, serves one request at a time): e.g. CP=0 PARALLEL=$PARALLEL CONTEXT=65536 ./start.sh restart"
 (( PARALLEL > 1 )) && SERVE_ARGS+=(--parallel "$PARALLEL")
 [[ "$DENSE" =~ ^(bf16|fp8|q4)$ ]] || die "DENSE is bf16, fp8 or q4, not $DENSE"
 [[ "$COMM" =~ ^(nccl|roce)$ ]] || die "COMM is nccl or roce, not $COMM"

@@ -1,0 +1,410 @@
+diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
+index 671303f..d18cd77 100644
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -436,14 +436,30 @@ def full_cp_bytes(t: dict, rows: int, cp: int, *, prefill: bool, share) -> int:
+ CP_PROMPT_ROWS = 512        # context parallelism: a prompt chunk's rows a sparse attention exchange takes
+ 
+ 
++def full_cp_kvg_bytes(t: dict, rows: int, cp: int, local: int, kv: str) -> int:
++    """TF_GLM_CP_KV_GATHER (forward.cp_prompt_kvg): a prompt chunk's buffers on a rank: the gathered planes of one
++    layer (every rank's ``local`` latent and rotary rows), the candidates [cp, rows, topk] int64 twice (sent and
++    received by the row owners), the owners' sort of [rows / cp, cp topk] int64 positions (twice) and the lists
++    [rows, topk] int32 twice."""
++    if cp <= 1:
++        return 0
++    lw, rope, topk = int(t["kv_lora_rank"]), int(t["qk_rope_head_dim"]), int(t.get("index_topk", 2048))
++    planes = cp * local * (mla_row_bytes(lw, kv) + full_rope_row_bytes(rope, kv))
++    m = -(-rows // cp)
++    return planes + 2 * cp * m * topk * 8 + 2 * m * cp * topk * 8 + 2 * cp * m * topk * 4
++
++
+ def mla_full_geometry(t: dict, world: int, reserve: int, *, share, decode_rows: int, mtp_rows: int,
+                       prefill_rows: int, kv: str = "bf16", mtp: bool = True, prompt_split_k: bool = False,
+-                      minimum_slots: int = 2560, cp: int = 1, cp_raw_q: bool = False) -> Geometry:
++                      minimum_slots: int = 2560, cp: int = 1, cp_raw_q: bool = False,
++                      cp_kv_gather: bool = False) -> Geometry:
+     """Full GLM-5.3's caches and buffers on a rank at a capacity of cache slots: the decode window's buffers (and the
+     MTP head's), the prompt chunk's, the per-token caches (``full_token_bytes``), and the largest transient
+     selection and attention scratch of either kind of window. ``cp`` > 1 (context parallelism): a rank keeps
+     ceil(capacity / cp) + 1 token rows and scores only those, plus the exchange buffers (``full_cp_bytes``);
+-    ``cp_raw_q`` (TF_GLM_CP_RAW_Q): plus the other ranks' absorb key rows it keeps (``full_cp_absorb_bytes``)."""
++    ``cp_raw_q`` (TF_GLM_CP_RAW_Q): plus the other ranks' absorb key rows it keeps (``full_cp_absorb_bytes``);
++    ``cp_kv_gather`` (TF_GLM_CP_KV_GATHER): a prompt chunk's buffers are the larger of the two paths'
++    (``full_cp_kvg_bytes``)."""
+ 
+     fixed = full_cp_absorb_bytes(t, cp, world, mtp=mtp) if cp > 1 and cp_raw_q else 0
+ 
+@@ -456,8 +472,10 @@ def mla_full_geometry(t: dict, world: int, reserve: int, *, share, decode_rows:
+         b += full_buffer_bytes(t, prefill_rows, world=world, share=share, capacity=capacity, prefill=True,
+                                prompt_split_k=prompt_split_k)
+         local = -(-capacity // cp) + (1 if cp > 1 else 0)
+-        b += max(full_transient_bytes(t, prefill_rows, local, prefill=True, share=share)
+-                 + full_cp_bytes(t, prefill_rows, cp, prefill=True, share=share),
++        cp_prompt = full_cp_bytes(t, prefill_rows, cp, prefill=True, share=share)
++        if cp_kv_gather:
++            cp_prompt = max(cp_prompt, full_cp_kvg_bytes(t, prefill_rows, cp, local, kv))
++        b += max(full_transient_bytes(t, prefill_rows, local, prefill=True, share=share) + cp_prompt,
+                  full_transient_bytes(t, decode_rows, local, prefill=False, share=share)
+                  + full_cp_bytes(t, decode_rows, cp, prefill=False, share=share))
+         return b + local * full_token_bytes(t, kv, mtp) + fixed
+diff --git tensorfold/families/glm5_next/cuda/dcp.py tensorfold/families/glm5_next/cuda/dcp.py
+index 4f2317c..c03b836 100644
+--- tensorfold/families/glm5_next/cuda/dcp.py
++++ tensorfold/families/glm5_next/cuda/dcp.py
+@@ -432,6 +432,26 @@ def select_keep(cand: torch.Tensor, thresholds: torch.Tensor, G: int, *, slots:
+     return slots, counts
+ 
+ 
++def owner_lists(cands: torch.Tensor, thresholds: torch.Tensor, G: int, S: int) -> tuple[torch.Tensor, torch.Tensor]:
++    """TF_GLM_CP_KV_GATHER (forward.cp_prompt_kvg): a row owner's whole lists. cands [G, M, k] (every rank's
++    ``select_local`` candidates of the owner's M rows, rank order) and each row's threshold (``select_threshold``) ->
++    (rows [M, k] int32, counts [M] int32): every rank's candidates that are real and >= the threshold (the uint64 order
++    of select_keep, so the ranks' kept parts together), as global positions in ascending order, which is the
++    replicated dsa_full.select_tokens list of the row; each position p written as the row (p % G) S + p // G of the
++    gathered planes (every rank's first S local slots, rank-major), -1 past the count."""
++    G_, M, k = cands.shape
++    if G_ != G or cands.dtype != torch.int64 or thresholds.dtype != torch.int64 or thresholds.numel() < M:
++        raise ValueError("owner_lists: int64 candidates [G, M, k] and an int64 threshold a row")
++    u = cands.permute(1, 0, 2).reshape(M, G * k)
++    flip = torch.full((), -(1 << 63), dtype=torch.int64, device=u.device)    # unsigned order as signed
++    keep = ((u ^ flip) >= (thresholds[:M, None] ^ flip)) & (u != 0)
++    big = torch.iinfo(torch.int64).max
++    pos = torch.where(keep, 0xFFFFFFFF - (u & 0xFFFFFFFF), big)
++    pos = torch.sort(pos, dim=1).values[:, :k]
++    rows = torch.where(pos != big, (pos % G) * S + pos // G, -1).to(torch.int32).contiguous()
++    return rows, keep.sum(1).to(torch.int32)
++
++
+ @triton.jit
+ def _merge_ranks_bf16(OWN, OWN_L, GOT, GOT_L, OUT, n, RANK: tl.constexpr, G: tl.constexpr, HP: tl.constexpr,
+                       HO: tl.constexpr, LW: tl.constexpr):
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 0778e7b..acb2532 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -783,7 +783,7 @@ class GlmEngine:
+         # (``forward.dsa_full_cp``); one request at a time, eager decode windows (for now); kept prompt states hold
+         # each rank's own rows of their positions (``decode.local_rows``), in memory and on disk alike
+         self.cp = world if cfg.full and os.environ.get("TF_GLM_CP", "0").strip() == "1" else 1
+-        from .forward import CP_PARTS_EDGE, cp_raw_q_on
++        from .forward import CP_KV_GATHER, CP_PARTS_EDGE, cp_raw_q_on
+ 
+         # TF_GLM_CP_RAW_Q: the other ranks' absorb key rows replicated (prompt chunks gather raw queries); the estimate
+         # counts them (``geometry.full_cp_absorb_bytes``)
+@@ -819,7 +819,8 @@ class GlmEngine:
+                 g = mla_full_geometry(text, world, MAX_ROWS, share=share, decode_rows=MAX_ROWS,
+                                       mtp_rows=min(MTP_ROWS, MAX_ROWS), prefill_rows=prompt_buffer_rows, kv=kv,
+                                       mtp=self.mtp_on, prompt_split_k=dense_kind() not in ("q4",),
+-                                      minimum_slots=DENSE_CAPACITY, cp=self.cp, cp_raw_q=cp_raw_q)
++                                      minimum_slots=DENSE_CAPACITY, cp=self.cp, cp_raw_q=cp_raw_q,
++                                      cp_kv_gather=self.cp > 1 and CP_KV_GATHER)
+                 if parallel == 1:
+                     return g
+                 # --parallel: the window is each stream's; the other streams' caches and the batched verify buffers,
+@@ -920,7 +921,8 @@ class GlmEngine:
+             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+-                                 KV_KINDS.index(kv), self.cp, int(cp_raw_q), int(CP_PARTS_EDGE)]
++                                 KV_KINDS.index(kv), self.cp, int(cp_raw_q), int(CP_PARTS_EDGE),
++                                 int(CP_KV_GATHER)]
+         # TF_GLM_DISK_CACHE (``pcache``): every rank takes part in a disk hit's agreement, so all have it or none
+         disk_on = int(bool(os.environ.get("TF_GLM_DISK_CACHE", "").strip() not in ("", "0", "off")) and parallel == 1)
+         mine.append(disk_on)
+@@ -938,7 +940,7 @@ class GlmEngine:
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+                                "TF_GLM_MULTI_GRAPHS, TF_GLM_MULTI_DRAFT_GRAPHS, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_DISK_CACHE, TF_GLM_CP_RAW_Q, "
+-                               "TF_GLM_CP_PARTS_EDGE): "
++                               "TF_GLM_CP_PARTS_EDGE, TF_GLM_CP_KV_GATHER): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 230970f..c7654c0 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -963,6 +963,8 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+     # or gather. Index keys are still written for later sparse rows.
+     within = ((host_pos + R <= c.index_topk) if host_pos is not None else sparse_np is None) and \
+         c.dense_limit <= c.index_topk
++    if b.prefill and CP_KV_GATHER and host_pos is not None and sparse_np is None:
++        return cp_prompt_kvg(layer, w, lc, kr, pos_dev, b, R, keys, host_pos, qp, within)
+     if b.prefill and CP_PIPE:
+         return cp_prompt(layer, w, lc, kr, pos_dev, b, R, keys, host_pos, sparse_np, qp, within)
+     if ix is not None and keys is not None and within:
+@@ -1368,6 +1370,140 @@ def cp_prompt(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, pos
+     return out_proj(w, b, o, a.o, None, R, site=(layer.index, "a"))
+ 
+ 
++# TF_GLM_CP_KV_GATHER (0141; default 1): context-parallel prompt chunks gather each layer's visible context (every
++# rank's latent and rotary rows of the positions before the chunk's end: ~430 B a token at fp4, ~650 at fp8) instead of
++# exchanging every row's queries and attention partials (~50 KB a row and layer: 3,072 rows x 79 layers ~ 12 GB a
++# chunk); each rank then attends its own heads over each row's whole top-k (ascending position) in one call of Mia's
++# sparse attention, as a rank does without context parallelism. Decode windows keep dsa_full_cp's path. 0: cp_prompt.
++CP_KV_GATHER = os.environ.get("TF_GLM_CP_KV_GATHER", "1") != "0"
++
++
++def cp_kvg_buffers(b: Buffers, lc: torch.Tensor, kr: torch.Tensor, G: int, S: int):
++    """The gathered latent and rotary rows of one layer, [G * S, ...] each (every rank's first S local slots,
++    rank-major: position p at row (p % G) S + p // G): views of one pair of allocations kept on the prompt buffer, G x
++    the planes' rows (ceil(capacity / G) + 1), made at the first chunk (``geometry.full_cp_bytes`` counts them)."""
++    held = getattr(b, "cp_kvg", None)
++    rows = G * lc.shape[0]
++    if held is None or held[0].shape[0] < rows or held[0].dtype != lc.dtype or held[1].dtype != kr.dtype \
++            or held[0].shape[1:] != lc.shape[1:] or held[1].shape[1:] != kr.shape[1:]:
++        b.cp_kvg = None
++        held = b.cp_kvg = (torch.empty((rows, *lc.shape[1:]), dtype=lc.dtype, device=lc.device),
++                           torch.empty((rows, *kr.shape[1:]), dtype=kr.dtype, device=kr.device))
++    return held[0][:G * S], held[1][:G * S]
++
++
++def _words(t: torch.Tensor) -> torch.Tensor:
++    """A contiguous tensor's bytes as int32 words (the collectives' types; every cache row is a multiple of 4 B)."""
++    return t.reshape(-1).view(torch.int32)
++
++
++def cp_prompt_kvg(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
++                  R: int, keys: torch.Tensor | None, host_pos: int, qp: torch.Tensor, within: bool) -> torch.Tensor:
++    """dsa_full_cp for a prompt chunk at host_pos (TF_GLM_CP_KV_GATHER), after the projections, cache writes, rotary
++    queries and index keys:
++
++    - every rank's first S = ceil((host_pos + R) / G) local slots of this layer's latent and rotary planes are
++      all-gathered (a second stream, while the selection scores) into one [G * S] pair of planes (``cp_kvg_buffers``):
++      every token the chunk's rows see, the bytes each owner wrote;
++    - the selection is context parallelism's exact one (each rank scores its own tokens, candidates to the row owners,
++      ``dcp.select_threshold``), but a row's owner keeps every rank's candidates >= the threshold as global positions
++      in ascending order (``dcp.owner_lists``: the replicated dsa_full.select_tokens list of the row), mapped to rows
++      of the gathered planes, and the lists are all-gathered (4 B a token); rows that see k tokens or fewer take all;
++    - the rank's own heads attend their rows over the gathered planes (Mia's sparse attention, ``msa.prompt``; on
++      CPU the chunk programs) straight into the attended latents: no query gather, no partials, no merge.
++
++    A row's bits depend on its query, its list (ascending positions, the same in any chunk) and the cache rows it
++    names, never on the chunk: rows keep their bits for any chunking of the prompt."""
++
++    from . import dcp, dsa_full
++
++    c = w.cfg
++    a = layer.dsa
++    HL = a.heads
++    G, rank = int(w.meta["cp"]), int(w.rank)
++    k = c.index_topk
++    freq = w.meta["rope_freq"]
++    ix = a.index
++    s = b.lat_s
++    dev = lc.device
++    side = _Side(dev)
++    gather_all = getattr(w.comm, "nccl", w.comm).all_gather
++    S = -(-(int(host_pos) + R) // G)
++    gl, gr = cp_kvg_buffers(b, lc, kr, G, S)
++
++    def gather_kv() -> None:
++        gather_all(_words(lc[:S]), _words(gl))
++        gather_all(_words(kr[:S]), _words(gr))
++
++    with prof.timed("dsa: kv gather"):
++        evk = side.run(gather_kv)                 # after this layer's cache writes (the main stream's work so far)
++    with prof.timed("dsa: absorb"):
++        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R], prompt=latent.PROMPT_MMA)
++    if ix is not None and keys is not None and within:
++        with prof.timed("dsa: select tokens"):
++            b.topk = cp_kvg_all_visible(b, R, host_pos, G, S, k, dev)
++    elif ix is not None and keys is not None:
++        with prof.timed("dsa: select tokens"):
++            mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
++            dsa_full.index_q_rope(b.qi[:R], c.index_heads, pos_dev, freq)
++            cols = max(1, dcp.visible_local(host_pos + R - 1, rank, G))
++            M = dcp.owner_rows(R, G)
++            cand = torch.empty((G * M, k), dtype=torch.int64, device=dev)
++            if G * M > R:
++                cand[R:].zero_()                      # pad rows: no candidates (an empty list, never read)
++            dcp.select_local(b.qi[:R], b.ikr[:R, c.index_dim:], keys, rank, G, pos_dev, R, k=k, cols=cols,
++                             out=cand[:R])
++            every = torch.empty((G, M, k), dtype=torch.int64, device=dev)
++            every[rank].copy_(cand[rank * M:(rank + 1) * M])
++            peers = [p for p in range(G) if p != rank]
++            ev = side.run(lambda: w.comm.exchange_all({p: [cand[p * M:(p + 1) * M]] for p in peers},
++                                                       {p: [every[p]] for p in peers}))
++            side.wait(ev)
++            th = torch.empty((M,), dtype=torch.int64, device=dev)
++            dcp.select_threshold(every, M, th)
++            own_t, own_c = dcp.owner_lists(every, th, G, S)
++            all_t = torch.empty((G * M, k), dtype=torch.int32, device=dev)
++            all_c = torch.empty((G * M,), dtype=torch.int32, device=dev)
++
++            def gather_lists() -> None:
++                gather_all(own_t.reshape(-1), all_t.reshape(-1))
++                gather_all(own_c, all_c)
++
++            side.wait(side.run(gather_lists))
++            b.topk = (all_t[:R], all_c[:R])
++    elif b.topk is None:
++        raise RuntimeError(f"layer {layer.index}: a shared indexer layer without a full layer's top-k before it")
++    tokens, counts = b.topk
++    ol = s.ol[:R]
++    scale = c.qk_dim ** -0.5
++    with prof.timed("dsa: kvg attention"):
++        side.wait(evk)
++        if PROMPT_MSA and qa.is_cuda and msa_ok(qa, gl, gr):
++            from . import msa
++
++            msa.prompt(qa, gl, tokens, counts, ol, scale, qp[:R], gr)
++        else:
++            for r0 in range(0, R, PROMPT_SPARSE_ROWS):
++                r1 = min(R, r0 + PROMPT_SPARSE_ROWS)
++                latent.sparse_attention(qa[r0:r1], gl, tokens[r0:r1], counts[r0:r1], ol[r0:r1], scale,
++                                        qp=qp[r0:r1], rope=gr)
++        side.join()
++    with prof.timed("dsa: expand"):
++        o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=latent.PROMPT_MMA).view(R, HL * c.v_dim)
++    return out_proj(w, b, o, a.o, None, R, site=(layer.index, "a"))
++
++
++def cp_kvg_all_visible(b: Buffers, R: int, host_pos: int, G: int, S: int, k: int, dev):
++    """cp_prompt_kvg's lists for a chunk whose rows see at most k tokens: row r every position 0 .. host_pos + r,
++    ascending, as rows of the gathered planes ((p % G) S + p // G), and its count; what ``dcp.owner_lists`` gives a
++    row with fewer than k candidates, so the row has the same list in any chunk."""
++    p = torch.arange(k, dtype=torch.int64, device=dev)
++    rows = ((p % G) * S + p // G).to(torch.int32)
++    tokens = rows.expand(R, k).contiguous()
++    counts = (torch.arange(R, dtype=torch.int32, device=dev) + int(host_pos) + 1).clamp(max=k)
++    return tokens, counts
++
++
+ def cp_all_visible(w: Weights, b: Buffers, R: int, pos_dev: torch.Tensor, G: int, rank: int, k: int):
+     """Context parallelism's lists for rows that see at most k tokens: every visible local slot of the rank,
+     ascending (slot t holds position t G + rank, visible to row r at pos + r when t G + rank <= pos + r), and their
+diff --git tensorfold/families/glm5_next/cuda/msa.cpp tensorfold/families/glm5_next/cuda/msa.cpp
+index f9007fc..25d5347 100644
+--- tensorfold/families/glm5_next/cuda/msa.cpp
++++ tensorfold/families/glm5_next/cuda/msa.cpp
+@@ -5,6 +5,8 @@
+ void msa_prompt_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                      const at::Tensor&, at::Tensor&, float*, double);
+ 
++void msa_set_fp4_lut(bool);
++
+ void prompt(const at::Tensor& qa, const at::Tensor& qp, const at::Tensor& cache, const at::Tensor& rope,
+             const at::Tensor& tokens, const at::Tensor& counts, at::Tensor out, double scale) {
+     auto ok = [](const at::Tensor& x, at::ScalarType t) { return x.is_cuda() && x.scalar_type() == t && x.is_contiguous(); };
+@@ -39,4 +41,5 @@ void prompt_lse(const at::Tensor& qa, const at::Tensor& qp, const at::Tensor& ca
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("prompt", &prompt);
+     m.def("prompt_lse", &prompt_lse);
++    m.def("set_fp4_lut", &msa_set_fp4_lut);
+ }
+diff --git tensorfold/families/glm5_next/cuda/msa.cu tensorfold/families/glm5_next/cuda/msa.cu
+index 3b4cc7e..15eec52 100644
+--- tensorfold/families/glm5_next/cuda/msa.cu
++++ tensorfold/families/glm5_next/cuda/msa.cu
+@@ -126,7 +126,23 @@ __device__ __forceinline__ int tile_token(const int* __restrict__ toks, int t0,
+ 
+ __constant__ float E2M1[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f, -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+ 
+-template <bool FP4, bool R8>
++// an e2m1 code (sign, 2 exponent bits, 1 mantissa bit) as bf16 bits, by its bits (0141): the table above read from
++// constant memory with a different index in every lane serialized the dequantize step (FP4 tiles ~2x FP8's time)
++__device__ __forceinline__ uint32_t e2m1_bf16(uint32_t c) {
++    const uint32_t em = c & 7u;
++    const uint32_t mag = em == 0u ? 0u : em == 1u ? 0x3F00u : (((126u + (em >> 1)) << 7) | ((em & 1u) << 6));
++    return ((c & 8u) << 12) | mag;
++}
++
++// a byte of two e2m1 codes (the even value low) times the block scale bs2 (bf16, both halves) as a bf16 pair: an
++// e2m1 value times an e4m3 scale is exact in bf16, so this is the table's float product rounded to bf16, bit for bit
++__device__ __forceinline__ uint32_t e2m1x2_scaled_bf16x2(uint32_t by, __nv_bfloat162 bs2) {
++    const uint32_t v = e2m1_bf16(by & 15u) | (e2m1_bf16(by >> 4) << 16);
++    const __nv_bfloat162 p = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&v), bs2);
++    return *reinterpret_cast<const uint32_t*>(&p);
++}
++
++template <bool FP4, bool R8, bool LUT = false>
+ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+     const __nv_bfloat16* __restrict__ qa, const __nv_bfloat16* __restrict__ qp, const uint8_t* __restrict__ cache,
+     const unsigned char* __restrict__ rope, const int* __restrict__ tokens, const int* __restrict__ counts,
+@@ -215,11 +231,17 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+                         *reinterpret_cast<unsigned char*>(&bs8) = row[LW / 2 + sl * 4 + blk];
+                         const float bs = float(bs8);
+                         uint32_t o[4];
++                        if constexpr (LUT) {
+ #pragma unroll
+-                        for (int bb = 0; bb < 4; ++bb) {
+-                            const uint32_t by = (w[j] >> (8 * bb)) & 0xffu;
+-                            const __nv_bfloat162 v = __floats2bfloat162_rn(E2M1[by & 15u] * bs, E2M1[by >> 4] * bs);
+-                            o[bb] = *reinterpret_cast<const uint32_t*>(&v);
++                            for (int bb = 0; bb < 4; ++bb) {
++                                const uint32_t by = (w[j] >> (8 * bb)) & 0xffu;
++                                const __nv_bfloat162 v = __floats2bfloat162_rn(E2M1[by & 15u] * bs, E2M1[by >> 4] * bs);
++                                o[bb] = *reinterpret_cast<const uint32_t*>(&v);
++                            }
++                        } else {
++                            const __nv_bfloat162 bs2 = __float2bfloat162_rn(bs);     // exact: an e4m3 value
++#pragma unroll
++                            for (int bb = 0; bb < 4; ++bb) o[bb] = e2m1x2_scaled_bf16x2((w[j] >> (8 * bb)) & 0xffu, bs2);
+                         }
+                         *reinterpret_cast<uint4*>(dst + q2 * 32 + j * 8) = make_uint4(o[0], o[1], o[2], o[3]);
+                     }
+@@ -438,6 +460,10 @@ __global__ void __launch_bounds__(NTHREADS, 1) msa_kernel(
+ 
+ }  // namespace
+ 
++// TF_GLM_MSA_FP4_LUT=1 (msa.py): FP4 tiles dequantized through the constant table as before 0141 (the same bits)
++bool g_fp4_lut = false;
++void msa_set_fp4_lut(bool on) { g_fp4_lut = on; }
++
+ void msa_prompt_cuda(const at::Tensor& qa, const at::Tensor& qp, const at::Tensor& cache, const at::Tensor& rope,
+                      const at::Tensor& tokens, const at::Tensor& counts, at::Tensor& out, float* lse, double scale) {
+     const int R = (int)qa.size(0), H = (int)qa.size(1);
+@@ -454,11 +480,16 @@ void msa_prompt_cuda(const at::Tensor& qa, const at::Tensor& qp, const at::Tenso
+                                             (int)SMEM));
+         C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             (int)SMEM));
++        C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<true, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                            (int)SMEM));
++        C10_CUDA_CHECK(cudaFuncSetAttribute(msa_kernel<true, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                            (int)SMEM));
+         return true;
+     }();
+     (void)once;
+     if (R == 0) return;
+-    (r8 ? msa_kernel<true, true> : fp4 ? msa_kernel<true, false> : msa_kernel<false, false>)
++    (r8 ? (g_fp4_lut ? msa_kernel<true, true, true> : msa_kernel<true, true>)
++        : fp4 ? (g_fp4_lut ? msa_kernel<true, false, true> : msa_kernel<true, false>) : msa_kernel<false, false>)
+         <<<R, NTHREADS, SMEM, at::cuda::getCurrentCUDAStream()>>>(
+         reinterpret_cast<const __nv_bfloat16*>(qa.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(qp.data_ptr()),
+         cache.data_ptr<uint8_t>(), reinterpret_cast<const unsigned char*>(rope.data_ptr()), tokens.data_ptr<int>(),
+diff --git tensorfold/families/glm5_next/cuda/msa.py tensorfold/families/glm5_next/cuda/msa.py
+index f000ae4..41613aa 100644
+--- tensorfold/families/glm5_next/cuda/msa.py
++++ tensorfold/families/glm5_next/cuda/msa.py
+@@ -10,6 +10,16 @@ from pathlib import Path
+ import torch
+ 
+ HEADS = 24                    # query heads a rank at most (full GLM-5.3: 22 / 21 / 21 at three ranks)
++# TF_GLM_MSA_FP4_LUT=1: FP4 tiles dequantized through msa.cu's constant table (before 0141); 0 (default): by the codes'
++# bits, the same bf16 values (an e2m1 value times an e4m3 scale is exact), without the table's serialized reads
++FP4_LUT = __import__("os").environ.get("TF_GLM_MSA_FP4_LUT", "0") == "1"
++
++
++def set_fp4_lut(on: bool) -> None:
++    """Switch the FP4 dequantize step (benchmarks and the bit-for-bit test)."""
++    global FP4_LUT
++    FP4_LUT = bool(on)
++    _ext().set_fp4_lut(FP4_LUT)
+ 
+ 
+ @lru_cache(maxsize=1)
+@@ -17,8 +27,10 @@ def _ext():
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_msa_v6", sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
+-                extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
++    ext = load(name="tensorfold_glm_msa_v7", sources=[str(here / "msa.cpp"), str(here / "msa.cu")],
++               extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
++    ext.set_fp4_lut(FP4_LUT)
++    return ext
+ 
+ 
+ def supported(qa: torch.Tensor, cache: torch.Tensor, rope: torch.Tensor | None) -> bool:
