@@ -1,0 +1,314 @@
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 40b0fcf..160ce2c 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -801,48 +801,83 @@ def dsa_full_block(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor
+     through kv_b (its key rows zero-padded over the rotary dims) with their rotary dims rotated beside them; dense
+     latent attention for rows within the top-k, the selected tokens' for rows past it, the selection made on a full
+     layer (``keys``: its per-token index keys) and reused on the shared layers after it (b.topk); then kv_b's value
+-    rows and o_proj. ``indexed``: the engine holds index caches (long contexts). Returns every rank's partials."""
++    rows and o_proj. ``indexed``: the engine holds index caches (long contexts). Returns every rank's partials.
++
++    Three pieces, so that a window of several streams' rows (``verify.FullBatchedVerify``) runs the row-independent
++    ones on all its rows and the position- and cache-bound one per stream: ``dsa_full_front`` (projections),
++    ``dsa_full_rows`` (one stream's rows on its caches) and ``dsa_full_out`` (value rows, o_proj, collective)."""
++
++    if int(w.meta.get("cp", 1)) > 1:
++        return dsa_full_cp(layer, w, lc, kr, pos_dev, b, R, keys, host_pos, sparse_np)
++    dsa_full_front(layer, w, b, 0, R)
++    b.topk = dsa_full_rows(layer, w, lc, kr, pos_dev, b, R, nch, keys, host_pos, sparse_np, indexed=indexed,
++                           topk=b.topk)
++    return dsa_full_out(layer, w, b, R)
+ 
+-    from . import dsa_full
++
++def dsa_full_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
++    """Full GLM-5.3's attention projections of rows lo .. hi: q_a / kv_a (one matmul), the query and latent RMSNorms,
++    q_b. Every kernel keeps rows apart (``qmm``: the same K slices and row tile for any row count up to 16), so the
++    rows of several streams projected together get the bits each gets alone."""
+ 
+     c = w.cfg
+     a = layer.dsa
+-    HL = a.heads
+     q0, l0 = c.q_lora, c.q_lora + c.kv_lora
+-    freq = w.meta["rope_freq"]
+-    cp = int(w.meta.get("cp", 1))
+-    if cp > 1:
+-        return dsa_full_cp(layer, w, lc, kr, pos_dev, b, R, keys, host_pos, sparse_np)
++    n = hi - lo
+     with prof.timed("dsa: projections"):
+-        mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
+-        glue.rmsnorm(b.dp[:R, :q0], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
+-        glue.rmsnorm(b.dp[:R, q0:l0], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
+-        mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
++        mm(b, b.normed[lo:hi], a.proj, b.xs[lo:hi], b.dp[lo:hi])
++        glue.rmsnorm(b.dp[lo:hi, :q0], a.q_norm, c.eps, b.qr[lo:hi], b.xs_qr[lo:hi])
++        glue.rmsnorm(b.dp[lo:hi, q0:l0], a.kv_norm, c.eps, b.lat[lo:hi], b.xs_lat[lo:hi])
++        mm(b, b.qr[lo:hi], a.q_b, b.xs_qr[lo:hi], b.q[lo:hi].view(n, a.heads * c.qk_dim))
++
++
++def dsa_full_rows(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
++                  R: int, nch: int | None, keys: torch.Tensor | None, host_pos: int | None,
++                  sparse_np: int | None = None, *, indexed: bool = True, topk=None, lo: int = 0):
++    """``dsa_full_block`` between its projections and its value rows, for rows lo .. lo + R of the buffers (their
++    front done) as ONE stream's window: its caches (``lc``, ``kr``, ``keys``), its device position ``pos_dev`` (the
++    first row's) and host position ``host_pos``. Writes the rows' latents, rotary keys and (full indexer layer) index
++    keys, rotates the queries, selects on a full layer, absorbs, attends: the attended latents into b.lat_s.ol[lo:lo
++    + R]. Every call below takes only these rows and this stream's caches, with the arguments (row count, chunk count,
++    head block, token bucket) a window of R rows alone at host_pos gets, so the rows get that window's bits.
++
++    ``topk``: the (tokens, counts) the stream's last full indexer layer selected for these rows, which a shared layer
++    reuses. Returns the selection to carry to the next layer: this layer's on a full indexer layer (None when no row
++    is sparse), else ``topk`` unchanged. A window of several streams keeps one per stream (a single carried selection
++    overwritten by the last stream would hand the next shared layer the wrong rows)."""
++
++    from . import dsa_full
++
++    c = w.cfg
++    a = layer.dsa
++    l0 = c.q_lora + c.kv_lora
++    freq = w.meta["rope_freq"]
++    rs = slice(lo, lo + R)
+     with prof.timed("dsa: latent write"):
+-        latent.latent_write(b.lat[:R], lc, pos_dev)
+-        dsa_full.k_rope_write(b.dp[:R, l0:], kr, pos_dev, freq)
+-    qp = dsa_full.q_rope(b.q[:R], b.qp[:R], pos_dev, freq, c.nope)
++        latent.latent_write(b.lat[rs], lc, pos_dev)
++        dsa_full.k_rope_write(b.dp[rs, l0:], kr, pos_dev, freq)
++    qp = dsa_full.q_rope(b.q[rs], b.qp[rs], pos_dev, freq, c.nope)
+     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
+     sparse_rows = indexed and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
+     ix = a.index
+     if ix is not None and keys is not None:
+         with prof.timed("dsa: indexer update"):
+-            mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
+-            dsa_full.index_write(b.ikr[:R, :c.index_dim], ix.ln_w, ix.ln_b, keys, pos_dev, freq)
+-        b.topk = None
++            mm(b, b.normed[rs], ix.kw, b.xs[rs], b.ikr[rs])
++            dsa_full.index_write(b.ikr[rs, :c.index_dim], ix.ln_w, ix.ln_b, keys, pos_dev, freq)
++        topk = None
+         if sparse_rows:
+             with prof.timed("dsa: select tokens"):
+-                mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+-                dsa_full.index_q_rope(b.qi[:R], c.index_heads, pos_dev, freq)
+-                b.topk = dsa_full.select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], keys, host_pos, R, pos_dev,
+-                                                bucket_cols=sparse_np, prompt=b.prefill and sparse_np is None,
+-                                                k=c.index_topk)
+-    elif sparse_rows and b.topk is None:
++                mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
++                dsa_full.index_q_rope(b.qi[rs], c.index_heads, pos_dev, freq)
++                topk = dsa_full.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], keys, host_pos, R, pos_dev,
++                                              bucket_cols=sparse_np, prompt=b.prefill and sparse_np is None,
++                                              k=c.index_topk)
++    elif sparse_rows and topk is None:
+         raise RuntimeError(f"layer {layer.index}: a shared indexer layer without a full layer's top-k before it")
+     s = b.lat_s
+     with prof.timed("dsa: absorb"):
+-        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R], prompt=b.prefill and latent.PROMPT_MMA)
+-    ol = s.ol[:R]
++        qa = latent.absorb_q(b.q[rs], a.absorb, s.qa[rs], prompt=b.prefill and latent.PROMPT_MMA)
++    ol = s.ol[rs]
+     scale = c.qk_dim ** -0.5
+     if not all_sparse:
+         dense = dense_rows_full(c, R, host_pos) if sparse_rows else R
+@@ -851,7 +886,7 @@ def dsa_full_block(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor
+                             hb=latent.head_block(R), starts=b.att_starts if b.prefill else None, qp=qp[:dense],
+                             rope=kr)
+     if sparse_rows:
+-        tokens, counts = b.topk
++        tokens, counts = topk
+         with prof.timed("dsa: sparse attention"):
+             # the chunk programs and their merge, prompt chunks in blocks of PROMPT_SPARSE_ROWS rows (their fp32
+             # partials' memory): at full GLM-5.3's 22 heads a rank the one-pass prompt kernel (GLM-5.3-Flash's
+@@ -869,8 +904,18 @@ def dsa_full_block(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor
+                     r1 = min(R, r0 + step)
+                     latent.sparse_attention(qa[r0:r1], lc, tokens[r0:r1], counts[r0:r1], ol[r0:r1], scale,
+                                             qp=qp[r0:r1], rope=kr)
++    return topk
++
++
++def dsa_full_out(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor | None:
++    """Full GLM-5.3's attention after the attended latents b.lat_s.ol[:R]: kv_b's value rows (``expand_v``: a row's
++    sum alone) and o_proj with its collective, on every row at once; every rank's partials."""
++
++    c = w.cfg
++    a = layer.dsa
+     with prof.timed("dsa: expand"):
+-        o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
++        o = latent.expand_v(b.lat_s.ol[:R], a.absorb, b.vn[:R],
++                            prompt=b.prefill and latent.PROMPT_MMA).view(R, a.heads * c.v_dim)
+     return out_proj(w, b, o, a.o, None if b.prefill else qmm.group_sums(o, b.xs_ao[:R]), R,
+                     site=(layer.index, "a"))
+ 
+@@ -893,13 +938,9 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+     a = layer.dsa
+     HL = a.heads
+     G, rank = int(w.meta["cp"]), int(w.rank)
+-    q0, l0 = c.q_lora, c.q_lora + c.kv_lora
++    l0 = c.q_lora + c.kv_lora
+     freq = w.meta["rope_freq"]
+-    with prof.timed("dsa: projections"):
+-        mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
+-        glue.rmsnorm(b.dp[:R, :q0], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
+-        glue.rmsnorm(b.dp[:R, q0:l0], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
+-        mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
++    dsa_full_front(layer, w, b, 0, R)
+     with prof.timed("dsa: latent write"):
+         latent.latent_write(b.lat[:R], lc, pos_dev, cp=G, rank=rank)
+         dsa_full.k_rope_write(b.dp[:R, l0:], kr, pos_dev, freq, cp=G, rank=rank)
+diff --git tensorfold/families/glm5_next/cuda/verify.py tensorfold/families/glm5_next/cuda/verify.py
+index 64dbc7c..b22192b 100644
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -10,6 +10,8 @@ and DFlash2 taps out, then each stream's commit of the rows it keeps. Two implem
+   segmented latent / sparse attention over the streams' extents (``forward.dsa_segments``, ``segments.SegRows``);
+   the commit replays each segment's kept rows (``kda.replay_layers_segments``) and shifts its conv window
+   (``forward.conv_shift_segments``). Every segment's rows get the bits of that stream's window alone.
++- ``FullBatchedVerify`` (full GLM-5.3, eager): ONE forward too, the projections, o_proj, MoE and head on every row,
++  each segment's cache writes, RoPE, selection and attention on its own stream's caches (``forward.dsa_full_rows``).
+ 
+ The scheduler (``multi.MultiDecoder``) only sees ``forward`` / ``commit``."""
+ 
+@@ -288,3 +290,142 @@ class BatchedVerify:
+                 st.cur = [1 - st.cur[0]] * len(st.cur)
+             st.set_pos(st.pos + keep)
+         self.segments = []
++
++
++# full GLM-5.3: the rows a batched window takes at most. Up to 16 rows every row-independent kernel keeps the tile it
++# runs a lone stream's window on (qmm's 16-row bucket, the absorb's one row a program, 16-head attention tiles), so
++# the bits cannot move with the window's size; past it the tiles change (claimed bit-neutral, unproven on the GPU).
++FULL_MAX_ROWS = 16
++
++
++class FullBatchedVerify:
++    """Full GLM-5.3's batched verify: ONE eager forward over every segment's rows back to back (``forward.compute``
++    with a ``mixer``), each segment a stream's window on its own ``State`` (its extent of the shared ``Caches``, its
++    ``Slots`` position). Full GLM-5.3 has no KDA layers and no hyper-connections, so what is not attention is row-wise:
++    the embedding, the RMSNorms, the attention projections (``forward.dsa_full_front``), the value rows, o_proj and
++    its collective (``forward.dsa_full_out``), the MoE and its collective, the head, all on the whole window, once.
++    Per segment, on that stream's caches at its positions (``forward.dsa_full_rows``, the same calls a lone window of
++    the segment's rows makes): latent, rotary and index key writes, query RoPE, top-k selection, dense / sparse
++    attention. Each segment's selection is carried through the shared indexer layers on its own (``self.topk``).
++
++    So every segment's logits are the bits of that stream's window run alone (``forward.forward`` at its state), and
++    a commit of any rows leaves each stream where its own window and commit would. Milestone 1: eager only (no CUDA
++    graphs), no drafter, no context parallelism (its caches hold one extent at base 0), at most FULL_MAX_ROWS rows.
++    ``e``: anything with the engine's ``w`` and ``caches`` (the pool the states view); ``taps``: DFlash2-style tap
++    layers to return, or ()."""
++
++    def __init__(self, e, *, taps: Sequence[int] = (), rows: int = FULL_MAX_ROWS) -> None:
++        from . import latent
++        from .forward import Buffers
++
++        w = e.w
++        c = w.cfg
++        if not c.full:
++            raise ValueError("FullBatchedVerify is full GLM-5.3's (GLM-5.3-Flash: BatchedVerify)")
++        if int(w.meta.get("cp", 1)) > 1:
++            raise ValueError("context parallelism serves one stream (its caches keep one extent at base 0)")
++        if not latent.ENABLED:
++            raise ValueError("batched verify windows need the latent cache (TF_GLM_LATENT=1)")
++        if not 1 <= rows <= FULL_MAX_ROWS:
++            raise ValueError(f"a full GLM-5.3 batched window holds 1 .. {FULL_MAX_ROWS} rows, not {rows}")
++        self.e, self.w, self.rows_max = e, w, rows
++        self.b = Buffers(w, rows, e.caches.rows)
++        if taps:
++            self.b.set_taps(tuple(taps), c.hidden)
++        self.taps = bool(taps)
++        self.segments: list[Segment] = []
++        self.topk: list = []
++        self.R = 0
++
++    def _stage(self, tokens: list[int]) -> None:
++        b = self.b
++        R = len(tokens)
++        if b.staged is not None:
++            b.staged.synchronize()
++        b.ids_host[:R].numpy()[:] = tokens
++        b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
++        if b.staged is not None:
++            b.staged.record()
++
++    def _check(self, segments: Sequence[Segment]) -> int:
++        """The window's rows; refuses windows the forward cannot run exactly: too many rows, an empty segment, two
++        segments on one state or on overlapping extents (one's writes would land in the other's keys)."""
++
++        from .forward import check_room
++
++        R = 0
++        spans = []
++        for seg in segments:
++            st, n = seg.st, len(seg.tokens)
++            if n < 1:
++                raise ValueError("a segment needs at least one token")
++            check_room(self.w, st, n)
++            spans.append((st.base, st.base + st.capacity, id(st)))
++            R += n
++        if not segments or R > self.rows_max:
++            raise ValueError(f"a window of {R} rows in {len(segments)} segments, the batched buffers hold "
++                             f"{self.rows_max}")
++        spans.sort()
++        for (a0, a1, ia), (b0, b1, ib) in zip(spans, spans[1:]):
++            if ia == ib or b0 < a1:
++                raise ValueError("the segments' states must be distinct streams on disjoint extents")
++        return R
++
++    @torch.no_grad()
++    def forward(self, segments: Sequence[Segment]) -> Verified:
++        from .forward import compute
++
++        R = self._check(segments)
++        self._stage([t for seg in segments for t in seg.tokens])
++        self.segments, self.R = list(segments), R
++        self.topk = [None] * len(segments)          # each segment's carried selection, reset as b.topk is
++        logits = compute(self.w, None, self.b, R, mixer=self._mixer)
++        out, taps, at = [], [], 0
++        for seg in segments:
++            n = len(seg.tokens)
++            out.append(logits[at:at + n])
++            taps.append(torch.cat([t[at:at + n] for t in self.b.taps], dim=1) if self.taps else None)
++            at += n
++        return Verified(out, taps)
++
++    def _mixer(self, layer):
++        """A layer's attention over the whole window: the projections and the output on every row, the rest per
++        segment on its own stream's caches and positions."""
++
++        from . import prof
++        from .forward import chunks_for, dsa_full_front, dsa_full_out, dsa_full_rows
++
++        if layer.kind != "dsa":
++            raise ValueError(f"layer {layer.index}: full GLM-5.3 has attention layers only")
++        w, b, R = self.w, self.b, self.R
++        with prof.timed("dsa (total)"):
++            dsa_full_front(layer, w, b, 0, R)
++            at = 0
++            for k, seg in enumerate(self.segments):
++                st, n = seg.st, len(seg.tokens)
++                di = st.dsa_index[layer.index]
++                keys = None
++                if st.index is not None and layer.dsa.index is not None:
++                    keys = st.index[st.index_of[layer.index]][2]
++                # the lone window's arguments: its rows, its chunk count, its host position (dense / sparse rows,
++                # the selection's token bucket over its own extent)
++                self.topk[k] = dsa_full_rows(layer, w, st.kc[di], st.kr[di], st.pos_dev, b, n, chunks_for(st, n),
++                                             keys, st.pos, None, indexed=st.index is not None, topk=self.topk[k],
++                                             lo=at)
++                at += n
++            return dsa_full_out(layer, w, b, R)
++
++    @torch.no_grad()
++    def commit(self, segments: Sequence[Segment], keeps: Sequence[int]) -> None:
++        """Each segment keeps its first ``keeps[k]`` rows (``forward.commit``: full GLM-5.3 has no recurrent state, so
++        its position advances; the caches' rows past it are rewritten before anything reads them)."""
++
++        from .forward import commit
++
++        if [id(s) for s in segments] != [id(s) for s in self.segments]:
++            raise ValueError("commit takes the segments of the last forward")
++        if len(keeps) != len(segments) or any(not 1 <= k <= len(s.tokens) for s, k in zip(segments, keeps)):
++            raise ValueError("keep must be in 1..rows for every segment")
++        for seg, keep in zip(segments, keeps):
++            commit(self.w, seg.st, self.b, len(seg.tokens), keep)
++        self.segments = []
