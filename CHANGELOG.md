@@ -37,6 +37,14 @@
 - A stopped request (client gone, stop string) ends on every rank within a round instead of decoding to max_tokens
   (0122, the GLM-5.3-Flash recipe's fix for its issue #38); CPU test `tests/cpu/test_stop_vote.py`.
 - `tools/quality.py`: a fixed quality suite with paired comparison; results of the 4-bit KV cache in the README.
+- DSpark draft dumps and an offline simulator (0123): `TF_GLM_DRAFT_DUMP` records the drafter's view at every
+  position, `dspark_sim` replays proposal policies on it exactly (same drafts as the engine) and scores them against
+  the reply.
+- `TF_GLM_MEM_TRACE=1` logs every rank's memory after each prompt chunk; the KV line names the actual format (0124).
+- DSpark's draft selection ~8 ms faster a round with the same drafts (0125): its Markov rows are read through NumPy
+  instead of a torch gather (7.8 -> 0.12 ms a greedy chain of 8 slots on the host).
+- Sampled replies check the top_p nucleus on all ranks' candidates together by default (`TENSORFOLD_NUCLEUS_UNION=1`):
+  the same tokens, ~1% faster.
 - Captured decode windows under CP (TF_GLM_CP_GRAPHS=1, off by default) cost ~2.9 GiB on each Spark. At 655k with fp8
   that left spark3 under the memory guard's 3 GiB during a long prompt: the guard stopped it and the other ranks
   waited (the "hang" seen with graphs on). With fp4, boot fp4g655 (KV=fp4 CP=1 TF_GLM_CP_GRAPHS=1, 655,360 window,

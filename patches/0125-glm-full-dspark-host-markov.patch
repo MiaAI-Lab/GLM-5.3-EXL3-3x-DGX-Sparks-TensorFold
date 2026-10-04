@@ -1,0 +1,86 @@
+diff --git tensorfold/families/glm5_next/cuda/dspark.py tensorfold/families/glm5_next/cuda/dspark.py
+index 99c621d..6235a49 100644
+--- tensorfold/families/glm5_next/cuda/dspark.py
++++ tensorfold/families/glm5_next/cuda/dspark.py
+@@ -196,6 +196,19 @@ DSPARK_NOISE = float(__import__("os").environ.get("TF_GLM_DSPARK_NOISE", "") or
+ DSPARK_FILTER = __import__("os").environ.get("TF_GLM_DSPARK_FILTER", "1") != "0"
+ 
+ 
++def _bits(w: torch.Tensor) -> np.ndarray:
++    """A host bf16 tensor's raw 16-bit words as a NumPy view (no copy)."""
++
++    return w.view(torch.int16).numpy()
++
++
++def _bf16_rows(bits: np.ndarray, idx) -> np.ndarray:
++    """Rows of a bf16 matrix (its raw words) as float64: exactly torch's bf16 -> double (bf16 is float32's top half),
++    in NumPy: ~1 ms a slot of torch dispatch becomes ~20 us, the same bits."""
++
++    return (bits[idx].astype(np.uint16).astype(np.uint32) << 16).view(np.float32).astype(np.float64)
++
++
+ def target_kept(score: np.ndarray, ids: np.ndarray, s) -> np.ndarray:
+     """Which of a slot's candidates the target's sampling rule keeps, judged on the drafter's scores (already over the
+     temperature): ``choose_rows``' order (score descending, id ascending), top_k, the top_p prefix, min_p."""
+@@ -506,14 +519,14 @@ class Drafter(_DFlash2):
+ 
+     # -- the sequential stage ---------------------------------------------------------------------------------------
+     def markov_embed(self, token: int) -> np.ndarray | None:
+-        return self.w1[int(token)].double().numpy() if self.w1 is not None else None
++        return _bf16_rows(_bits(self.w1), int(token)) if self.w1 is not None else None
+ 
+     def markov_bias(self, cand: np.ndarray, emb: np.ndarray | None) -> np.ndarray:
+         """W2[cand] @ W1[prev] in float64 (the bias of the candidates only)."""
+ 
+         if emb is None:
+             return np.zeros(cand.shape, dtype=np.float64)
+-        return self.w2[torch.from_numpy(np.ascontiguousarray(cand, dtype=np.int64))].double().numpy() @ emb
++        return _bf16_rows(_bits(self.w2), np.asarray(cand, dtype=np.int64)) @ emb
+ 
+     def chain(self, tokens: np.ndarray, values: np.ndarray, hconf: np.ndarray, anchor: int, first: int,
+               sampling: Sampling | None, confidence: float = 0.0, *, round_ms=None,
+diff --git tensorfold/families/glm5_next/cuda/dspark_sim.py tensorfold/families/glm5_next/cuda/dspark_sim.py
+index 3007468..58e81b3 100644
+--- tensorfold/families/glm5_next/cuda/dspark_sim.py
++++ tensorfold/families/glm5_next/cuda/dspark_sim.py
+@@ -32,6 +32,7 @@ class Policy:
+     costs: tuple[float, ...] | None = None    # verify ms of 1, 2, .. rows: cut at best_depth (learned confidences)
+     noise: float | None = None            # keyed-noise weight when sampling (None: the dump's)
+     filter: bool | None = None            # the target_kept filter when sampling (None: the dump's)
++    logit_scale: float = 1.0              # sampled picks: the drafter's scores times this before the keyed noise
+     conf_scale: float = 1.0               # confidence logits scaled before the sigmoid (calibration experiments)
+     conf_shift: float = 0.0
+ 
+@@ -81,7 +82,7 @@ def chain(r: Record, i: int, p: Policy) -> list[int]:
+     for d in range(depth):
+         bias = r.mb0[i] if d == 0 else r.mbs[i, d - 1, a]
+         score = (r.vals[i, d] + bias) / temp
+-        pick = score + weight * r.noise[i, d] if sampled else score
++        pick = p.logit_scale * score + weight * r.noise[i, d] if sampled else score
+         if sampled and use_filter:
+             pick = np.where(target_kept(score, r.cand[i, d], r.sampling), pick, -np.inf)
+         j = int(np.argmax(pick))
+@@ -156,8 +157,21 @@ def main(argv: list[str]) -> None:
+             Policy("fc8:0.15", most=8, confidence=0.15)]
+     if costs is not None:
+         pols += [Policy(f"cost{m}", most=m, costs=costs) for m in (5, 7, 8)]
+-    for w in (0.5, 0.7, 1.0):
+-        pols.append(Policy(f"fc5:0.3 noise {w}", most=5, confidence=0.3, noise=w))
++    if any(r.sampling is not None for r in recs):          # sampled replies: noise weight x logit scale
++        for w in (0.5, 0.7, 0.85, 1.0):
++            for ls in (0.8, 1.0, 1.25):
++                pols.append(Policy(f"fc5:0.3 noise {w} scale {ls}", most=5, confidence=0.3, noise=w, logit_scale=ls))
++        pols.append(Policy("fc5:0.3 no filter", most=5, confidence=0.3, filter=False))
++    groups = {"greedy": [r for r in recs if r.sampling is None], "sampled": [r for r in recs if r.sampling is not None]}
++    for gname, grecs in groups.items():
++        if not grecs:
++            continue
++        print(f"-- {gname}: {len(grecs)} replies")
++        report(grecs, pols if gname == "sampled" else [q for q in pols if q.noise is None and q.filter is None],
++               costs)
++
++
++def report(recs: list[Record], pols: list[Policy], costs) -> None:
+     for p in pols:
+         agg = [walk(r, p, costs) for r in recs]
+         t, rd = sum(a["tokens"] for a in agg), sum(a["rounds"] for a in agg)

@@ -79,3 +79,15 @@ def test_walk_counts_rounds():
     r.tokens[1:1 + len(first)] = first
     out = sim.walk(r, sim.Policy("p", most=3))
     assert out["tokens"] == 10 and out["rounds"] <= 10 - len(first) + 1
+
+
+def test_numpy_bf16_rows_equal_torch_double():
+    from tensorfold.families.glm5_next.cuda.dspark import _bf16_rows, _bits
+    g = torch.Generator().manual_seed(9)
+    w = (torch.randn((500, R), generator=g) * 3).to(torch.bfloat16)
+    w[3, :4] = torch.tensor([0.0, -0.0, float("inf"), 1e-40]).to(torch.bfloat16)    # signed zero, inf, subnormal
+    idx = np.array([0, 3, 499, 3, 17])
+    want = w[torch.from_numpy(idx)].double().numpy()
+    got = _bf16_rows(_bits(w), idx)
+    assert np.array_equal(want.view(np.int64), got.view(np.int64))
+    assert np.array_equal(w[3].double().numpy().view(np.int64), _bf16_rows(_bits(w), 3).view(np.int64))
