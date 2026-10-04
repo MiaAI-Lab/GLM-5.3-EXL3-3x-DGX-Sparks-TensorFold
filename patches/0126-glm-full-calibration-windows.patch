@@ -1,0 +1,70 @@
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index e6e4226..5914c64 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -328,6 +328,10 @@ CALIBRATION_TEXT = (
+     "to the sea, where it settles into deltas that shift with every flood and every dry season.")
+ 
+ 
++# TF_GLM_CALIBRATION_WINDOWS: windows of the calibration text timed for each verify width (default 4; 1: as before)
++CALIBRATION_WINDOWS = max(1, min(4, int(os.environ.get("TF_GLM_CALIBRATION_WINDOWS", "4") or 4)))
++
++
+ def calibration_tokens(model_dir) -> list[int] | None:
+     """CALIBRATION_TEXT through the checkpoint's tokenizer (the same ids on every rank), or None."""
+ 
+@@ -890,7 +894,8 @@ class GlmEngine:
+         self.costs = self._calibrate()
+         if rank == 0:
+             c = self.costs
+-            print(f"[tensorfold] drafter timings (ms, fastest of 7): {c['timed']}", flush=True)
++            print(f"[tensorfold] drafter timings (ms, fastest of 7; verify widths the mean of {CALIBRATION_WINDOWS} windows): "
++                  f"{c['timed']}", flush=True)
+             mtp = (f"; MTP draft {c['mtp']:.2f} (+{c['mtp_step']:.2f} a chained draft, +{c['mtp_row']:.2f} a row)"
+                    if w.mtp is not None else "")
+             print("[tensorfold] drafter costs (ms): verify " + " ".join(f"{v:.1f}" for v in c["verify"]) + mtp +
+@@ -951,9 +956,9 @@ class GlmEngine:
+         # random tokens route every row to different experts, overstating a window's expert union and so its cost
+         text = calibration_tokens(getattr(self, "model_dir", None))
+ 
+-        def tokens(n: int) -> list[int]:
+-            if text is not None and 64 + n <= len(text):
+-                return list(text[64:64 + n])
++        def tokens(n: int, at: int = 0) -> list[int]:
++            if text is not None and 64 + at + n <= len(text):
++                return list(text[64 + at:64 + at + n])
+             return [int(t) for t in rng.integers(0, vocab, n)]
+ 
+         prefill(e, list(text[:64]) if text is not None and len(text) >= 64 + 16 else
+@@ -969,7 +974,12 @@ class GlmEngine:
+         # the verify windows the drafters' rounds use (MTP chains of 3, DFlash2 blocks of 5: the captured graphs);
+         # wider (copied) windows are not the choice's, and their eager launches would bend the fitted line
+         widest = max(GRAPH_ROWS + WIDE_GRAPHS)          # TF_GLM_WIDE_GRAPHS=9: a DSpark round's 8 drafts too
+-        pieces: dict[str, tuple] = {f"v{r}": (lambda w=tokens(r): e.forward(w), None) for r in range(1, widest + 1)}
++        # each width on CALIBRATION_WINDOWS windows from different points of the text (the fastest pass of each,
++        # then their mean): one window's chance routing (a row that happens to pull in new experts) no longer steps the
++        # table, e.g. the single-window +14 ms from 8 to 9 rows (boot p22)
++        offsets = [24 * j for j in range(CALIBRATION_WINDOWS)]
++        pieces: dict[str, tuple] = {f"v{r}@{o}": (lambda w=tokens(r, o): e.forward(w), None)
++                                    for r in range(1, widest + 1) for o in offsets}
+         if self.w.mtp is not None:
+             pieces["m1"] = (lambda: draft(e, hidden[:1], one, st.pos + 1, 1, None), rewind)
+             pieces["m3"] = (lambda: draft(e, hidden[:1], one, st.pos + 1, 3, None), rewind)
+@@ -1005,6 +1015,8 @@ class GlmEngine:
+         got = torch.empty((self.world * mine.numel(),), dtype=torch.float32, device="cuda")
+         self.comm.all_gather(mine, got)
+         both = dict(zip(names, got.view(self.world, -1).max(dim=0).values.tolist()))
++        for r in range(1, widest + 1):                   # a width's cost: the mean of its windows' fastest passes
++            both[f"v{r}"] = sum(both[f"v{r}@{o}"] for o in offsets) / len(offsets)
+         if os.environ.get("TF_GLM_PROFILE_VERIFY", "0") == "1":   # lab: where a verify window's width goes, eagerly
+             from . import prof
+             from .forward import chunks_for, compute, stage
+@@ -1043,7 +1055,7 @@ class GlmEngine:
+         mtp = both.get("m1", 0.0)
+         return {"verify": verify, "mtp": mtp, "mtp_step": max((both.get("m3", 0.0) - mtp) / 2, 0.0),
+                 "mtp_row": max((both.get("m6", 0.0) - mtp) / 5, 0.0), "block": both.get("block", 0.0),
+-                "taps_row": max(both.get("taps8", 0.0) / 8, 0.0), "timed": {k: round(v, 2) for k, v in both.items()}}
++                "taps_row": max(both.get("taps8", 0.0) / 8, 0.0), "timed": {k: round(v, 2) for k, v in both.items() if "@" not in k}}
+ 
+     def _gather_ints(self, values: list[int]) -> list[list[int]]:
+         torch = self.torch

@@ -1,0 +1,203 @@
+diff --git tensorfold/families/glm5_next/cuda/dspark_sim.py tensorfold/families/glm5_next/cuda/dspark_sim.py
+index 58e81b3..f160963 100644
+--- tensorfold/families/glm5_next/cuda/dspark_sim.py
++++ tensorfold/families/glm5_next/cuda/dspark_sim.py
+@@ -117,6 +117,68 @@ def check_production(r: Record) -> int:
+     return bad
+ 
+ 
++def confidence_pairs(r: Record, p: Policy) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    """(slot, confidence logit, kept) for every slot of every record's full chain (all D slots walked), kept: the draft
++    equals the reply's token there given every earlier draft did (the verifier's conditional acceptance)."""
++
++    full = Policy("full", most=r.cand.shape[1], noise=p.noise, filter=p.filter, logit_scale=p.logit_scale)
++    slots, logits, kept = [], [], []
++    n = len(r.tokens) - 1
++    for i in range(len(r.cand)):
++        drafts = chain(r, i, full)
++        zs = _conf_logits(r, i, full)
++        for d, tok in enumerate(drafts):
++            if i + 1 + d > n:
++                break
++            slots.append(d)
++            logits.append(zs[d])
++            ok = tok == int(r.tokens[i + 1 + d])
++            kept.append(ok)
++            if not ok:
++                break
++    return np.array(slots), np.array(logits), np.array(kept)
++
++
++def _conf_logits(r: Record, i: int, p: Policy) -> list[float]:
++    """The learned confidence logits of the chain p proposes at record i (before scale/shift)."""
++
++    from .dspark import target_kept
++
++    m = r.meta
++    sampled = r.sampling is not None
++    temp = float(r.sampling.temperature) if sampled else 1.0
++    weight = m["dspark_noise"] if p.noise is None else p.noise
++    use_filter = m["dspark_filter"] if p.filter is None else p.filter
++    out, a = [], -1
++    for d in range(min(p.most, r.cand.shape[1])):
++        bias = r.mb0[i] if d == 0 else r.mbs[i, d - 1, a]
++        score = (r.vals[i, d] + bias) / temp
++        pick = p.logit_scale * score + weight * r.noise[i, d] if sampled else score
++        if sampled and use_filter:
++            pick = np.where(target_kept(score, r.cand[i, d], r.sampling), pick, -np.inf)
++        j = int(np.argmax(pick))
++        out.append(float(r.hconf[i, d]) + m["conf_b"] + (float(r.cm0[i]) if d == 0 else float(r.cms[i, d - 1, a])))
++        a = j
++    return out
++
++
++def fit_confidence(slots: np.ndarray, z: np.ndarray, kept: np.ndarray) -> tuple[float, float, float, float]:
++    """Logistic fit kept ~ sigmoid(a z + b) (Newton steps): (a, b, mean predicted before, mean kept)."""
++
++    a, b = 1.0, 0.0
++    for _ in range(50):
++        q = 1.0 / (1.0 + np.exp(-(a * z + b)))
++        g = np.array([np.sum((kept - q) * z), np.sum(kept - q)])
++        w = q * (1 - q)
++        h = np.array([[np.sum(w * z * z), np.sum(w * z)], [np.sum(w * z), np.sum(w)]]) + 1e-9 * np.eye(2)
++        step = np.linalg.solve(h, g)
++        a, b = a + step[0], b + step[1]
++        if np.abs(step).max() < 1e-10:
++            break
++    before = float(np.mean(1.0 / (1.0 + np.exp(-z))))
++    return float(a), float(b), before, float(np.mean(kept))
++
++
+ def walk(r: Record, p: Policy, costs: tuple[float, ...] | None = None) -> dict:
+     """Rounds, tokens and (with ``costs``: verify ms of 1, 2, .. rows) estimated ms of decoding the reply under p."""
+ 
+@@ -169,6 +231,28 @@ def main(argv: list[str]) -> None:
+         print(f"-- {gname}: {len(grecs)} replies")
+         report(grecs, pols if gname == "sampled" else [q for q in pols if q.noise is None and q.filter is None],
+                costs)
++        calibration_report(grecs, costs)
++
++
++def calibration_report(recs: list[Record], costs) -> None:
++    pairs = [confidence_pairs(r, Policy("p")) for r in recs]
++    sl, z, k = (np.concatenate([q[j] for q in pairs]) for j in range(3))
++    if not len(z):
++        return
++    a, b, before, rate = fit_confidence(sl, z, k.astype(np.float64))
++    print(f"   confidence: mean predicted {before:.3f} vs kept {rate:.3f} over {len(z)} slots; fitted scale {a:.3f} "
++          f"shift {b:.3f}")
++    for d in range(int(sl.max()) + 1):
++        m = sl == d
++        if m.sum() >= 20:
++            print(f"     slot {d}: n {int(m.sum())}, predicted {np.mean(1 / (1 + np.exp(-z[m]))):.3f}, "
++                  f"fitted {np.mean(1 / (1 + np.exp(-(a * z[m] + b)))):.3f}, kept {np.mean(k[m]):.3f}")
++    if costs is not None:
++        for name, p in (("cost8 raw", Policy("c", most=8, costs=costs)),
++                        ("cost8 calibrated", Policy("c", most=8, costs=costs, conf_scale=a, conf_shift=b))):
++            agg = [walk(r, p, costs) for r in recs]
++            t, rd = sum(x["tokens"] for x in agg), sum(x["rounds"] for x in agg)
++            print(f"   {name:>18}: tokens/round {t / rd:.3f}, est. {1000.0 * t / sum(x['ms'] for x in agg):.1f} tok/s")
+ 
+ 
+ def report(recs: list[Record], pols: list[Policy], costs) -> None:
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index b5d58b9..4408991 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -475,15 +475,18 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
+ 
+ 
+ def partials(w: Weights, b: Buffers, R: int, fill, label: str | None = None, site: tuple | None = None,
+-             whole: bool = False) -> torch.Tensor | None:
++             whole: bool = False, pre=None) -> torch.Tensor | None:
+     """``fill(lo, hi)`` writes rows lo .. hi of this rank's fp32 partial b.part; returns every rank's partials
+     [world, R, D] (``gather``), or None while a prompt chunk runs row-split (TF_GLM_HC_SPLIT), which exchanges them
+-    and runs hc_post itself (``hcsplit.HcSplit``)."""
++    and runs hc_post itself (``hcsplit.HcSplit``). ``pre()``: work on every row before any fill (one call), after
++    which the fills run by row range: the peers' rows first, their exchange overlapping this rank's own fill."""
+ 
+     sp = b.split
+     if sp is not None and sp.active:
+-        sp.partial(fill, whole)
++        sp.partial(fill, whole, pre=pre)
+         return None
++    if pre is not None:
++        pre()
+     fill(0, R)
+     if site is not None and l2pf.ACTIVE is not None:      # TF_GLM_L2PF: the next reads into L2 during the gather
+         l2pf.ACTIVE.site(*site)
+@@ -1095,6 +1098,23 @@ def moe_full_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tenso
+         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
+     slots = c.top_k + 1
+ 
++    if b.prefill and R <= EXL3_BLOCK_ROWS and MOE_OVERLAP and b.split is not None and b.split.active:
++        # TF_GLM_MOE_OVERLAP (default 1): the routed experts of every row in one call first (as below), then the shared
++        # expert and the combine by row range, the peers' rows first: their partials go out while this rank fills its
++        # own (each row's arithmetic unchanged: the same bits)
++        routed = {}
++
++        def pre() -> None:
++            routed["y"] = _routed_rows(layer, w, b, 0, R)
++
++        def fill_after(lo: int, hi: int) -> None:
++            shared_front(layer, w, b, lo, hi)
++            with prof.timed("moe: combine"):
++                glue.combine_shared(routed["y"].view(R, slots, c.hidden)[lo:hi], b.sy[lo:hi], b.wts[lo:hi],
++                                    b.part[lo:hi])
++
++        return partials(w, b, R, fill_after, "moe: all-gather", site=(layer.index, "f"), pre=pre)
++
+     def fill(lo: int, hi: int) -> None:
+         shared_front(layer, w, b, lo, hi)
+         # the routed experts in blocks of EXL3_BLOCK_ROWS rows (the grouping kernel stages a block's picks in shared
+@@ -1126,6 +1146,29 @@ def moe_full_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tenso
+     return partials(w, b, R, fill, "moe: all-gather", site=(layer.index, "f"), whole=True)
+ 
+ 
++def _routed_rows(layer: LayerW, w: Weights, b: Buffers, a: int, z: int) -> torch.Tensor:
++    """The routed experts' output rows a .. z [(z - a) * slots, hidden] (one block, <= EXL3_BLOCK_ROWS rows), the
++    same kernels and bits as ``moe_full_block``'s fill."""
++
++    from tensorfold.cuda.exl3 import experts as generic
++
++    c, m = w.cfg, layer.moe
++    with prof.timed("moe: routed (exl3)"):
++        kind = prompt_ok(m.experts) if b.px is not None else None
++        if kind == "mpe" and b.mpx is not None:
++            from tensorfold.cuda.exl3 import mpe
++
++            return mpe.pairs(b.normed[a:z], b.pick[a:z], m.experts, b.mpx, b.gx.y, c.limit, act_mode=generic.ACT_BF16)
++        if kind is not None:
++            from tensorfold.cuda.exl3 import prompt_experts
++
++            return prompt_experts.prompt_pairs(b.normed[a:z], b.pick[a:z], m.experts, b.px, b.gx.y, c.limit,
++                                               act_mode=generic.ACT_BF16)
++        return generic.routed(b.normed[a:z], b.pick[a:z], None, m.experts, b.gx, None, z - a, c.limit,
++                              act_mode=generic.ACT_BF16, mt=2 if b.prefill else 1)
++
++
++MOE_OVERLAP = os.environ.get("TF_GLM_MOE_OVERLAP", "1") != "0"
+ EXL3_BLOCK_ROWS = 2176    # a whole prompt chunk (2,048 rows and the split's pad): 2,176 x 9 x 4 bytes = 77 KiB
+ # Prompt chunks' routed experts (TF_GLM_PROMPT_EXPERTS):
+ #   mpe (default): Mia's prompt experts (cuda/exl3/mpe: each row rotated once a layer, the trellis decoded once for
+diff --git tensorfold/families/glm5_next/cuda/hcsplit.py tensorfold/families/glm5_next/cuda/hcsplit.py
+index a6856f4..58213b5 100644
+--- tensorfold/families/glm5_next/cuda/hcsplit.py
++++ tensorfold/families/glm5_next/cuda/hcsplit.py
+@@ -280,12 +280,15 @@ class HcSplit:
+         theirs = self.theirs() + off
+         self.w.comm.exchange([t[mine:mine + n] for t in outs], [t[theirs:theirs + n] for t in outs], self.peer)
+ 
+-    def partial(self, fill: Callable[[int, int], None], whole: bool = False) -> None:
++    def partial(self, fill: Callable[[int, int], None], whole: bool = False, pre=None) -> None:
+         """This rank's fp32 partial rows (``fill(lo, hi)`` writes b.part[lo:hi]), the peers' rows sent to them and
+         their partials of this rank's rows received (``got``). ``whole``: one fill of every row, then the pieces'
+         swaps (a block whose kernels lose more on short row ranges than the overlap wins: full GLM-5.3's MoE)."""
+ 
+         mine = self.mine()
++        if pre is not None:                             # every row's shared work first, then the fills by range
++            pre()
++            whole = False
+         if whole and self.stream is not None and not self.gather:
+             fill(0, self.R)
+             main = torch.cuda.current_stream()
