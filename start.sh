@@ -348,6 +348,8 @@ until curl -sf --max-time 5 "$URL/v1/models" >/dev/null 2>&1; do
     # the memory at this start holds a smaller window than asked (a Spark's free memory drifts): once, start again
     # with the largest one TensorFold names
     refit=$(docker logs "$CONTAINER_NAME" 2>&1 | sed -n 's/.*largest fitting prompt-plus-reply window: \([0-9]*\) tokens.*/\1/p' | tail -1)
+    # 97% of it, a multiple of 2,048: free memory keeps drifting between the two starts (by ~0.3 GiB on a busy Spark)
+    [[ -n "$refit" ]] && refit=$(( refit * 97 / 100 / 2048 * 2048 ))
     [[ -n "$refit" && $attempt == 1 && "$refit" -ge 4096 ]] && break
     fail "rank 0 exited (code $(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
   fi

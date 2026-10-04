@@ -57,6 +57,8 @@ request at a time. Each figure names its boot; figures from one boot are single 
 
 | | Measured | Boot and settings |
 | --- | --- | --- |
+| Defaults with 0122-0129, greedy | prose 30.6-32.6, code 41.7-43.2 tok/s (3 runs); prefill 630 / 679 / 660 tok/s at 8k / 16k / 32k | dflt: defaults, FP8 KV, the start's window 155,648 (start.sh's fallback, below) |
+| Defaults with 0122-0129, sampled (T 1.0, top_p 0.95) | prose 26.5-27.8, code 31.2-33.1 tok/s | dflt |
 | Decode, code | 39.5-40.4 tok/s (3 runs) | p17: defaults (RoCE, DSpark, FP8 KV, 163,840-token window), sampled |
 | Decode, prose | 29.1-30.2 tok/s (3 runs) | p17 |
 | Decode with NCCL instead of RoCE | code 33.0-34.5, prose 27.6-28.1 tok/s | p15 vs NCCL boots: RoCE is ~+10% |
@@ -119,6 +121,9 @@ context parallelism: FP4 29/30, FP8 27/30 short questions, recall 8/8 at 64k and
   on the first long chunk and then stays flat to 314k tokens. The thin margin was the window: 655,360 left TensorFold's
   admission ~0.25 GiB on spark3 (and spark3's other services move its free memory by about a GiB). At 626,688 tokens
   spark3's lowest was 5.35 GiB through a 314k-token needle (correct): the long-context mode's window.
+
+If a Spark's free memory has drifted since the memory plan ran and TensorFold's own admission refuses the window,
+`start.sh` starts again once with 97% of the largest window TensorFold names (a multiple of 2,048) and says so.
 
 ## Requirements
 
