@@ -7,7 +7,9 @@
   <a href="https://x.com/MiaAI_lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
 </p>
 
-<!-- hero image: .github/image.png -->
+<p align="center">
+  <img src=".github/image.png" alt="GLM-5.3 EXL3 on TensorFold, 3x DGX Sparks" width="100%">
+</p>
 
 Serve **[GLM-5.3](https://huggingface.co/zai-org/GLM-5.3)**, Z.ai's full model (78 layers of MLA with DeepSeek sparse
 attention, 256 routed experts, an MTP head), from three NVIDIA DGX Sparks (GB10, 128 GB each, joined by a triangle of
