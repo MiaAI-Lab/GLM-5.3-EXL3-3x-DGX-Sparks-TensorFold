@@ -52,13 +52,30 @@ default), seeds 11, 22 and 33; long prompts with `tools/needle.py`.
 
 **Default: long-context mode** (`./start.sh`: `CP=1`, 499,712-token window, fp4 KV, 3,072-row prompt chunks)
 
-| | Measured | Boot |
-| --- | --- | --- |
-| Prefill | **563 tok/s** at 9.9k tokens, **545 tok/s** at 94k, **468 tok/s** at 314k (needles correct; spark3's lowest free memory 5.26 GiB); 607 / 596 / 590 tok/s at 8k / 16k / 32k | hcp: 499,712-token window, 3,072-row chunks, 0141 (before it, cp500b: 448 / 434, and 419 / 491 / 496) |
-| Decode, greedy | prose 31.7-32.5, code 41.8-42.3 tok/s | fp4g627x: the same mode at a 626,688-token window, 2,048-row chunks, patches through 0128 |
-| Decode, sampled | prose 22.9-24.0, code 25.7-29.4 tok/s | fp4g627x |
-| Long prompts | needles correct at 9.9k and 94k tokens (cp500b), and at 314k (fp4g655, 655,360-token window) | |
-| Exact | 12/12 | hcp, cp500b |
+Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) through the OpenAI API on the release build (boot
+hcp, patches through 0141, 2026-10-04).
+
+**Decode** (one request, greedy)
+
+| Concurrent requests | Prose | TTFT | Code | TTFT |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 31.3 tok/s | 5 ms | 41.7 tok/s | 412 ms |
+
+**Prefill**
+
+| Prompt | Prefill | TTFT |
+| ---: | ---: | ---: |
+| 4k (4,120 tokens) | 601.5 tok/s | 6.85 s |
+| 8k (8,218 tokens) | 606.5 tok/s | 13.55 s |
+| 16k (16,407 tokens) | 598.4 tok/s | 27.42 s |
+| 32k (32,792 tokens) | 591.2 tok/s | 55.47 s |
+| 94k (94,317 tokens, `tools/needle.py`) | 545 tok/s | 173.0 s |
+| 314k (314,225 tokens, `tools/needle.py`) | 468 tok/s | 671.1 s |
+
+The 94k and 314k prompts are needles, both answered correctly, on the same build (boot hcp); spark3's lowest free
+memory through the 314k prompt was 5.26 GiB. Before 0141 the same mode prefilled 448 / 434 tok/s at 9.9k / 94k
+(cp500b). Drafted replies equal serial ones on this build (12/12, `tools/exact.py`). Sampled decode (temperature 1.0,
+top_p 0.95) in this mode: prose 22.9-24.0, code 25.7-29.4 tok/s (fp4g627x, an earlier build of the same mode).
 
 **Without context parallelism** (`CP=0 ./start.sh`: 163,840-token window, FP8 KV)
 
