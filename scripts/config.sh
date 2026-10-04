@@ -62,7 +62,8 @@ DSPARK_REVISION="${DSPARK_REVISION-b374b95663447ea0e935151be4f3d6666e36e6d7}"
 # this recipe extends; 0100 on: full GLM-5.3). prepare.sh builds it on every Spark FROM the GLM-5.3-Flash recipe's
 # published image (FLASH_IMAGE: TensorFold v0.6.0 with exactly patches 0001-0068, pulled by digest), applying the
 # patches past them: a layer of a few hundred KB, nothing big crosses the Sparks' links. FLASH_IMAGE= (empty) builds
-# from BASE_IMAGE instead (pip install of TensorFold, every patch).
+# from BASE_IMAGE instead (pip install of TensorFold, every patch). Before building, prepare.sh pulls this release's
+# prebuilt image from GHCR_IMAGE (PULL=0 skips that).
 TF_VERSION="${TF_VERSION:-v0.6.0}"
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
@@ -72,6 +73,17 @@ IMAGE="${IMAGE:-tensorfold-glm53-full:${TF_VERSION}}"
 IMAGE_EXTRAS="av==18.1.0 xgrammar>=0.2.8,<0.3"
 image_hash() { (cat patches/*.patch 2>/dev/null; echo "$IMAGE_EXTRAS") | sha256sum | cut -c1-12; }
 flash_hash() { (cat patches/00[0-6][0-9]-*.patch 2>/dev/null; echo "$IMAGE_EXTRAS") | sha256sum | cut -c1-12; }
+GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/glm-5.3-exl3-3x-dgx-sparks-tensorfold}"
+# The published image of this release's patches, pinned: prepare.sh pulls it by digest (a tag can be moved, a digest
+# cannot) while patches/*.patch and IMAGE_EXTRAS still hash to IMAGE_TAG's hash. Other patches pull
+# $GHCR_IMAGE:<TF_VERSION>-<hash> when one is published, else build as above. scripts/publish-image.sh prints both.
+IMAGE_TAG="${IMAGE_TAG:-}"
+IMAGE_DIGEST="${IMAGE_DIGEST:-}"
+# the registry reference prepare.sh pulls for these patches: the pinned digest, or the hash's tag
+prebuilt_image() {
+  local tag="${TF_VERSION}-$(image_hash)"
+  if [[ "$tag" == "$IMAGE_TAG" && -n "$IMAGE_DIGEST" ]]; then echo "$GHCR_IMAGE@$IMAGE_DIGEST"; else echo "$GHCR_IMAGE:$tag"; fi
+}
 CONTAINER_NAME="${CONTAINER_NAME:-glm53-full-tf}"   # the same name on every Spark
 
 SERVED_NAME="${SERVED_NAME:-GLM-5.3-EXL3}"

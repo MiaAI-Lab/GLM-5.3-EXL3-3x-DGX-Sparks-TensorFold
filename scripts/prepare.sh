@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Prepare the three Sparks to serve GLM-5.3 (MODEL_ID) with TensorFold:
 #   1. preflight: docker and the GPU on every Spark, key-based ssh to both workers, the CX7 links, disk space
-#   2. the image on every Spark, built there: FROM the GLM-5.3-Flash recipe's published image (TensorFold v0.6.0 with
+#   2. the image on every Spark: this release's prebuilt image pulled from GHCR_IMAGE (PULL=0 skips that), else built
+#      there FROM the GLM-5.3-Flash recipe's published image (TensorFold v0.6.0 with
 #      patches 0001-0068, pulled by digest when a Spark lacks it) plus this recipe's later patches, a layer of a few
 #      hundred KB; or, with FLASH_IMAGE= (empty), from BASE_IMAGE with every patch (pip install of TensorFold)
 #   3. the checkpoint on the head (HF_CACHE): served as it is when its snapshot is complete there, else downloaded
-#      (~273 GiB, resumable; a gated repository needs your Hugging Face token), keeping KEEP_FREE_GB free
+#      (~273 GiB, resumable; with the hf CLI, else from inside the image), keeping KEEP_FREE_GB free
 #   4. the checkpoint checked: its config read by the patched engine, every file of its index present
 #   5. each worker reads the head's HF_CACHE over NFS (required; nothing is copied): a read-only docker volume
 #      NFS_VOLUME on the worker, mounted from its NFS server (the head's address on that worker's cable), checked file
@@ -85,6 +86,16 @@ fi
 nocache=(); (( REBUILD )) && nocache=(--no-cache)
 built_here() { [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null)" == "$HASH" ]]; }
 built_there() { [[ "$(worker "$1" docker image inspect -f "'{{index .Config.Labels \"tf.patches\"}}'" "$IMAGE" 2>/dev/null)" == "$HASH" ]]; }
+label_of() { docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$1" 2>/dev/null; }
+prebuilt=$(prebuilt_image)            # the pinned digest (config.sh's IMAGE_TAG / IMAGE_DIGEST), else the hash's tag
+if (( ! REBUILD )) && [[ "${PULL:-1}" == 1 ]] && ! built_here; then
+  log "Pulling the prebuilt image $prebuilt (~25 GB; PULL=0 builds instead)"
+  if docker pull "$prebuilt" >/dev/null && [[ "$(label_of "$prebuilt")" == "$HASH" ]]; then
+    docker tag "$prebuilt" "$IMAGE"; log "Using $prebuilt as $IMAGE"
+  else
+    warn "could not pull $prebuilt (no image for these patches, the package is not public, or no network): building it"
+  fi
+fi
 if (( REBUILD )) || ! built_here; then
   if (( FAST )); then
     docker image inspect "$FLASH_IMAGE" >/dev/null 2>&1 || { log "Pulling $FLASH_IMAGE (the GLM-5.3-Flash recipe's image, ~25 GB)"; docker pull "$FLASH_IMAGE"; }
@@ -98,6 +109,11 @@ log "Image $IMAGE (patches $HASH) here"
 for i in $(worker_ids); do
   h=$(worker_host "$i")
   if (( ! REBUILD )) && built_there "$i"; then log "Image $IMAGE (patches $HASH) on worker $i"; continue; fi
+  if (( ! REBUILD )) && [[ "${PULL:-1}" == 1 ]] && worker "$i" docker pull "$prebuilt" >/dev/null 2>&1 &&
+     [[ "$(worker "$i" docker image inspect -f "'{{index .Config.Labels \"tf.patches\"}}'" "$prebuilt" 2>/dev/null)" == "$HASH" ]]; then
+    worker "$i" docker tag "$prebuilt" "$IMAGE"
+    built_there "$i" && { log "Using $prebuilt as $IMAGE on worker $i ($h)"; continue; }
+  fi
   if (( FAST )); then
     if ! worker "$i" docker image inspect "$FLASH_IMAGE" >/dev/null 2>&1; then
       root=$(worker "$i" "docker info -f '{{.DockerRootDir}}'" 2>/dev/null || echo /var/lib/docker)
@@ -124,16 +140,25 @@ files = set(json.load(open(os.path.join(snap, "model.safetensors.index.json")))[
 sys.exit(0 if all(os.path.isfile(os.path.join(snap, f)) for f in files) else 1)
 PY
 }
+command -v hf >/dev/null || warn "host 'hf' CLI not found: downloads run from inside the image"
+download() {  # <repo id> <revision or empty>: into HF_CACHE/hub, the standard cache layout, resumable
+  if command -v hf >/dev/null; then
+    hf download "$1" ${2:+--revision "$2"} --cache-dir "$HF_CACHE/hub" >/dev/null
+  else                                 # owned by this user, as the host CLI's files would be
+    docker run --rm --user "$(id -u):$(id -g)" --network host --entrypoint python ${HF_TOKEN:+-e HF_TOKEN} \
+      -v "$HF_CACHE":/hf -e HF_HOME=/hf -e HOME=/tmp "$IMAGE" -c \
+      'import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1], revision=sys.argv[2] or None)' "$1" "$2"
+  fi
+}
 rev=$(snapshot_rev "$MODEL_ID")
 if [[ -n "$rev" ]] && complete "$dir/snapshots/$rev"; then
   log "Checkpoint: $MODEL_ID @ ${rev:0:12} complete in $HF_CACHE (nothing to download)"
 else
-  command -v hf >/dev/null || die "$MODEL_ID is not complete in $HF_CACHE and the host has no 'hf' CLI to download it (pip install -U huggingface_hub)"
   have=$(free_gb "$HF_CACHE")
   (( have >= 280 + KEEP_FREE_GB )) ||
     die "only ${have} GB free under $HF_CACHE: the download needs ~280 GB and leaves KEEP_FREE_GB=$KEEP_FREE_GB free"
   log "Downloading $MODEL_ID${MODEL_REVISION:+ @ ${MODEL_REVISION:0:12}} into $HF_CACHE/hub (~273 GiB, resumes if interrupted)"
-  hf download "$MODEL_ID" ${MODEL_REVISION:+--revision "$MODEL_REVISION"} --cache-dir "$HF_CACHE/hub" >/dev/null ||
+  download "$MODEL_ID" "$MODEL_REVISION" ||
     die "$MODEL_ID: the download failed (a gated repository: accept its terms on Hugging Face and log in with hf auth login)"
   [[ -z "$MODEL_REVISION" || -f "$dir/refs/main" ]] || { mkdir -p "$dir/refs"; printf %s "$MODEL_REVISION" > "$dir/refs/main"; }
   rev=$(snapshot_rev "$MODEL_ID")
@@ -147,7 +172,7 @@ if [[ "$DRAFTER" == dspark ]]; then              # the DSpark speculator, in the
     log "Drafter: $DSPARK_ID @ ${drev:0:12} in $HF_CACHE (nothing to download)"
   else
     log "Downloading the drafter $DSPARK_ID${DSPARK_REVISION:+ @ ${DSPARK_REVISION:0:12}} (~2.4 GiB)"
-    hf download "$DSPARK_ID" ${DSPARK_REVISION:+--revision "$DSPARK_REVISION"} --cache-dir "$HF_CACHE/hub" >/dev/null ||
+    download "$DSPARK_ID" "$DSPARK_REVISION" ||
       die "$DSPARK_ID: the download failed"
   fi
 fi
