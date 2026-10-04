@@ -1,0 +1,207 @@
+diff --git tensorfold/cuda/exl3/experts.cu tensorfold/cuda/exl3/experts.cu
+index fa43234..be60076 100644
+--- tensorfold/cuda/exl3/experts.cu
++++ tensorfold/cuda/exl3/experts.cu
+@@ -13,17 +13,29 @@ namespace {
+ constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
+ 
+ // Grouping in one block: distinct experts (< E) in id order, members row * 32 + slot in row order, -1 after the last.
++// The picks are read from a copy: STAGED, in shared memory as 16-bit values (an expert id < E <= 4,096 kept, any other
++// pick -1, which no expert matches), so 3,072 rows x 9 slots take 54 KiB; past the shared memory a block can opt in
++// to (some 5,600 rows of 9 slots on GB10), straight from global memory. Either way every expert scans the same picks
++// in the same order: the same members, in the same order, as the 32-bit staging before (and as any split of the rows
++// into blocks, each block's members offset by its first row).
+ constexpr int GROUP_THREADS = 1024;
+ constexpr int GROUP_PER_THREAD = 4;
+ 
++template <bool STAGED>
+ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restrict__ pick, int* __restrict__ uids,
+                                                               int* __restrict__ ucount, int* __restrict__ members,
+                                                               int R, int slots, int E, int maxm) {
+-    extern __shared__ int sh_pick[];
++    extern __shared__ short sh_pick16[];
+     __shared__ int warp_tot[GROUP_THREADS / 32];
+     const int n = R * slots;
+-    for (int i = threadIdx.x; i < n; i += GROUP_THREADS) sh_pick[i] = pick[i];
+-    __syncthreads();
++    if constexpr (STAGED) {
++        for (int i = threadIdx.x; i < n; i += GROUP_THREADS) {
++            const int p = pick[i];
++            sh_pick16[i] = (short)(p >= 0 && p < E ? p : -1);
++        }
++        __syncthreads();
++    }
++    auto sh_pick = [&](int i) -> int { if constexpr (STAGED) return sh_pick16[i]; else return __ldg(pick + i); };
+     int cnt[GROUP_PER_THREAD];
+     int used = 0;
+ #pragma unroll
+@@ -31,7 +43,7 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
+         const int e = threadIdx.x * GROUP_PER_THREAD + q;
+         int c = 0;
+         if (e < E)
+-            for (int i = 0; i < n; ++i) c += sh_pick[i] == e;
++            for (int i = 0; i < n; ++i) c += sh_pick(i) == e;
+         cnt[q] = c;
+         used += c > 0;
+     }
+@@ -65,7 +77,7 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
+         uids[place] = e;
+         int j = 0;
+         for (int i = 0; i < n && j < maxm; ++i)
+-            if (sh_pick[i] == e) members[place * maxm + j++] = (i / slots) * 32 + (i % slots);
++            if (sh_pick(i) == e) members[place * maxm + j++] = (i / slots) * 32 + (i % slots);
+         for (; j < maxm; ++j) members[place * maxm + j] = -1;
+         ++place;
+     }
+@@ -303,16 +315,39 @@ void exl3x_dequant_cuda(const at::Tensor& T, at::Tensor& out, int64_t K, int64_t
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
++// Dynamic shared memory the staged grouping kernel may take on ``device``: the block opt-in limit less its static
++// shared memory (the warp totals) and a margin.
++static int group_smem_limit(int device) {
++    static int limit[64] = {0};
++    if (device < 0 || device >= 64) return 48 * 1024;
++    if (!limit[device]) {
++        int optin = 0;
++        C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
++        limit[device] = optin > 48 * 1024 ? optin - 1024 : 48 * 1024;
++    }
++    return limit[device];
++}
++
+ void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucount, at::Tensor& members, int64_t R,
+                       int64_t slots, int64_t E) {
+     TORCH_CHECK(E <= GROUP_THREADS * GROUP_PER_THREAD, "too many experts for the grouping kernel");
+     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
+-    const size_t smem = (size_t)R * slots * sizeof(int);
+-    if (smem > 48 * 1024)     // a prompt chunk's picks (2,048 rows x 9 slots: 72 KiB): opt in past the default
+-        C10_CUDA_CHECK(cudaFuncSetAttribute(group_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+-    group_kernel<<<1, GROUP_THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+-        pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), (int)R,
+-        (int)slots, (int)E, (int)members.size(1));
++    const size_t smem = (size_t)R * slots * sizeof(short);
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const int* p = pick.data_ptr<int>();
++    int* u = uids.data_ptr<int>();
++    int* c = ucount.data_ptr<int>();
++    int* m = members.data_ptr<int>();
++    if (smem <= (size_t)group_smem_limit(pick.get_device())) {
++        if (smem > 48 * 1024)  // a prompt chunk's picks (3,072 rows x 9 slots: 54 KiB): opt in past the default
++            C10_CUDA_CHECK(cudaFuncSetAttribute(group_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                                (int)smem));
++        group_kernel<true><<<1, GROUP_THREADS, smem, stream>>>(p, u, c, m, (int)R, (int)slots, (int)E,
++                                                               (int)members.size(1));
++    } else {                  // more picks than shared memory holds: read them from global memory (cached, broadcast)
++        group_kernel<false><<<1, GROUP_THREADS, 0, stream>>>(p, u, c, m, (int)R, (int)slots, (int)E,
++                                                             (int)members.size(1));
++    }
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
+diff --git tensorfold/cuda/exl3/experts.py tensorfold/cuda/exl3/experts.py
+index ae41c90..caf3720 100644
+--- tensorfold/cuda/exl3/experts.py
++++ tensorfold/cuda/exl3/experts.py
+@@ -26,7 +26,7 @@ def _ext():
+ 
+     here = Path(__file__).parent
+     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
+-    return load(name="tensorfold_exl3_experts_v3", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
++    return load(name="tensorfold_exl3_experts_v4", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+                 verbose=False)
+ 
+ 
+@@ -170,6 +170,22 @@ class Scratch:
+         return self.ids[:maxu], self.members_buf[:maxu * R].view(maxu, R)
+ 
+ 
++def group_reference(pick: torch.Tensor, E: int, maxm: int) -> tuple[torch.Tensor, torch.Tensor]:
++    """What the grouping kernel (``ext.group``) writes, on the host: the distinct experts < E of ``pick`` [R, slots]
++    in id order, and each one's members row * 32 + slot in pair order (row-major), at most ``maxm``, -1 after the
++    last ([count, maxm]); for tests (the kernel stages the picks in shared memory or reads them from global memory
++    by the chunk's size, the same members in the same order either way)."""
++
++    R, S = pick.shape
++    flat = pick.reshape(-1).to(torch.int64).cpu()
++    uids = [e for e in range(E) if bool((flat == e).any())]
++    members = torch.full((len(uids), maxm), -1, dtype=torch.int32)
++    for k, e in enumerate(uids):
++        idx = torch.nonzero(flat == e).flatten()[:maxm]
++        members[k, :len(idx)] = ((idx // S) * 32 + idx % S).to(torch.int32)
++    return torch.tensor(uids, dtype=torch.int32), members
++
++
+ # full GLM-5.3's prompt chunks: (nt, warps, pf) of the multi-tile kernel (a program decodes a trellis tile once for up
+ # to 4 x 16 rows of its expert); its K splits are the shape's default_config ones, so each row keeps those bits
+ MT_TILES = (8, 4, 1)
+diff --git tensorfold/cuda/exl3/mpe.py tensorfold/cuda/exl3/mpe.py
+index 2d8cd53..f1ec2e0 100644
+--- tensorfold/cuda/exl3/mpe.py
++++ tensorfold/cuda/exl3/mpe.py
+@@ -63,6 +63,23 @@ class Scratch:
+             torch.empty((rows, ex.dims), dtype=torch.float16, device=device)
+ 
+ 
++def route_reference(pick: torch.Tensor, E: int, item_rows: int = 64) -> tuple[list[tuple[int, int, int]], list[set]]:
++    """What ``ext.route`` writes, on the host: the items (expert, first sorted position, rows) in expert order, an
++    expert's pairs in items of ``item_rows`` (the kernel's BM), and each expert's pairs (r * slots + s) as a set (the
++    kernel's scatter places an expert's pairs in any order within its span: each pair's output row is its own, so
++    the order changes no bit). Only per-expert counts are kept on the device, so any number of rows is one call."""
++
++    flat = pick.reshape(-1).to(torch.int64).cpu()
++    items, spans, pos = [], [], 0
++    for e in range(E):
++        idx = torch.nonzero(flat == e).flatten().tolist()
++        for j in range(0, len(idx), item_rows):
++            items.append((e, pos + j, min(item_rows, len(idx) - j)))
++        spans.append(set(idx))
++        pos += len(idx)
++    return items, spans
++
++
+ def pairs(x: torch.Tensor, pick: torch.Tensor, ex: Exl3RoutedExperts, scratch: Scratch, y: torch.Tensor,
+           limit: float = math.inf, act_mode: int = ACT_F32) -> torch.Tensor:
+     """y [R * S, D] fp32: row r * S + s = expert pick[r, s](x[r]), unweighted (picks outside [0, E): not written).
+diff --git tensorfold/cuda/geometry.py tensorfold/cuda/geometry.py
+index 8fafa54..671303f 100644
+--- tensorfold/cuda/geometry.py
++++ tensorfold/cuda/geometry.py
+@@ -395,6 +395,8 @@ def full_buffer_bytes(t: dict, rows: int, *, world: int, share, capacity: int, p
+     cfg_gu, cfg_d = 4, 1                                                   # the universal kernels' K splits (GLM's)
+     total += 2 * P * D * 2 + P * ml * 2 + max(2 * cfg_gu * ml, cfg_d * D) * P * 4 + P * D * 4   # their scratch
+     total += min(P, E) * 4 * (1 + R) + 4
++    if prefill:              # the prompt kernels' tables on a GPU (mpe.Scratch, prompt_experts.PromptScratch: sorted
++        total += 2 * (P * 4 + 3 * (-(-P // 64) + min(P, E)) * 4 + 4)    # pairs, items of >= 64 pairs, a count)
+     total += R * 3 * sl * 2 + R * (sl // 64) * 4 + R * D * 4               # shared expert
+     total += P * 4 + (P + 64) * 3 * 4 * 2 + P * 4 + (-(-P // 1024)) * (E + 1) * 4   # the (unused) grouping plan
+     total += R * D * 4 + world * R * D * 4                                  # partials and their gather
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 1ca499d..230970f 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -1478,8 +1478,9 @@ def moe_full_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tenso
+ 
+     def fill(lo: int, hi: int) -> None:
+         shared_front(layer, w, b, lo, hi)
+-        # the routed experts in blocks of EXL3_BLOCK_ROWS rows (the grouping kernel stages a block's picks in shared
+-        # memory, opted in past 48 KiB up to 2,048 x 9 x 4 bytes); a prompt chunk's take the 2-tile kernel (each
++        # the routed experts in blocks of EXL3_BLOCK_ROWS rows: every prompt chunk's in one call (the universal
++        # grouping kernel stages up to ~5,600 rows' picks in shared memory as 16-bit values and reads more from
++        # global memory, the same members in the same order); a prompt chunk's take MPE or the 2-tile kernel (each
+         # trellis tile decoded and read once for 32 rows of its expert: -10% at 2,048 rows); every row keeps the
+         # same bits in any block and either kernel (the kernels keep rows apart; tests/gpu)
+         for a in range(lo, hi, EXL3_BLOCK_ROWS):
+@@ -1530,7 +1531,11 @@ def _routed_rows(layer: LayerW, w: Weights, b: Buffers, a: int, z: int) -> torch
+ 
+ 
+ MOE_OVERLAP = os.environ.get("TF_GLM_MOE_OVERLAP", "1") != "0"
+-EXL3_BLOCK_ROWS = 2176    # a whole prompt chunk (2,048 rows and the split's pad): 2,176 x 9 x 4 bytes = 77 KiB
++# rows one routed-expert call takes: every prompt chunk whole (TF_GLM_PREFILL_ROWS up to 16,384 rows and the split's
++# pad rows at three ranks), so a chunk's expert weights are decoded once for all its rows (3,072-row chunks: one MPE
++# call, not two); MPE's route and the prompt kernels' keep per-expert counts only, the universal grouping kernel
++# stages 16-bit picks while they fit and reads global memory past that (experts.cu: the same members either way)
++EXL3_BLOCK_ROWS = 16384 + 2
+ # Prompt chunks' routed experts (TF_GLM_PROMPT_EXPERTS):
+ #   mpe (default): Mia's prompt experts (cuda/exl3/mpe: each row rotated once a layer, the trellis decoded once for
+ #        up to 64 rows of an expert on tensor cores, gate and up off one staged input); layers whose experts do not

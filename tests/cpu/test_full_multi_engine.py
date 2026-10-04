@@ -316,7 +316,13 @@ def test_three_streams_dspark_equal_serial(folder, dspark, fakes):
 
     reqs = three_plus_one()
     dec, host = multi(folder, 3, dspark=dspark)
-    assert isinstance(dec.drafts, DSparkMulti) and type(dec.verify).__name__ == "FullSegVerify"   # the default (milestone 4)
+    # the default verify: the segmented one where the tree has it (milestone 4, full_seg), else the eager batched one
+    try:
+        from tensorfold.families.glm5_next.cuda import full_seg  # noqa: F401
+        default = "FullSegVerify"
+    except ImportError:
+        default = "FullBatchedVerify"
+    assert isinstance(dec.drafts, DSparkMulti) and type(dec.verify).__name__ == default, type(dec.verify).__name__
     seen = watch(dec)
     streams = drive(dec, host, reqs)
     assert max(n for n, _ in seen) == 3 and max(r for _, r in seen) <= 16, seen

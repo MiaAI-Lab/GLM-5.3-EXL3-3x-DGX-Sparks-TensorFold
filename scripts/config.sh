@@ -111,6 +111,9 @@ export TF_GLM_PREFILL_ROWS="$PREFILL_ROWS"
 # time, no kept prompt states, eager decode windows for now) or 0 (default: every Spark keeps every token).
 CP="${CP:-0}"
 export TF_GLM_CP="$CP"
+# CP prompt chunks send absorbed queries (0131); raw queries with every rank absorbing all heads (0135, +0.64 GiB a
+# Spark) measured no faster on boot cp500a vs cp500b (94k: 216 vs 217 s; 9.9k: 25.5 vs 22.1 s): off by default
+export TF_GLM_CP_RAW_Q="${TF_GLM_CP_RAW_Q:-0}"
 PREFILL_SPLIT="${PREFILL_SPLIT:-1}"
 PREFILL_OVERLAP="${PREFILL_OVERLAP:-1}"
 [[ "$PREFILL_SPLIT" == 1 ]] || PREFILL_OVERLAP=0

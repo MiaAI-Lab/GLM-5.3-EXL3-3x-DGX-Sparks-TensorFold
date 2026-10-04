@@ -55,7 +55,7 @@ SERVE_ARGS=(--context "$CONTEXT" --max-tokens "$MAX_TOKENS" --drafter "$DRAFT_AR
 [[ "$KV" =~ ^(bf16|fp8|fp4|fp4x)$ ]] || die "KV is bf16, fp8, fp4 or fp4x, not $KV"
 [[ "$MTP" =~ ^[01]$ ]] || die "MTP is 0 or 1, not $MTP"
 [[ "$CONTEXT" =~ ^[0-9]+$ && "$CONTEXT" -ge 4096 && "$CONTEXT" -le 1048576 ]] || die "CONTEXT is a token count from 4096 to 1048576, not $CONTEXT"
-[[ "$PREFILL_ROWS" =~ ^(1024|2048)$ ]] || die "PREFILL_ROWS is 1024 or 2048, not $PREFILL_ROWS"
+[[ "$PREFILL_ROWS" =~ ^(1024|2048|3072)$ ]] || die "PREFILL_ROWS is 1024, 2048 or 3072, not $PREFILL_ROWS"
 [[ "$PREFILL_SPLIT" =~ ^[01]$ && "$PREFILL_OVERLAP" =~ ^[01]$ ]] || die "PREFILL_SPLIT and PREFILL_OVERLAP are 0 or 1"
 [[ "$CP" =~ ^[01]$ ]] || die "CP is 0 or 1"
 [[ "$DRAFTER" =~ ^(mtp|dspark)$ ]] || die "DRAFTER is mtp or dspark, not $DRAFTER"
@@ -188,7 +188,7 @@ memplan() {  # <rank=GiB,...>: the plan's table; non-zero when a rank would fall
   snapdir=$SNAP
   docker run --rm --network none --memory 3g --entrypoint python -v "$snapdir:/ckpt:ro" -v "$PWD/scripts:/recipe:ro" "$IMAGE" \
     /recipe/memplan.py /ckpt --tp 3 --context "$(arg_value --context)" --kv "$KV" --dense "$DENSE" --mtp "$MTP" \
-    --prefill-rows "$PREFILL_ROWS" --split "$PREFILL_SPLIT" --cp "$([[ "$CP" == 1 ]] && echo 3 || echo 1)" --kept-gib "$( [[ "$CP" == 1 ]] && echo 0 || echo "$KV_POOL_GIB")" --floor "$FLOOR_GIB" \
+    --prefill-rows "$PREFILL_ROWS" --split "$PREFILL_SPLIT" --cp "$([[ "$CP" == 1 ]] && echo 3 || echo 1)" --kept-gib "$KV_POOL_GIB" --floor "$FLOOR_GIB" \
     --overhead "$OVERHEAD_GIB" --reserve "$MEMORY_RESERVE_GIB" --avail "$1" 2>&1 | grep -v -E '^$|^=+$|PyTorch|Copyright|rights reserved|NVIDIA|found at|CUDA|SHMEM|docker run|insufficient'
   return "${PIPESTATUS[0]}"
 }

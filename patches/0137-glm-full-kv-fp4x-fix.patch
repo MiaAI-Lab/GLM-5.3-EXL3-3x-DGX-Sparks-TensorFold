@@ -1,0 +1,230 @@
+diff --git tensorfold/families/glm5_next/cuda/dsa_full.py tensorfold/families/glm5_next/cuda/dsa_full.py
+index 13c05ca..e5cd29a 100644
+--- tensorfold/families/glm5_next/cuda/dsa_full.py
++++ tensorfold/families/glm5_next/cuda/dsa_full.py
+@@ -135,8 +135,8 @@ def _k_rope_write(K, k_stride, KR, POS, BASE, FREQ, RANK, HALF: tl.constexpr, SE
+         ab = a.to(tl.bfloat16).to(tl.float32)
+         bb = b.to(tl.bfloat16).to(tl.float32)
+         s, inv = kv8.scale_of(tl.maximum(tl.max(tl.abs(ab), 0), tl.max(tl.abs(bb), 0)))
+-        tl.store(KR + row * (2 * HALF) + i, (ab * inv).to(tl.float8e4nv))
+-        tl.store(KR + row * (2 * HALF) + HALF + i, (bb * inv).to(tl.float8e4nv))
++        tl.store(KR + row * (2 * HALF) + i, kv8.e4m3_code(ab * inv))
++        tl.store(KR + row * (2 * HALF) + HALF + i, kv8.e4m3_code(bb * inv))
+         tl.store(LS + row * LRS + RSW, s)
+     else:
+         tl.store(KR + row * (2 * HALF) + i, a.to(tl.bfloat16))
+@@ -168,6 +168,8 @@ def k_rope_write(k: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, freq:
+             or cache.shape[1] != 2 * half:
+         raise ValueError(f"k_rope_write: rows of {k.shape[1]} into a cache of {tuple(cache.shape)}")
+     KR, LS, LRS, RSW, R8 = rope8_args(cache, latent)
++    if R8:
++        KR = cache                       # the writer stores code bytes (kv8.e4m3_code), the readers load e4m3
+     if k.shape[0]:
+         _k_rope_write[(k.shape[0],)](k, k.stride(0), KR, pos, pos, freq, int(rank), HALF=half, SEG=False,
+                                      CP=int(cp), LS=LS, LRS=LRS, RSW=RSW, R8=R8, num_warps=1)
+@@ -175,15 +177,17 @@ def k_rope_write(k: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, freq:
+ 
+ @triton.jit
+ def _index_write(KR, k_stride, LNW, LNB, IK, POS, FREQ, eps, RANK, D: tl.constexpr, HALF: tl.constexpr,
+-                 CP: tl.constexpr = 1, IS=None, K8: tl.constexpr = 0):
++                 CP: tl.constexpr = 1, OUTR: tl.constexpr = 0):
+     """Row r: LayerNorm(k_raw[r, :D]) (fp32 statistics, weight and bias), rounded to bf16 as the bf16 LayerNorm
+     returns it, then RoPE on its first 2 HALF dims at position pos + r -> IK[pos + r] (bf16). CP > 1: only
+-    positions p with p % CP == RANK, at row p // CP. K8 (TF_GLM_KV=fp4x): IK an e4m3 plane of rows D + 4 bytes, the
+-    bf16 row's codes, then its power-of-two scale (IS: the plane's fp32 view, word D / 4 of the row)."""
++    positions p with p % CP == RANK, at row p // CP. OUTR (TF_GLM_KV=fp4x's first pass): every row r into IK[r] (a
++    bf16 scratch the encoder reads); the arithmetic is the same code either way."""
+     r = tl.program_id(0)
+     pos = tl.load(POS) + r
+     slot = pos.to(tl.int64)
+-    if CP > 1:
++    if OUTR:
++        slot = r.to(tl.int64)
++    elif CP > 1:
+         if slot % CP != RANK:
+             return
+         slot = slot // CP
+@@ -194,46 +198,40 @@ def _index_write(KR, k_stride, LNW, LNB, IK, POS, FREQ, eps, RANK, D: tl.constex
+     xc = x - mean
+     rstd = 1.0 / tl.sqrt(tl.sum(xc * xc, axis=0) / D + eps)
+     y = xc * rstd * tl.load(LNW + d).to(tl.float32) + tl.load(LNB + d).to(tl.float32)
++    row = IK + slot * D
++    tl.store(row + d, y.to(tl.bfloat16), mask=d >= 2 * HALF)           # the dims past the rotary ones
+     i = tl.arange(0, HALF)
+     e, o = 2 * i, 2 * i + 1
+     ye = (tl.load(src + e).to(tl.float32) - mean) * rstd * tl.load(LNW + e).to(tl.float32) + tl.load(LNB + e).to(tl.float32)
+     yo = (tl.load(src + o).to(tl.float32) - mean) * rstd * tl.load(LNW + o).to(tl.float32) + tl.load(LNB + o).to(tl.float32)
+     a, b = _rotate(ye.to(tl.bfloat16).to(tl.float32), yo.to(tl.bfloat16).to(tl.float32), pos, FREQ, HALF)
+-    if K8:
+-        # the bf16 row (pass dims, then the rotated halves), its power-of-two scale, its codes
+-        yb = tl.where(d >= 2 * HALF, y.to(tl.bfloat16).to(tl.float32), 0.0)
+-        ab = a.to(tl.bfloat16).to(tl.float32)
+-        bb = b.to(tl.bfloat16).to(tl.float32)
+-        amax = tl.maximum(tl.max(tl.abs(yb), 0), tl.maximum(tl.max(tl.abs(ab), 0), tl.max(tl.abs(bb), 0)))
+-        s, inv = kv8.scale_of(amax)
+-        row = IK + slot * (D + 4)
+-        tl.store(row + d, (yb * inv).to(tl.float8e4nv), mask=d >= 2 * HALF)
+-        tl.store(row + i, (ab * inv).to(tl.float8e4nv))
+-        tl.store(row + HALF + i, (bb * inv).to(tl.float8e4nv))
+-        tl.store(IS + slot * ((D + 4) // 4) + D // 4, s)
+-    else:
+-        row = IK + slot * D
+-        tl.store(row + d, y.to(tl.bfloat16), mask=d >= 2 * HALF)           # the dims past the rotary ones
+-        tl.store(row + i, a.to(tl.bfloat16))
+-        tl.store(row + HALF + i, b.to(tl.bfloat16))
++    tl.store(row + i, a.to(tl.bfloat16))
++    tl.store(row + HALF + i, b.to(tl.bfloat16))
+ 
+ 
+ def index_write(k_raw: torch.Tensor, ln_w: torch.Tensor, ln_b: torch.Tensor, keys: torch.Tensor, pos: torch.Tensor,
+                 freq: torch.Tensor, eps: float = 1e-6, cp: int = 1, rank: int = 0) -> None:
+     """Window rows' index keys: k_raw [R, >= D] (wk's output, any row stride) -> LayerNorm -> RoPE on the first
+-    rotary dims -> keys [slots, D] bf16 rows pos .. pos + R - 1 (TF_GLM_KV=fp4x: uint8 [slots, D + 4] rows, the
+-    bf16 row's e4m3 codes and fp32 scale)."""
++    rotary dims -> keys [slots, D] bf16 rows pos .. pos + R - 1 (TF_GLM_KV=fp4x: uint8 [slots, D + 4] rows: the bf16
++    kernel's rows into a scratch, then kv8.quant_rows8, the one encoder: the bf16 rows' e4m3 codes and fp32 scale,
++    ``kv8.quantize_index8`` of what the bf16 cache would hold, bit for bit on any GPU)."""
+ 
+     D = kv8.index_width(keys)
+     if keys.dtype not in (torch.bfloat16, torch.uint8) or not keys.is_contiguous() or k_raw.stride(1) != 1 \
+             or k_raw.shape[1] < D:
+         raise ValueError("index_write: bf16 (or fp4x) key rows, contiguous")
+-    k8 = kv8.index8(keys)
+-    if k_raw.shape[0]:
+-        _index_write[(k_raw.shape[0],)](k_raw, k_raw.stride(0), ln_w, ln_b,
+-                                        keys.view(torch.float8_e4m3fn) if k8 else keys, pos, freq, float(eps),
+-                                        int(rank), D=D, HALF=freq.numel(), CP=int(cp),
+-                                        IS=keys.view(torch.float32) if k8 else keys, K8=int(k8), num_warps=1)
++    R = k_raw.shape[0]
++    if not R:
++        return
++    if not kv8.index8(keys):
++        _index_write[(R,)](k_raw, k_raw.stride(0), ln_w, ln_b, keys, pos, freq, float(eps), int(rank), D=D,
++                           HALF=freq.numel(), CP=int(cp), num_warps=1)
++        return
++    rows = torch.empty((R, D), dtype=torch.bfloat16, device=keys.device)
++    _index_write[(R,)](k_raw, k_raw.stride(0), ln_w, ln_b, rows, pos, freq, float(eps), int(rank), D=D,
++                       HALF=freq.numel(), CP=1, OUTR=1, num_warps=1)
++    kv8.quant_rows8(rows, keys, keys.view(torch.float32), pos, rs=D + 4, srs=(D + 4) // 4, sw=D // 4, cp=cp,
++                    rank=rank)
+ 
+ 
+ @triton.jit
+diff --git tensorfold/families/glm5_next/cuda/kv8.py tensorfold/families/glm5_next/cuda/kv8.py
+index 2596c1a..294718c 100644
+--- tensorfold/families/glm5_next/cuda/kv8.py
++++ tensorfold/families/glm5_next/cuda/kv8.py
+@@ -330,13 +330,43 @@ def index_width(keys: torch.Tensor) -> int:
+     return keys.shape[-1] - 4 if index8(keys) else keys.shape[-1]
+ 
+ 
++def e4m3_bits(v: torch.Tensor) -> torch.Tensor:
++    """fp32 values -> e4m3 (float8_e4m3fn) code bytes by integer arithmetic on their bits: round to nearest, ties to
++    even, the sign kept (also on zeros), saturating at +-448; the definition ``e4m3_code`` (the write kernels' encoder)
++    equals bit for bit on every finite input (no hardware conversion involved on either side)."""
++    b = v.float().contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
++    sign = (b >> 31) & 1
++    a = b & 0x7FFFFFFF
++    e = a >> 23                                                # biased fp32 exponent
++    m = a & 0x7FFFFF
++    # normal e4m3 (|v| >= 2^-6, biased fp32 exponent >= 121): 3 mantissa bits, ties to even
++    q = m >> 20
++    rem = m & 0xFFFFF
++    up = (rem > 0x80000) | ((rem == 0x80000) & ((q & 1) == 1))
++    q = q + up.to(torch.int64)
++    en = e - 120 + (q >> 3)                                    # e4m3 biased exponent (bias 7), carry from q == 8
++    normal = (en << 3) | (q & 7)
++    # subnormal e4m3 (|v| < 2^-6): the multiple of 2^-9 nearest |v|, ties to even (8 is the smallest normal, 2^-6)
++    full = m | 0x800000                                        # |v| = full x 2^(e - 150); in units of 2^-9: full >> sh
++    sh = (141 - e).clamp(min=0, max=63)                        # |v| / 2^-9 = full x 2^(e - 141)
++    k = full >> sh.clamp(max=62)
++    rbits = full - (k << sh.clamp(max=62))
++    halfv = torch.where(sh > 0, torch.ones_like(sh) << (sh - 1).clamp(min=0), torch.zeros_like(sh))
++    upk = (sh > 0) & ((rbits > halfv) | ((rbits == halfv) & ((k & 1) == 1)))
++    k = torch.where(sh > 25, torch.zeros_like(k), k + upk.to(torch.int64))
++    k = torch.where(e == 0, torch.zeros_like(k), k)            # fp32 zeros and subnormals: 0
++    mag = torch.where(e >= 121, normal, k)
++    mag = torch.minimum(mag, torch.full_like(mag, 0x7E))       # saturate at 448
++    return ((sign << 7) | mag).to(torch.uint8)
++
++
+ def quantize_codes8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+     """bf16 (or fp32) rows [n, width] -> (e4m3 codes uint8 [n, width], fp32 power-of-two scales [n]): the FP8 rule
+-    (``quantize_rows``) on the bf16 row, as the write kernels store them."""
++    (``quantize_rows``) on the bf16 row, encoded by ``e4m3_bits`` (the write kernels' ``e4m3_code``, bit for bit)."""
+     x = x.to(torch.bfloat16).float()
+     s = scales(x.abs().amax(dim=1))
+     inv = ((254 - (s.view(torch.int32) >> 23)) << 23).view(torch.float32)
+-    return (x * inv[:, None]).to(torch.float8_e4m3fn).view(torch.uint8), s
++    return e4m3_bits(x * inv[:, None]), s
+ 
+ 
+ def quantize_index8(x: torch.Tensor) -> torch.Tensor:
+@@ -364,13 +394,61 @@ def dequantize_rope8(rope: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
+ 
+ 
+ @triton.jit
+-def store_codes8(VALS, row, k, x, RS: tl.constexpr):
+-    """Row ``row`` (int64) of an e4m3 plane (VALS: an fp8 pointer, rows RS bytes apart) <- codes of x (fp32 of a bf16
+-    row, [W], at columns ``k``) under the row's power-of-two scale; returns (scale, reciprocal) for the caller to
+-    store where the format keeps it."""
++def e4m3_code(v):
++    """fp32 values -> e4m3 code bytes (uint8) by integer arithmetic on their bits, ``e4m3_bits`` bit for bit: round to
++    nearest, ties to even, sign kept, saturating at +-448. No float conversion instruction is involved, so the bytes
++    are the same on every GPU (and in Triton's interpreter)."""
++    b = v.to(tl.int32, bitcast=True)
++    sign = (b >> 31) & 1
++    a = b & 0x7FFFFFFF
++    e = a >> 23
++    m = a & 0x7FFFFF
++    q = m >> 20
++    rem = m & 0xFFFFF
++    up = ((rem > 0x80000) | ((rem == 0x80000) & ((q & 1) == 1))).to(tl.int32)
++    q = q + up
++    normal = ((e - 120 + (q >> 3)) << 3) | (q & 7)
++    full = m | 0x800000
++    sh = tl.minimum(tl.maximum(141 - e, 0), 31)                # shifts past 25 leave nothing (zeroed below)
++    k = full >> sh
++    rbits = full - (k << sh)
++    halfv = tl.where(sh > 0, tl.full(sh.shape, 1, tl.int32) << tl.maximum(sh - 1, 0), 0)
++    upk = ((sh > 0) & ((rbits > halfv) | ((rbits == halfv) & ((k & 1) == 1)))).to(tl.int32)
++    k = tl.where(141 - e > 25, 0, k + upk)
++    k = tl.where(e == 0, 0, k)
++    mag = tl.where(e >= 121, normal, k)
++    mag = tl.minimum(mag, 0x7E)
++    return ((sign << 7) | mag).to(tl.uint8)
++
++
++@triton.jit
++def _quant_rows8(SRC, src_stride, VALS, SCL, POS, RANK, W: tl.constexpr, RS: tl.constexpr, SRS: tl.constexpr,
++                 SW: tl.constexpr, CP: tl.constexpr):
++    """Row r of bf16 rows SRC -> its e4m3 codes at row pos + r of VALS (uint8, rows RS bytes apart) and its
++    power-of-two scale at fp32 word SW of row pos + r of SCL (rows SRS words apart). CP > 1: only positions p with
++    p % CP == RANK, at row p // CP."""
++    r = tl.program_id(0)
++    row = (tl.load(POS) + r).to(tl.int64)
++    if CP > 1:
++        if row % CP != RANK:
++            return
++        row = row // CP
++    k = tl.arange(0, W)
++    x = tl.load(SRC + r * src_stride + k).to(tl.float32)
+     s, inv = scale_of(tl.max(tl.abs(x), 0))
+-    tl.store(VALS + row * RS + k, (x * inv).to(tl.float8e4nv))
+-    return s, inv
++    tl.store(VALS + row * RS + k, e4m3_code(x * inv))
++    tl.store(SCL + row * SRS + SW, s)
++
++
++def quant_rows8(src: torch.Tensor, vals: torch.Tensor, scl: torch.Tensor, pos: torch.Tensor, *, rs: int, srs: int,
++                sw: int, cp: int = 1, rank: int = 0) -> None:
++    """bf16 rows src [R, W] -> e4m3 rows of a uint8 plane at rows pos + r (``quantize_codes8``'s bytes) and their
++    scales into fp32 word ``sw`` of rows of ``scl`` (``srs`` words a row): the one fp4x encoder of a bf16 row."""
++    if src.dtype != torch.bfloat16 or src.stride(1) != 1 or vals.dtype != torch.uint8 or scl.dtype != torch.float32:
++        raise ValueError("quant_rows8: bf16 rows into a uint8 plane and fp32 scale words")
++    if src.shape[0]:
++        _quant_rows8[(src.shape[0],)](src, src.stride(0), vals, scl, pos, int(rank), W=src.shape[1], RS=int(rs),
++                                      SRS=int(srs), SW=int(sw), CP=int(cp), num_warps=1)
+ 
+ 
+ @triton.jit

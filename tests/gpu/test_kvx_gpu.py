@@ -48,7 +48,22 @@ def test_writers_store_the_definition():
     F.index_write(raw, ln_w, ln_b, ref, pos, freq)
     keys = kv8.index_zeros(5000, 128, "fp4x", DEV)
     F.index_write(raw, ln_w, ln_b, keys, pos, freq)
-    assert torch.equal(keys.cpu(), kv8.quantize_index8(ref.cpu()))
+    # the written rows 4097 .. 4596 against the definition; the plane's other rows stay zero (quantize_index8 of a
+    # zero row would store the scale 2^-126: comparing the whole plane flagged every unwritten row)
+    keys, ref = keys.cpu(), ref.cpu()
+    assert torch.equal(keys[4097:4597], kv8.quantize_index8(ref[4097:4597]))
+    assert (keys[:4097] == 0).all() and (keys[4597:] == 0).all()
+
+
+def test_encoder_is_the_definition_on_gpu():
+    """kv8.e4m3_code (integer arithmetic, no hardware fp8 conversion) on the GPU equals the definition on every
+    edge and random value."""
+    from test_kvx import _encode, edge_values
+
+    v = edge_values()
+    out = torch.empty(v.numel(), dtype=torch.uint8, device=DEV)
+    _encode[((v.numel() + 1023) // 1024,)](v.to(DEV), out, v.numel(), B=1024)
+    assert torch.equal(out.cpu(), kv8.e4m3_bits(v))
 
 
 def test_msa_fp8_rope_equals_dequantized_bf16_rope():
@@ -161,13 +176,13 @@ def folder(tmp_path_factory):
     return write_checkpoint(tmp_path_factory.mktemp("glm53kvx"))
 
 
-def engine(folder, graphs=False):
+def engine(folder, graphs=False, kv="fp4x"):
     from tensorfold.families.glm5_next.cuda.decode import Engine
     from tensorfold.families.glm5_next.cuda.weights import load
 
     w = load(folder, rank=0, world=1, device="cuda", mtp=True)
     return Engine(w, capacity=4096 + 512, max_rows=8, prefill_rows=64, graphs=graphs, graph_rows=(1, 2, 3, 4),
-                  long_context=True, mtp_rows=4, kv="fp4x")
+                  long_context=True, mtp_rows=4, kv=kv)
 
 
 def run(e, prompt, steps):
@@ -186,16 +201,37 @@ def test_engine_fp4x_matches_the_reference(folder):
     from test_full_forward import agree_kv, tokens
     from test_kvx import ReferenceX
 
+    from full_fakes import Reference
+
+    prompt, steps = tokens(30, 1), tokens(8, 2)
+
+    def against(e, ref):
+        cache = ref.new_cache()
+        got = run(e, prompt, steps)
+        ref.forward(prompt, cache, 0)
+        want = torch.cat([ref.forward([t], cache, 30 + i)[0] for i, t in enumerate(steps)])
+        return got, want
+
     e = engine(folder)
     assert e.st.kr[0].dtype == torch.uint8 and e.st.index[0][2].dtype == torch.uint8
-    ref = ReferenceX(folder)
-    cache = ref.new_cache()
-    prompt, steps = tokens(30, 1), tokens(8, 2)
-    got = run(e, prompt, steps)
-    ref.forward(prompt, cache, 0)
-    want = torch.cat([ref.forward([t], cache, 30 + i)[0] for i, t in enumerate(steps)])
+    got, want = against(e, ReferenceX(folder))
+    # fp4's own engine-vs-reference error on this GPU, the yardstick: fp4x adds two more quantized planes, whose
+    # codes flip on the engine's and the reference's tiny bf16 differences, and an index-key flip swaps a near-tie
+    # member of the tiny model's top-16 (one such swap moves a step's logits by up to ~20%: even bf16 shows a 7x
+    # spike on one step, kvx_diag.py --engine). Per step the maxima are spiky (CPU: fp4 0.13-0.54, fp4x 0.12-0.63
+    # of 3.3), so the band is 2x fp4's worst step (or fp4's 15%), and the mean error at most 2x fp4's
+    g4, w4 = against(engine(folder, kv="fp4"), Reference(folder, kv="fp4"))
+    err4, mean4 = (g4 - w4).abs().max().item(), (g4 - w4).abs().mean().item()
+    err, mean = (got - want).abs().max().item(), (got - want).abs().mean().item()
+    scale = want.abs().max().item()
+    print(f"\n[kvx gpu] engine vs reference: fp4x max {err:.4f} mean {mean:.4f}, fp4 max {err4:.4f} mean {mean4:.4f}"
+          f" of {scale:.3f}")
     ok, why = agree_kv(got, want, "fp4")
-    assert ok, why
+    assert ok or err <= max(0.15 * scale, 2.0 * err4), why
+    assert mean <= 2.0 * mean4 + 1e-3 * scale
+    top = want.topk(2, dim=-1).values
+    clear = (top[..., 0] - top[..., 1]) > 2 * err
+    assert (got.argmax(-1) == want.argmax(-1))[clear].all()
 
 
 @pytest.mark.parametrize("start", [9, 60])
