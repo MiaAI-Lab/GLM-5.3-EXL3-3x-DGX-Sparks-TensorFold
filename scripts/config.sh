@@ -139,6 +139,9 @@ export TF_GLM_CLEAR_THINKING="${TF_GLM_CLEAR_THINKING:-0}"
 STREAM_SMOOTH="${STREAM_SMOOTH:-1}"
 STREAM_SMOOTH_MS="${STREAM_SMOOTH_MS:-400}"
 export TF_GLM_STREAM_SMOOTH="$STREAM_SMOOTH" TF_GLM_STREAM_SMOOTH_MS="$STREAM_SMOOTH_MS"
+# Sampled replies: the top_p nucleus is checked on every rank's candidates together (TENSORFOLD_NUCLEUS_UNION=1),
+# the same draws as reading whole vocabulary shards (reply hashes equal on boots fp4g655nu vs fp4g655b), ~1% faster.
+export TENSORFOLD_NUCLEUS_UNION="${TENSORFOLD_NUCLEUS_UNION:-1}"
 # Other conversations' kept prompt states (the snapshots' saved rows): at most KV_POOL_GIB (TF_GLM_CACHE_GIB) and
 # TF_GLM_CACHE_ENTRIES of them.
 KV_POOL_GIB="${KV_POOL_GIB:-1}"

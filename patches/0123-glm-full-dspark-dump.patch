@@ -1,0 +1,277 @@
+diff --git tensorfold/families/glm5_next/cuda/draft_dump.py tensorfold/families/glm5_next/cuda/draft_dump.py
+index 425ea9d..2c2bc8f 100644
+--- tensorfold/families/glm5_next/cuda/draft_dump.py
++++ tensorfold/families/glm5_next/cuda/draft_dump.py
+@@ -1,4 +1,5 @@
+-"""TF_GLM_DRAFT_DUMP=<dir>: teacher-forced DFlash2 records for the offline draft simulator (``draft_sim``).
++"""TF_GLM_DRAFT_DUMP=<dir>: teacher-forced DFlash2 or DSpark records for the offline draft simulators (``draft_sim``,
++``dspark_sim``).
+ 
+ With it set (on both ranks: the engine refuses to start otherwise), a request that would draft with DFlash2 decodes
+ one token a round instead, through the same one-row verify as ``serial_decode``, so its reply is serial's
+@@ -56,6 +57,29 @@ def edges(drafter, tokens: np.ndarray, proj: np.ndarray, anchor: int) -> tuple[n
+     return e0, out
+ 
+ 
++def dspark_terms(drafter, tokens: np.ndarray, anchor: int) -> tuple[np.ndarray, float, np.ndarray, np.ndarray]:
++    """DSpark's sequential terms for every pair the chain could meet, each its own float64 expression (same bits as
++    ``dspark.Drafter.chain``): (Markov bias of slot 0's candidates after the anchor [K], the confidence head's Markov
++    part after the anchor, Markov biases of slot d's candidates after slot d-1's candidate a [D - 1, K, K], the
++    confidence head's Markov part after slot d-1's candidate a [D - 1, K])."""
++
++    depth, k = tokens.shape
++
++    def cm(emb):
++        return float(drafter.conf_m @ emb) if drafter.conf_m is not None and emb is not None else 0.0
++
++    emb = drafter.markov_embed(anchor)
++    mb0, cm0 = drafter.markov_bias(tokens[0], emb), cm(emb)
++    mbs = np.zeros((max(depth - 1, 0), k, k), dtype=np.float64)
++    cms = np.zeros((max(depth - 1, 0), k), dtype=np.float64)
++    for d in range(1, depth):
++        for a in range(k):
++            emb = drafter.markov_embed(int(tokens[d - 1, a]))
++            mbs[d - 1, a] = drafter.markov_bias(tokens[d], emb)
++            cms[d - 1, a] = cm(emb)
++    return mb0, cm0, mbs, cms
++
++
+ def target_top(w, row: torch.Tensor, k: int = TARGET_K) -> tuple[np.ndarray, np.ndarray, float]:
+     """The target's top-k over the whole vocabulary of one logits row (this rank's slice [1, V/world]) by (value desc,
+     id asc), and the row's logsumexp; gathered from every rank alike."""
+@@ -86,11 +110,12 @@ def dump_decode(e, drafter, pending: int, count: int, sampling: Sampling | None,
+     passes ``out_dir`` and writes the records there, every rank runs the same calls."""
+ 
+     w, st, b = e.w, e.st, e.buf
+-    depth = drafter.block - 1
++    spark = hasattr(drafter, "markov_bias")           # DSpark (Markov head, confidence head) rather than DFlash2
++    depth = drafter.block if spark else drafter.block - 1
+     sampled = sampling is not None and sampling.temperature > 0
+     out = [pending]
+     rec: dict[str, list] = {k: [] for k in ("first", "cand_ids", "cand_vals", "proj", "noise", "edge0", "edges",
+-                                            "prod_chain", "tgt_ids", "tgt_vals", "tgt_lse")}
++                                            "prod_chain", "tgt_ids", "tgt_vals", "tgt_lse", "cm0", "cms")}
+     stages = {"block": 0.0, "forward": 0.0, "sample": 0.0, "commit": 0.0}
+     _sync(w)
+     start = time.perf_counter()
+@@ -100,12 +125,18 @@ def dump_decode(e, drafter, pending: int, count: int, sampling: Sampling | None,
+             raise RuntimeError(f"draft dump: the drafter's context ends at {drafter.context_end}, "
+                                f"the reply at {st.pos}")
+         first = drafter.context_end + 1
+-        tokens, values, proj = drafter.candidates(out[-1], depth)
+-        e0, ed = edges(drafter, tokens, proj, out[-1])
++        tokens, values, proj = drafter.candidates(out[-1], depth)       # DSpark: proj is each slot's hconf [D]
++        if spark:
++            e0, cm0, ed, cms = dspark_terms(drafter, tokens, out[-1])
++        else:
++            e0, ed = edges(drafter, tokens, proj, out[-1])
+         noise = (-np.log(-np.log(uniform_rows(sampling.seed, first + np.arange(depth), tokens)))
+                  if sampled else None)
+         most = min(PROD_MOST, depth)
+         chain = drafter.chain(tokens[:most], values[:most], proj[:most], out[-1], first, sampling, PROD_CONFIDENCE)
++        if spark:
++            rec["cm0"].append(cm0)
++            rec["cms"].append(cms)
+         t1 = time.perf_counter()
+         logits = e.forward(e.verify_window([out[-1]]))
+         torch.cuda.synchronize()
+@@ -140,6 +171,13 @@ def dump_decode(e, drafter, pending: int, count: int, sampling: Sampling | None,
+     res = DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
+     if out_dir is not None:
+         info = dict(meta or {})
++        if spark:
++            from . import dspark
++
++            info.update(drafter="dspark", dspark_noise=dspark.DSPARK_NOISE, dspark_filter=dspark.DSPARK_FILTER,
++                        conf_b=float(drafter.conf_b), learned_conf=drafter.conf_h is not None)
++        else:
++            info.update(drafter="dflash2")
+         info.update(version=VERSION, block=drafter.block, selector_top_k=drafter.top_k, edge=dflash2.EDGE,
+                     noise=dflash2.NOISE, prod_most=PROD_MOST, prod_confidence=PROD_CONFIDENCE, stop_eos=bool(stop_eos),
+                     eos=[int(t) for t in w.cfg.eos], count=int(count), steps=len(out) - 1,
+@@ -173,6 +211,8 @@ def write(out_dir: Path, meta: dict, tokens: Sequence[int], rec: dict, depth: in
+                   prod_chain=stack("prod_chain", (depth,), np.int32), tgt_ids=stack("tgt_ids", (TARGET_K,), np.int32),
+                   tgt_vals=stack("tgt_vals", (TARGET_K,), np.float32),
+                   tgt_lse=np.asarray(rec["tgt_lse"], dtype=np.float64).reshape(n))
++    if rec["cm0"]:                          # DSpark: the confidence head's Markov parts (edge0 / edges: Markov biases)
++        arrays.update(cm0=np.asarray(rec["cm0"], dtype=np.float64), cms=stack("cms", (max(depth - 1, 0), k), np.float64))
+     name = f"dump-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{_count:04d}"
+     tmp = out_dir / f".{name}.tmp.npz"
+     np.savez_compressed(tmp, **arrays)
+diff --git tensorfold/families/glm5_next/cuda/dspark_sim.py tensorfold/families/glm5_next/cuda/dspark_sim.py
+new file mode 100644
+index 0000000..3007468
+--- /dev/null
++++ tensorfold/families/glm5_next/cuda/dspark_sim.py
+@@ -0,0 +1,171 @@
++"""Offline DSpark draft simulator over ``draft_dump`` records (TF_GLM_DRAFT_DUMP with DRAFTER=dspark).
++
++A dump is a serial reply with DSpark's view at every position: the merged candidates and base logits of each slot, the
++confidence head's hidden part, and the Markov terms for every previous token the chain could meet, each the drafter's
++own float64 value. ``chain`` rebuilds the drafts a policy proposes from them (the arithmetic of ``Drafter.chain``), and
++``walk`` follows the decode as the engine would: a round at the reply's position p proposes from the record there, the
++verifier keeps the drafts that equal the reply's next tokens (drafted == serial, so the serial reply is the target's),
++and the next round starts after them. Only proposals change between policies, never the reply.
++
++    python3 -m tensorfold.families.glm5_next.cuda.dspark_sim <dump dir or .npz> ... [--costs 64.3,76.5,...]
++"""
++
++from __future__ import annotations
++
++import json
++import sys
++from dataclasses import dataclass, field
++from pathlib import Path
++
++import numpy as np
++
++from tensorfold.engine.exact_sampling import Sampling
++
++from .dflash2 import best_depth
++
++
++@dataclass
++class Policy:
++    name: str
++    most: int = 8                         # drafts at most a round
++    confidence: float = 0.0               # cut below this confidence product (the first draft always kept)
++    costs: tuple[float, ...] | None = None    # verify ms of 1, 2, .. rows: cut at best_depth (learned confidences)
++    noise: float | None = None            # keyed-noise weight when sampling (None: the dump's)
++    filter: bool | None = None            # the target_kept filter when sampling (None: the dump's)
++    conf_scale: float = 1.0               # confidence logits scaled before the sigmoid (calibration experiments)
++    conf_shift: float = 0.0
++
++
++@dataclass
++class Record:
++    meta: dict
++    tokens: np.ndarray                    # the reply: pending token then every sampled token
++    cand: np.ndarray                      # [n, D, K] candidate ids
++    vals: np.ndarray                      # [n, D, K] base logits
++    hconf: np.ndarray                     # [n, D] the confidence head's hidden part
++    mb0: np.ndarray                       # [n, K]
++    cm0: np.ndarray                       # [n]
++    mbs: np.ndarray                       # [n, D - 1, K, K]
++    cms: np.ndarray                       # [n, D - 1, K]
++    noise: np.ndarray | None              # [n, D, K] or None (greedy)
++    prod: np.ndarray                      # [n, D] the production chain (-1 padded)
++    sampling: Sampling | None = field(default=None)
++
++
++def load(path: Path) -> Record:
++    z = np.load(path, allow_pickle=False)
++    meta = json.loads(str(z["meta"]))
++    if meta.get("drafter") != "dspark":
++        raise ValueError(f"{path}: not a DSpark dump")
++    noise = z["noise"] if z["noise"].ndim == 3 else None
++    s = None
++    if meta["temperature"] > 0:
++        s = Sampling(temperature=meta["temperature"], top_k=meta["top_k"], top_p=meta["top_p"], min_p=meta["min_p"],
++                     seed=meta["seed"])
++    return Record(meta, z["tokens"], z["cand_ids"].astype(np.int64), z["cand_vals"].astype(np.float64),
++                  z["proj"].astype(np.float64), z["edge0"], z["cm0"], z["edges"], z["cms"], noise, z["prod_chain"], s)
++
++
++def chain(r: Record, i: int, p: Policy) -> list[int]:
++    """The drafts policy p proposes at record i (Drafter.chain's arithmetic on the recorded terms)."""
++
++    from .dspark import target_kept
++
++    m = r.meta
++    depth = min(p.most, r.cand.shape[1])
++    sampled = r.sampling is not None
++    temp = float(r.sampling.temperature) if sampled else 1.0
++    weight = m["dspark_noise"] if p.noise is None else p.noise
++    use_filter = m["dspark_filter"] if p.filter is None else p.filter
++    out, conf, alive, a = [], [], 1.0, -1
++    for d in range(depth):
++        bias = r.mb0[i] if d == 0 else r.mbs[i, d - 1, a]
++        score = (r.vals[i, d] + bias) / temp
++        pick = score + weight * r.noise[i, d] if sampled else score
++        if sampled and use_filter:
++            pick = np.where(target_kept(score, r.cand[i, d], r.sampling), pick, -np.inf)
++        j = int(np.argmax(pick))
++        if m["learned_conf"]:
++            z = float(r.hconf[i, d]) + m["conf_b"] + (float(r.cm0[i]) if d == 0 else float(r.cms[i, d - 1, a]))
++            z = z * p.conf_scale + p.conf_shift
++            c = float(1.0 / (1.0 + np.exp(-z)))
++        else:
++            e = np.exp(score - score.max())
++            c = float(e[j] / e.sum())
++        conf.append(c)
++        if p.costs is None and p.confidence > 0:
++            alive *= c
++            if d > 0 and alive < p.confidence:
++                conf.pop()
++                break
++        a = j
++        out.append(int(r.cand[i, d, j]))
++    if p.costs is not None:
++        out = out[:best_depth(conf, p.costs)]
++    return out
++
++
++def check_production(r: Record) -> int:
++    """Records whose production chain (fc5:0.3, the dump's settings) the replay does not reproduce (0 expected)."""
++
++    prod = Policy("prod", most=r.meta["prod_most"], confidence=r.meta["prod_confidence"])
++    bad = 0
++    for i in range(len(r.cand)):
++        want = [int(t) for t in r.prod[i] if t >= 0]
++        bad += chain(r, i, prod) != want
++    return bad
++
++
++def walk(r: Record, p: Policy, costs: tuple[float, ...] | None = None) -> dict:
++    """Rounds, tokens and (with ``costs``: verify ms of 1, 2, .. rows) estimated ms of decoding the reply under p."""
++
++    n, i, rounds, ms = len(r.tokens) - 1, 0, 0, 0.0
++    depths = []
++    while i < n:
++        drafts = chain(r, i, p) if i < len(r.cand) else []
++        acc = 0
++        while acc < len(drafts) and i + 1 + acc <= n and drafts[acc] == int(r.tokens[i + 1 + acc]):
++            acc += 1
++        rows = 1 + len(drafts)
++        if costs is not None:
++            ms += costs[min(rows, len(costs)) - 1]
++        depths.append(len(drafts))
++        i += acc + 1
++        rounds += 1
++    out = dict(tokens=n, rounds=rounds, tokens_per_round=n / max(rounds, 1), mean_drafts=float(np.mean(depths or [0])))
++    if costs is not None:
++        out.update(ms=ms, tok_s=1000.0 * n / ms if ms else 0.0)
++    return out
++
++
++def main(argv: list[str]) -> None:
++    costs = None
++    if "--costs" in argv:
++        k = argv.index("--costs")
++        costs = tuple(float(x) for x in argv[k + 1].split(","))
++        argv = argv[:k] + argv[k + 2:]
++    files = []
++    for a in argv:
++        q = Path(a)
++        files += sorted(q.glob("*.npz")) if q.is_dir() else [q]
++    recs = [load(f) for f in files]
++    bad = sum(check_production(r) for r in recs)
++    print(f"{len(recs)} dumps, {sum(len(r.tokens) - 1 for r in recs)} tokens; production chain reproduced: "
++          f"{'yes' if bad == 0 else f'NO ({bad} rounds differ)'}")
++    pols = [Policy("fc5:0.3 (production)", most=5, confidence=0.3), Policy("fc8:0.3", most=8, confidence=0.3),
++            Policy("fc8:0.15", most=8, confidence=0.15)]
++    if costs is not None:
++        pols += [Policy(f"cost{m}", most=m, costs=costs) for m in (5, 7, 8)]
++    for w in (0.5, 0.7, 1.0):
++        pols.append(Policy(f"fc5:0.3 noise {w}", most=5, confidence=0.3, noise=w))
++    for p in pols:
++        agg = [walk(r, p, costs) for r in recs]
++        t, rd = sum(a["tokens"] for a in agg), sum(a["rounds"] for a in agg)
++        line = f"{p.name:>24}: tokens/round {t / rd:.3f}, mean drafts {np.mean([a['mean_drafts'] for a in agg]):.2f}"
++        if costs is not None:
++            line += f", est. {1000.0 * t / sum(a['ms'] for a in agg):.1f} tok/s (verify only)"
++        print(line)
++
++
++if __name__ == "__main__":
++    main(sys.argv[1:])
