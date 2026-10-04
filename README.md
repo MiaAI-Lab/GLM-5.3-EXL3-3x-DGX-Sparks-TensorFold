@@ -61,6 +61,7 @@ request at a time. Each figure names its boot; figures from one boot are single 
 | Decode, prose | 29.1-30.2 tok/s (3 runs) | p17 |
 | Decode with NCCL instead of RoCE | code 33.0-34.5, prose 27.6-28.1 tok/s | p15 vs NCCL boots: RoCE is ~+10% |
 | Prefill | 655 / 656 / 638 tok/s at 8k / 16k / 32k tokens | p10 |
+| Prefill with the MoE exchange overlapped (0127) | 684 / 670 tok/s at 16k / 32k (2 runs each); 662 / 649 with it off on the same image | ovl1 / ovl0, 147,456-token window |
 | Long-context mode, 655,360-token window (experimental) | decode code 39.9-40.1, prose 29.8-30.4 tok/s (3 runs); prefill ~220-245 tok/s | fp4g655: `KV=fp4 CP=1 TF_GLM_CP_GRAPHS=1`, `OVERHEAD_GIB=10` |
 | Same window, FP8 KV, graphs off | decode code 29.6-30.1, prose 23.8-25.1 tok/s | cp655: `CP=1`, eager decode |
 | Long-context mode with 0125 (faster draft selection), 626,688-token window | greedy: prose 30.1-31.8, code 39.9-41.3 tok/s (3 runs); sampled (T 1.0, top_p 0.95): prose 22.0-23.4, code 25.1-28.7 | fp4g627m; same reply hashes as before 0125 |
