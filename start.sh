@@ -6,15 +6,23 @@
 # Stop it with ./stop.sh.
 #
 # Usage: ./start.sh [restart] [extra tensorfold serve args]
-#   ./start.sh                         # scripts/config.sh's defaults (provisional: README "Memory")
-#   ./start.sh restart                 # stop all three ranks (./stop.sh), then start them again
-#   CONTEXT=32768 ./start.sh restart   # another window (memplan checks it first)
+#   ./start.sh                         # scripts/config.sh's defaults: a 163,840-token window, FP8 KV cache, DSpark
+#                                      # drafts, 4-bit dense weights, one request at a time
+#                                      # (if the server already runs, says so and leaves it alone)
+#   ./start.sh restart                 # stop all three ranks (./stop.sh), then start them again, e.g. to apply changed
+#                                      # settings or patches; the new arguments are checked before stopping
+#   KV=fp4 CP=1 CONTEXT=499712 PREFILL_ROWS=3072 TF_GLM_CP_GRAPHS=1 ./start.sh restart
+#                                      # the long-context mode: a 499,712-token window (README "Results")
+#   KV=fp4x CP=1 CONTEXT=618496 PREFILL_ROWS=3072 TF_GLM_CP_GRAPHS=1 ./start.sh restart
+#                                      # opt-in: ~24% more context than fp4 (README "More context")
+#   PARALLEL=2 CONTEXT=65536 ./start.sh restart   # two requests decoded together (up to 4; not with CP=1)
+#   CONTEXT=32768 ./start.sh restart   # another window (the memory plan checks it first)
 #   DRY_RUN=1 ./start.sh               # print the memory plan and every rank's docker command; change nothing
 # Extra arguments go to every rank after the defaults, so they win (the last value of a flag counts).
 # Setup: WORKER and WORKER2 in scripts/local.sh (scripts/local.sh.example), key-based ssh; the head exports its
 # Hugging Face cache over NFS to both workers (README "Weights over NFS").
 # Settings, from the environment, scripts/local.sh or ./.env (defaults and their reasons in scripts/config.sh):
-#   serving  CONTEXT, KV, DENSE, MTP, CP, PREFILL_ROWS, PREFILL_SPLIT, PREFILL_OVERLAP, COPY, COPY_MAX, COPY_HYBRID,
+#   serving  CONTEXT, PARALLEL, KV, DENSE, DRAFTER, MTP, CP, PREFILL_ROWS, PREFILL_SPLIT, PREFILL_OVERLAP, COPY, COPY_MAX, COPY_HYBRID,
 #            SHARED_PREFIX, STREAM_SMOOTH, STREAM_SMOOTH_MS, KV_POOL_GIB, MAX_TOKENS, THINKING, COMM, SERVED_NAME,
 #            HOST, PORT
 #   memory   FLOOR_GIB, OVERHEAD_GIB, MEMORY_RESERVE_GIB, GUARD, GUARD_KILL_GIB
@@ -101,8 +109,8 @@ source ./scripts/banner.sh
 echo
 banner
 printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
-printf '%s  %s · 3 x DGX Spark · %s-token window · %s KV · %s dense · MTP %s · port %s%s\n\n' "$D" "$MODEL_ID" \
-  "$(arg_value --context)" "$KV" "$DENSE" "$( [[ "$MTP" == 1 ]] && echo on || echo off)" "$PORT" "$R"
+printf '%s  %s · 3 x DGX Spark · %s at once · %s-token window · %s KV%s · %s drafts · port %s%s\n\n' "$D" "$MODEL_ID" \
+  "$PARALLEL" "$(arg_value --context)" "$KV" "$( [[ "$CP" == 1 ]] && echo " · context parallel")" "$DRAFTER" "$PORT" "$R"
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
 
@@ -125,7 +133,7 @@ step 1 "Setup: image and checkpoint on all 3 Sparks"
 if [[ "${PREPARE:-auto}" == 1 || ( "${PREPARE:-auto}" != 0 && "$(prepared_state 2>/dev/null)" != "$(cat "$PREPARED_MARKER" 2>/dev/null)" ) ]]; then
   if (( DRY )); then log "DRY_RUN: scripts/prepare.sh would run now (not ready yet)"
   else
-    log "Not ready yet: running scripts/prepare.sh"
+    log "Not ready yet: running scripts/prepare.sh (the first time this builds the image on every Spark, downloads ~273 GiB and sets up NFS for the workers)"
     ./scripts/prepare.sh
   fi
 elif [[ "${PREPARE:-auto}" == 0 ]]; then
@@ -205,7 +213,7 @@ if (( image_ok )); then
   plan_rc=0
   memplan "0=${AVAIL[0]},1=${AVAIL[1]},2=${AVAIL[2]}" | sed 's/^/  /' || plan_rc=$?
   if (( plan_rc == 1 )); then
-    msg="the memory plan refuses this start (above): with a ${CONTEXT}-token window a Spark would be left with less than FLOOR_GIB=$FLOOR_GIB GiB, and a GB10 that runs out of memory freezes. Lower CONTEXT, use KV=fp8, PREFILL_ROWS=1024 or MTP=0, or free memory on the Spark it names"
+    msg="the memory plan refuses this start (above): with a ${CONTEXT}-token window a Spark would be left with less than FLOOR_GIB=$FLOOR_GIB GiB, and a GB10 that runs out of memory freezes. Lower CONTEXT, use KV=fp4 (or fp4x), PREFILL_ROWS=1024 or MTP=0, or free memory on the Spark it names"
     (( DRY )) && warn "DRY_RUN: $msg" || die "$msg; nothing was started"
   elif (( plan_rc != 0 )); then
     msg="the memory plan could not be computed (exit $plan_rc, above): the image and scripts/memplan.py disagree; rebuild the image (scripts/prepare.sh)"
@@ -342,7 +350,7 @@ step 3 "Launch: memory guard, container $CONTAINER_NAME, ranks 2 and 1 on the wo
 start_guards
 launch
 [[ "${FOREGROUND:-0}" == 1 ]] && foreground
-step 4 "Loading: ~86 GiB of weights on each Spark (the workers over NFS; the very first start also compiles CUDA kernels)"
+step 4 "Loading: ~86 GiB of weights on each Spark, the workers over NFS (3-5 min; the very first start also compiles CUDA kernels)"
 docker logs -f "$CONTAINER_NAME" > >(grep --line-buffered -v -E "$NOISE" | sed -u "s/^/  ${D}│${R} /") 2>&1 &
 LOGS_PID=$!
 start=$SECONDS; next_beat=30; refit=""
@@ -385,7 +393,7 @@ step 5 "Smoke test: one chat completion through all 3 ranks"
 SERVED=$(served_name || echo "$SERVED_NAME")
 if smoke=$(curl -s --max-time 300 "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
              -d "{\"model\": \"$SERVED\", \"max_tokens\": 32, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}" |
-           python3 -c 'import json,sys; r = json.load(sys.stdin); c = r["choices"][0]["message"].get("content") or ""; assert c.strip(); print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
+           python3 -c 'import json,sys; r = json.load(sys.stdin); c = r["choices"][0]["message"].get("content") or ""; assert c.strip(); print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens,", r.get("tensorfold", {}).get("decode_s"), "s")' 2>/dev/null); then
   log "OK: $smoke"
 else
   fail "the smoke test request failed (no reply text); the ranks are still running"
@@ -395,7 +403,8 @@ IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED" "$PORT" "$R"
 cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED)
-    Window   $(arg_value --context) tokens · 3 Sparks · one request at a time · $KV KV · $DENSE dense weights · MTP drafts $( [[ "$MTP" == 1 ]] && echo on || echo off)
+    Window   $(arg_value --context) tokens · 3 Sparks · $( [[ "$PARALLEL" == 1 ]] && echo "one request at a time" || echo "$PARALLEL at once") · $KV KV$( [[ "$CP" == 1 ]] && echo " · context parallel")$( [[ -n "${TF_GLM_DISK_CACHE:-}" ]] && echo " · prompt cache on NVMe") · $DENSE dense weights$( [[ "$COMM" == roce ]] && echo " · RoCE all-gathers")
+    Drafts   $DRAFTER$( [[ "$MTP" == 1 && "$DRAFTER" != mtp ]] && echo " + MTP") · copy drafts $( [[ "$COPY" == 1 ]] && echo "up to $COPY_MAX$( [[ "$COPY_HYBRID" == 1 ]] && echo ", checked by DSpark")" || echo off) · shared system prompts $( [[ "$SHARED_PREFIX" == 1 ]] && echo on || echo off)
     Memory   guard $( [[ "$GUARD" == 1 ]] && echo "on (stops a rank below $GUARD_KILL_GIB GiB; lowest so far: $STATE_DIR/guard/memguard.low)" || echo off)
     Logs     docker logs -f $CONTAINER_NAME$(for i in $(worker_ids); do printf '   (rank %s: ssh %s docker logs -f %s)' "$i" "$(worker_host "$i")" "$CONTAINER_NAME"; done)
     Restart  ./start.sh restart
