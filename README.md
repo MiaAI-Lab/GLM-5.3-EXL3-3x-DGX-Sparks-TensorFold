@@ -637,7 +637,9 @@ repository's own work only.
   (Apache 2.0).
 - Patches 0001-0068 carry the GLM-5.3-Flash recipe's credits: b12x's RoCE transport by local-inference-lab, code from
   [jayleaton/glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark) by Jay Leaton (tool
-  calling, L2 prefetch, expert loads), and the other contributors listed there.
+  calling, L2 prefetch, expert loads), and contributions by [abhicnv007](https://github.com/abhicnv007) (0054),
+  [Alexbob0](https://github.com/Alexbob0) (0057, 0063), [kky42](https://github.com/kky42) (0060) and
+  [SxMShaDoW](https://github.com/SxMShaDoW) (0059, a TensorFold fix backported).
 - NVIDIA's PyTorch container, the base of the image.
 
 The full list, including the runtime stack and licenses, is in [`CREDITS.md`](CREDITS.md). Made by Mia's AI Lab.

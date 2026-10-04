@@ -54,7 +54,7 @@ b12x
   Copyright the b12x contributors (local-inference-lab). Apache License, Version 2.0.
   patches/0006-cuda-roce-allgather.patch: tensorfold/cuda/roce_proxy.c is b12x's RDMA proxy
   (b12x/comm/roce/_roce_proxy.c at commit 8a99d639410e39d5f39cb4037675331beceea1d4), modified: the multi-Spark
-  (TP=3/4) patch extends it to up to 4 HCAs with a GID index each and per-peer routes (each peer's stripes over the
+  (TP=3/4) patch (patches/0066-glm-tp-n.patch) extends it to up to 4 HCAs with a GID index each and per-peer routes (each peer's stripes over the
   HCAs that share its subnet), proxy ABI 5; with no routes set it behaves as b12x's file. Its header lists these
   changes. tensorfold/cuda/roce.cu reimplements b12x's CuTe DSL all-gather kernel (b12x/comm/roce/_allgather_cute.py
   at the same commit) in CUDA C++, with the same stages and memory orderings.
@@ -133,6 +133,7 @@ Contributions to the GLM-5.3-Flash recipe (Apache-2.0, through its issues and pu
   patches/0054-glm-image-prompt-reuse.patch: by abhicnv007 (issue #11), with two review changes by Mia's AI Lab.
   patches/0057-server-thinking-alias.patch: from Alexbob0's pull request #25, extended by Mia's AI Lab.
   patches/0060-glm-keep-thinking.patch: by kky42 (pull request #23).
+  patches/0063-glm-kept-cap-superseded-first.patch: by Alexbob0 (pull request #32), rebased on 0054 by Mia's AI Lab.
 
 Model files (downloaded from Hugging Face by scripts/prepare.sh; not included in this repository or its image)
   The checkpoint, Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold, derives from zai-org's GLM-5.3

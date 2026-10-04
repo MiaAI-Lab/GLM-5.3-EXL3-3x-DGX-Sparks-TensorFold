@@ -90,7 +90,7 @@ credits for them carry over here:
 - `0003-glm-vision`: GLM's image and video processors (resize with pad, 2 fps frame choice, prompt layout) and vision
   tower, checked bit for bit against Hugging Face [transformers](https://github.com/huggingface/transformers) 5.17
   (Apache 2.0), the reference they follow; builds on TensorFold's Qwen image pipeline.
-- `0006-cuda-roce-allgather`: the one-shot RoCE all-gather (`COMM=roce`) is the "RoCEnante" transport of
+- `0006-cuda-roce-allgather` and `0066-glm-tp-n` (three Sparks): the one-shot RoCE all-gather (`COMM=roce`) is the "RoCEnante" transport of
   **[b12x](https://github.com/local-inference-lab/b12x)** by local-inference-lab (Apache 2.0): its C proxy
   (`roce_proxy.c`), modified for more than two Sparks (per-peer routes over up to 4 network cards; its header lists the
   changes), and its CuTe all-gather kernel reimplemented in CUDA C++ (`roce.cu`).
@@ -133,6 +133,8 @@ credits for them carry over here:
   [SxMShaDoW](https://github.com/SxMShaDoW)), backported to v0.6.0.
 - `0060-glm-keep-thinking` (earlier turns keep their reasoning, `TF_GLM_CLEAR_THINKING`): by
   [kky42](https://github.com/kky42), the Flash recipe's pull request #23.
+- `0063-glm-kept-cap-superseded-first` (past `TF_GLM_CACHE_ENTRIES`, a conversation's superseded kept states go
+  first): by [Alexbob0](https://github.com/Alexbob0), the Flash recipe's pull request #32, rebased on 0054.
 - Every patch, except the parts credited above: by Mia's AI Lab, developed with
   [Claude Code](https://claude.com/claude-code), under the Apache License 2.0; the TensorFold code the patches modify or
   quote as context stays under TensorFold's licenses (Apache 2.0, and MIT for code written before v0.6.0; see
