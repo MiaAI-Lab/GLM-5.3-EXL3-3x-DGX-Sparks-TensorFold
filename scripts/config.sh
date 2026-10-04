@@ -77,8 +77,8 @@ GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/glm-5.3-exl3-3x-dgx-sparks-tensorfol
 # The published image of this release's patches, pinned: prepare.sh pulls it by digest (a tag can be moved, a digest
 # cannot) while patches/*.patch and IMAGE_EXTRAS still hash to IMAGE_TAG's hash. Other patches pull
 # $GHCR_IMAGE:<TF_VERSION>-<hash> when one is published, else build as above. scripts/publish-image.sh prints both.
-IMAGE_TAG="${IMAGE_TAG:-}"
-IMAGE_DIGEST="${IMAGE_DIGEST:-}"
+IMAGE_TAG="${IMAGE_TAG:-v0.6.0-4f3223245926}"
+IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:1adb1f950a9bc44a633a62544ffa64deac7f099765f8cf8bfa2f40074694449c}"
 # the registry reference prepare.sh pulls for these patches: the pinned digest, or the hash's tag
 prebuilt_image() {
   local tag="${TF_VERSION}-$(image_hash)"
