@@ -93,6 +93,17 @@ API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.
 URL="http://$API_HOST:$PORT"
 
 running_here()   { [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
+# rank 0's container has really stopped (exited, dead, or gone on a second look): a docker inspect that fails for a
+# moment (a busy daemon) is not taken for an exit
+exited_here() {
+  local st
+  st=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || true)
+  [[ "$st" == exited || "$st" == dead ]] && return 0
+  [[ -n "$st" ]] && return 1
+  sleep 3
+  st=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || true)
+  [[ -z "$st" || "$st" == exited || "$st" == dead ]]
+}
 running_worker() { [[ "$(worker "$1" docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
 wname() { echo "rank $1 ($(worker_host "$1"))"; }
 served_name() {
@@ -367,7 +378,7 @@ docker logs -f "$CONTAINER_NAME" > >(grep --line-buffered -v -E "$NOISE" | sed -
 LOGS_PID=$!
 start=$SECONDS; next_beat=30; refit=""
 until curl -sf --max-time 5 "$URL/v1/models" >/dev/null 2>&1; do
-  if ! running_here; then
+  if exited_here; then
     # the memory at this start holds a smaller window than asked (a Spark's free memory drifts): once, start again
     # with the largest one TensorFold names
     refit=$(docker logs "$CONTAINER_NAME" 2>&1 | sed -n 's/.*largest fitting prompt-plus-reply window: \([0-9]*\) tokens.*/\1/p' | tail -1)
