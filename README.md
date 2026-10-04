@@ -86,9 +86,20 @@ Fixed, seeded suite with checkable answers (`tools/quality.py`; greedy), boot fp
 | Python tasks run against hidden tests | 25/25 | |
 | Recall of 16 keys, 4 corrected later (latest value counts) | 7/7 items, 112/112 keys, 0 stale | at ~39k, ~157k and ~314k tokens |
 
-Earlier probe against FP8 KV (greedy, 30 short questions and 8-key recall, without context parallelism): FP4 29/30,
-FP8 27/30, 27/30 replies identical; recall 8/8 at 64k and 128k for both. A paired FP8-vs-FP4 run of the suite above is
-next; until then `KV=fp8` stays the default.
+Paired against FP8 KV on the same items (boot fp8g393: `KV=fp8 CP=1 TF_GLM_CP_GRAPHS=1`, 393,216-token window; the
+window size does not change the arithmetic), exact two-sided McNemar test on the items only one format got right:
+
+| Category | FP8 | FP4 | only FP8 right | only FP4 right | p |
+| --- | --- | --- | --- | --- | --- |
+| Short questions | 123/150 | 124/150 | 6 | 7 | 1.00 |
+| Chained arithmetic | 40/40 | 39/40 | 1 | 0 | 1.00 |
+| Ledger tracking | 35/40 | 35/40 | 4 | 4 | 1.00 |
+| Python tasks | 25/25 | 25/25 | 0 | 0 | 1.00 |
+
+No measurable difference: in both runs every ledger miss is a reply that ran past the token limit (5 each), and every
+finished reply was right. The texts differ (1 of 20 long replies identical; on average they share their first 14%):
+a lossy cache moves a near tie early and greedy decoding takes another, equally good path. Earlier probe without
+context parallelism: FP4 29/30, FP8 27/30 short questions, recall 8/8 at 64k and 128k for both.
 
 ### Memory
 
