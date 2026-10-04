@@ -54,7 +54,7 @@ default), seeds 11, 22 and 33; long prompts with `tools/needle.py`.
 
 | | Measured | Boot |
 | --- | --- | --- |
-| Prefill | **563 tok/s** at 9.9k tokens, **545 tok/s** at 94k (needles correct); 607 / 596 / 590 tok/s at 8k / 16k / 32k | hcp: 499,712-token window, 3,072-row chunks, 0141 (before it, cp500b: 448 / 434, and 419 / 491 / 496) |
+| Prefill | **563 tok/s** at 9.9k tokens, **545 tok/s** at 94k, **468 tok/s** at 314k (needles correct; spark3's lowest free memory 5.26 GiB); 607 / 596 / 590 tok/s at 8k / 16k / 32k | hcp: 499,712-token window, 3,072-row chunks, 0141 (before it, cp500b: 448 / 434, and 419 / 491 / 496) |
 | Decode, greedy | prose 31.7-32.5, code 41.8-42.3 tok/s | fp4g627x: the same mode at a 626,688-token window, 2,048-row chunks, patches through 0128 |
 | Decode, sampled | prose 22.9-24.0, code 25.7-29.4 tok/s | fp4g627x |
 | Long prompts | needles correct at 9.9k and 94k tokens (cp500b), and at 314k (fp4g655, 655,360-token window) | |

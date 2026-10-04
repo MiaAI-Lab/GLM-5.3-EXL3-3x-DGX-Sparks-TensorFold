@@ -68,5 +68,6 @@
 - Long-context prefill +26% (0141, on by default under `CP=1`): prompt chunks gather each rank's visible KV rows
   (~430 B a token at fp4) instead of exchanging every row's queries and attention partials (~50 KB a row and layer),
   and the fp4 attention kernel decodes its codes arithmetically instead of through a lookup table (the same bits).
-  Boot hcp (cp500b's settings): 563 / 545 tok/s at 9.9k / 94k tokens (cp500b: 448 / 434), 607 / 596 / 590 at
+  Boot hcp (cp500b's settings): 563 / 545 / 468 tok/s at 9.9k / 94k / 314k tokens (cp500b: 448 / 434; the last
+  measured at 314k before, fp4g627p: 276), 607 / 596 / 590 at
   8k / 16k / 32k; exact 12/12, needles correct, spark3's lowest free memory 5.61 GiB. GPU tests 22/22.
