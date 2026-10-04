@@ -74,7 +74,6 @@ for v in KV_POOL_GIB FLOOR_GIB OVERHEAD_GIB MEMORY_RESERVE_GIB GUARD_KILL_GIB; d
 done
 awk -v f="$FLOOR_GIB" -v k="$GUARD_KILL_GIB" 'BEGIN { exit !(f >= 4 && f > k) }' ||
   die "FLOOR_GIB is at least 4 and above GUARD_KILL_GIB ($GUARD_KILL_GIB) (a GB10 that runs out of memory freezes), not $FLOOR_GIB"
-awk -v f="$FLOOR_GIB" 'BEGIN { exit !(f < 8) }' && warn "FLOOR_GIB=$FLOOR_GIB: under 8 GiB of headroom a rank's spike may reach the guard ($GUARD_KILL_GIB GiB), which stops it"
 check_workers
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
