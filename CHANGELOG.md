@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (in development)
+## v1.0 (2026-10-04)
 
 - Full GLM-5.3 (`glm_moe_dsa`) on TensorFold v0.6.0 across three DGX Sparks: the GLM-5.3-Flash recipe's v1.4 patches
   (0001-0068) and patches 0100-0104 (the 3-rank layout with expert blocks rotating by layer, the mixed-width EXL3
