@@ -63,6 +63,11 @@ request at a time. Each figure names its boot; figures from one boot are single 
 | Prefill | 655 / 656 / 638 tok/s at 8k / 16k / 32k tokens | p10 |
 | Long-context mode, 655,360-token window (experimental) | decode code 39.9-40.1, prose 29.8-30.4 tok/s (3 runs); prefill ~220-245 tok/s | fp4g655: `KV=fp4 CP=1 TF_GLM_CP_GRAPHS=1`, `OVERHEAD_GIB=10` |
 | Same window, FP8 KV, graphs off | decode code 29.6-30.1, prose 23.8-25.1 tok/s | cp655: `CP=1`, eager decode |
+| Long-context mode with 0125 (faster draft selection), 626,688-token window | greedy: prose 30.1-31.8, code 39.9-41.3 tok/s (3 runs); sampled (T 1.0, top_p 0.95): prose 22.0-23.4, code 25.1-28.7 | fp4g627m; same reply hashes as before 0125 |
+
+Sampled replies (temperature 1.0, top_p 0.95: a chat client's default) decode slower than greedy ones: fewer drafts
+survive the target's sampled token (~2 tokens a round on prose against ~3-4 greedy). sparkDash's decode bench is
+greedy; its live gauge on a chat shows the sampled rate.
 
 Decode speed depends on the text: speculative drafts land more often on predictable text. On worked arithmetic
 (thinking on) the drafter's acceptance was 87% and a request averaged ~45 tok/s, with bursts above 70.
