@@ -47,7 +47,7 @@ SOCKET_IFNAME="${SOCKET_IFNAME:-}"
 # weight) and BF16 elsewhere, ~273 GiB. MODEL_REVISION pins a Hugging Face commit (empty: the cache's refs/main, or
 # the Hub's main when first downloaded). A checkpoint already in HF_CACHE at that revision is served as it is.
 MODEL_ID="${MODEL_ID:-Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold}"
-MODEL_REVISION="${MODEL_REVISION-}"
+MODEL_REVISION="${MODEL_REVISION-2d747d0e30eca6e3fe37ba63c471cdf9172faa83}"
 # DRAFTER: dspark (default: RedHatAI's DSpark speculator for GLM-5.3, glm-5.3 license, ~2.4 GiB download, ~0.3 GiB a
 # Spark as 4-bit copies; up to 8 drafts a round cut by its learned confidence; code 39.5-40.4 tok/s vs 37.1 with the
 # MTP head, prose the same, 3 runs each) or mtp (the checkpoint's MTP head drafts). Drafts only propose: replies are
