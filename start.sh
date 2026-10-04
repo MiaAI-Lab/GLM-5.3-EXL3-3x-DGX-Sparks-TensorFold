@@ -255,6 +255,19 @@ RUN_ARGS=(--gpus all --ipc=host --network host --shm-size 16g --device /dev/infi
 # The guard (GUARD=1): scripts/memguard.sh on every Spark from before its rank starts until its container is gone
 # (on a worker: copied to ~/.cache/tensorfold-glm53-full/ there and run detached).
 GUARD_DIR="$STATE_DIR/guard"
+# The prompt cache (DISK_CACHE) lives in each image's own folder, KERNEL_CACHE/<image hash>/pcache: an older image's
+# saved states cannot be loaded by this one, so before a start they are deleted on every Spark (the compiled kernels
+# stay). They are root's files (the containers write them), so a throwaway container removes them.
+PCACHE_CLEAN='for d in /k/*/pcache; do [ -d "$d" ] || continue; [ "$d" = "/k/$0/pcache" ] && continue; du -sm "$d" | cut -f1; rm -rf "$d"; done'
+clean_pcaches() {
+  local mb i
+  (( DRY )) && { printf '[dry-run] prompt caches of other images removed on every Spark (KERNEL_CACHE/<other hash>/pcache)\n'; return 0; }
+  mb=$(docker run --rm --network none -v "$KERNEL_CACHE":/k --entrypoint sh "$IMAGE" -c "$PCACHE_CLEAN" "$KCACHE" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')
+  for i in $(worker_ids); do
+    mb=$(( mb + $(worker "$i" "docker run --rm --network none -v \$HOME/.cache/tensorfold-glm53-full:/k --entrypoint sh '$IMAGE' -c $(printf '%q' "$PCACHE_CLEAN") '$KCACHE' 2>/dev/null" | awk '{ s += $1 } END { print s + 0 }') ))
+  done
+  (( mb == 0 )) || log "Removed older images' prompt caches: $(( mb / 1024 )).$(( mb % 1024 * 10 / 1024 )) GiB across the Sparks"
+}
 start_guards() {
   local i
   (( GUARD )) || return 0
@@ -346,6 +359,7 @@ fail() {
 for attempt in 1 2; do
 step 3 "Launch: memory guard, container $CONTAINER_NAME, ranks 2 and 1 on the workers, then rank 0 here"
 start_guards
+(( attempt == 1 )) && clean_pcaches
 launch
 [[ "${FOREGROUND:-0}" == 1 ]] && foreground
 step 4 "Loading: ~86 GiB of weights on each Spark, the workers over NFS (3-5 min; the very first start also compiles CUDA kernels)"

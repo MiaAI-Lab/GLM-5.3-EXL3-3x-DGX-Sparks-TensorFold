@@ -78,7 +78,8 @@ DISK_CACHE=0 ./start.sh restart         # off: nothing is written to disk
 - **Where:** each Spark writes its own third of every prompt (context parallelism) to its own disk, under
   `~/.cache/tensorfold-glm53-full/<image hash>/pcache`; nothing crosses the cables. The budget is a cap, not a
   reservation: it grows as prompts are saved, the least recently used go first, and a Spark always keeps 100 GB free
-  (`TF_GLM_DISK_KEEP_FREE_GB`).
+  (`TF_GLM_DISK_KEEP_FREE_GB`). A new image (an update with other patches) starts a new cache, since its states may not
+  match the old ones: `start.sh` deletes older images' prompt caches on every Spark before it starts the ranks.
 - **What it stores:** the model's state for each prompt (its KV rows, checksummed), from which a prompt's content
   can be derived: treat the folder like the conversations themselves. Delete it to clear the cache.
 - **Limits:** only prompts are saved, so a turn you continue prefills the model's last reply and your new message
