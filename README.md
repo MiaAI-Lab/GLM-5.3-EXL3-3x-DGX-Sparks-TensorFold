@@ -111,8 +111,11 @@ context parallelism: FP4 29/30, FP8 27/30 short questions, recall 8/8 at 64k and
 - Captured decode windows under context parallelism cost ~2.9 GiB on each Spark. With FP8 KV at a 655k window that
   left spark3 under the memory guard's 3 GiB during a long prompt: the guard stopped it and the other ranks waited.
   FP4 KV frees ~3.6 GiB a Spark at that window, which is what makes fp4g655 fit.
-- fp4g655's lowest free memory on spark3 was 3.30 GiB, during a 314k-token prefill: too thin a margin for a default
-  until the prompt path's peak memory comes down (in progress).
+- fp4g655's lowest free memory on spark3 was 3.30 GiB during a 314k-token prefill. A trace of every prompt chunk
+  (`TF_GLM_MEM_TRACE=1`, boot fp4g627m) shows the prompt path itself is small: PyTorch's reserved memory grows 0.9 GiB
+  on the first long chunk and then stays flat to 314k tokens. The thin margin was the window: 655,360 left TensorFold's
+  admission ~0.25 GiB on spark3 (and spark3's other services move its free memory by about a GiB). At 626,688 tokens
+  spark3's lowest was 5.35 GiB through a 314k-token needle (correct): the long-context mode's window.
 
 ## Requirements
 
