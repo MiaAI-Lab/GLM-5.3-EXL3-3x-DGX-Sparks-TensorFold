@@ -64,7 +64,7 @@ request at a time. Each figure names its boot; figures from one boot are single 
 | Prefill with the MoE exchange overlapped (0127) | 684 / 670 tok/s at 16k / 32k (2 runs each); 662 / 649 with it off on the same image | ovl1 / ovl0, 147,456-token window |
 | Long-context mode, 655,360-token window (experimental) | decode code 39.9-40.1, prose 29.8-30.4 tok/s (3 runs); prefill ~220-245 tok/s | fp4g655: `KV=fp4 CP=1 TF_GLM_CP_GRAPHS=1`, `OVERHEAD_GIB=10` |
 | Same window, FP8 KV, graphs off | decode code 29.6-30.1, prose 23.8-25.1 tok/s | cp655: `CP=1`, eager decode |
-| Long-context prefill with 0129 (context-parallel prompt attention through our MSA kernel) | 294 tok/s at 9.9k, 297 at 94k tokens (needles correct; was 244 / 236); exact 12/12 | fp4g627p; spark3 lowest 5.41 GiB |
+| Long-context prefill with 0129 (context-parallel prompt attention through our MSA kernel) | 294 tok/s at 9.9k, 297 at 94k, 276 at 314k tokens (needles correct; was 244 / 236 / 220); exact 12/12 | fp4g627p; spark3 lowest 5.41 GiB |
 | Long-context mode with 0128 (expert kernels: L2 prefetch, dependent launches), 626,688-token window | greedy: prose 31.7-32.5, code 41.8-42.3 tok/s (3 runs); sampled: prose 22.9-24.0, code 25.7-29.4; exact 12/12 | fp4g627x; the same reply hashes |
 | Long-context mode with 0125 (faster draft selection), 626,688-token window | greedy: prose 30.1-31.8, code 39.9-41.3 tok/s (3 runs); sampled (T 1.0, top_p 0.95): prose 22.0-23.4, code 25.1-28.7 | fp4g627m; same reply hashes as before 0125 |
 
