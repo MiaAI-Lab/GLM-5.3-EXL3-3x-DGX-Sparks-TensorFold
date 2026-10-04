@@ -1,0 +1,365 @@
+diff --git tensorfold/families/glm5_next/cuda/dcp.py tensorfold/families/glm5_next/cuda/dcp.py
+index 5db5f58..301dc69 100644
+--- tensorfold/families/glm5_next/cuda/dcp.py
++++ tensorfold/families/glm5_next/cuda/dcp.py
+@@ -345,3 +345,138 @@ def merge_ranks(o: torch.Tensor, lse: torch.Tensor, out: torch.Tensor | None = N
+     if R:
+         _merge_ranks[(R, H)](o, lse, out, R, G=G, H=H, LW=LW, num_warps=4)
+     return out
++
++
++# -- prompt chunks: the selection merged by row owners, the partials merged straight from bf16 -------------------------
++
++def owner_rows(R: int, G: int) -> int:
++    """Rows of a prompt chunk each rank merges the selection of (``select_threshold``): rank p takes rows p M ..
++    min(R, (p + 1) M) - 1, M = ceil(R / G) (the exchanges take M rows a rank; the last ranks' rows past R are
++    padding)."""
++    return -(-int(R) // int(G))
++
++
++@triton.jit
++def _select_threshold(C, T, M, G: tl.constexpr, K: tl.constexpr, KP: tl.constexpr):
++    """Program m: T[m] = the K-th largest of the G K candidates C[g, m, :] (uint64 order, 0 when fewer than K are
++    real): _merge_select's radix select, the same passes on the same keys (C: [G, M, K], every rank's candidates of
++    the rows this rank merges), so the same threshold."""
++    m = tl.program_id(0).to(tl.int64)
++    j = tl.arange(0, KP)
++    jok = j < K
++    bins = tl.arange(0, 256)
++    prefix = tl.zeros((), dtype=tl.uint64)
++    fixed = tl.zeros((), dtype=tl.uint64)
++    need = K
++    for p in tl.static_range(8):
++        hist = tl.zeros((256,), dtype=tl.int32)
++        for g in tl.static_range(G):
++            u = tl.load(C + (g * M + m) * K + j, mask=jok, other=0).to(tl.uint64, bitcast=True)
++            match = jok & ((u & fixed) == prefix)
++            hist += tl.histogram(((u >> (56 - 8 * p)) & 0xFF).to(tl.int32), 256, mask=match)
++        at_or_above = tl.sum(hist, 0) - tl.cumsum(hist, 0) + hist
++        digit = tl.max(tl.where(at_or_above >= need, bins, 0), 0)
++        need -= tl.sum(tl.where(bins > digit, hist, 0), 0)
++        prefix = prefix | (digit.to(tl.uint64) << (56 - 8 * p))
++        fixed = fixed | (tl.full((), 0xFF, tl.uint64) << (56 - 8 * p))
++    tl.store(T + m, prefix.to(tl.int64, bitcast=True))
++
++
++@triton.jit
++def _select_keep(CAND, T, SL, CNT, G: tl.constexpr, K: tl.constexpr, KP: tl.constexpr):
++    """Program r: the rank's own candidates CAND[r] that are real and >= T[r] (uint64), in their (ascending position)
++    order, as local slots g // G -> SL[r] (int32, 0 past them), their number -> CNT[r]: _merge_select's keep."""
++    r = tl.program_id(0).to(tl.int64)
++    j = tl.arange(0, KP)
++    jok = j < K
++    prefix = tl.load(T + r).to(tl.uint64, bitcast=True)
++    u = tl.load(CAND + r * K + j, mask=jok, other=0).to(tl.uint64, bitcast=True)
++    keep = jok & (u >= prefix) & (u != 0)
++    kp = keep.to(tl.int32)
++    gpos = 4294967295 - u.to(tl.uint32).to(tl.int64)
++    at = tl.cumsum(kp, 0) - kp
++    n = tl.sum(kp, 0)
++    tl.store(SL + r * K + at, (gpos // G).to(tl.int32), mask=keep)
++    tl.store(SL + r * K + j, tl.zeros((KP,), tl.int32), mask=jok & (j >= n))
++    tl.store(CNT + r, n)
++
++
++def select_threshold(cands: torch.Tensor, m: int, out: torch.Tensor) -> torch.Tensor:
++    """cands [G, M, k] int64 (every rank's ``select_local`` candidates of the M rows this rank merges, rank order) ->
++    out[:m] int64 (uint64 bits): each row's k-th largest candidate, ``select_merge``'s threshold bit for bit (out[m:]
++    is left alone)."""
++    G, M, k = cands.shape
++    if not cands.is_contiguous() or cands.dtype != torch.int64 or out.dtype != torch.int64 or m > M:
++        raise ValueError("select_threshold: contiguous int64 candidates [G, M, k] and an int64 output")
++    if m:
++        _select_threshold[(int(m),)](cands, out, M, G=G, K=k, KP=triton.next_power_of_2(k),
++                                     num_warps=8 if k > 1024 else 4)
++    return out
++
++
++def select_keep(cand: torch.Tensor, thresholds: torch.Tensor, G: int, *, slots: torch.Tensor | None = None,
++                counts: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
++    """The rank's own candidates cand [R, k] and each row's threshold (``select_threshold`` of the row's owner) ->
++    (local slots [R, k] int32, counts [R] int32): ``select_merge``'s result bit for bit."""
++    R, k = cand.shape
++    if not cand.is_contiguous() or cand.dtype != torch.int64 or thresholds.numel() < R:
++        raise ValueError("select_keep: contiguous int64 candidates and a threshold a row")
++    slots = torch.empty((R, k), dtype=torch.int32, device=cand.device) if slots is None else slots
++    counts = torch.empty((R,), dtype=torch.int32, device=cand.device) if counts is None else counts
++    if R:
++        _select_keep[(R,)](cand, thresholds, slots, counts, G=int(G), K=k, KP=triton.next_power_of_2(k),
++                           num_warps=8 if k > 1024 else 4)
++    return slots, counts
++
++
++@triton.jit
++def _merge_ranks_bf16(OWN, OWN_L, GOT, GOT_L, OUT, n, RANK: tl.constexpr, G: tl.constexpr, HP: tl.constexpr,
++                      LW: tl.constexpr):
++    """Program (row, head): _merge_ranks on bf16 partials (each widened to fp32, exactly what merge_ranks gets from
++    ``got_o.float()``): rank RANK's own partial OWN [n, HP, LW] / OWN_L [n, HP], every other rank p's GOT[s] /
++    GOT_L[s] (s = p, or p - 1 past RANK), in rank order -> OUT[r, h] bf16 (OUT: [n, H, LW], H <= HP heads)."""
++    r = tl.program_id(0).to(tl.int64)
++    h = tl.program_id(1)
++    H = tl.num_programs(1)
++    k = tl.arange(0, LW)
++    M = float("-inf")
++    for g in tl.static_range(G):
++        if g == RANK:
++            x = tl.load(OWN_L + r * HP + h)
++        else:
++            s = g if g < RANK else g - 1
++            x = tl.load(GOT_L + (s * n + r) * HP + h)
++        M = tl.maximum(M, x)
++    acc = tl.zeros((LW,), tl.float32)
++    den = 0.0
++    for g in tl.static_range(G):
++        if g == RANK:
++            x = tl.load(OWN_L + r * HP + h)
++            o = tl.load(OWN + (r * HP + h) * LW + k).to(tl.float32)
++        else:
++            s = g if g < RANK else g - 1
++            x = tl.load(GOT_L + (s * n + r) * HP + h)
++            o = tl.load(GOT + ((s * n + r) * HP + h) * LW + k).to(tl.float32)
++        w = tl.where(x == float("-inf"), 0.0, tl.exp(x - M))
++        acc = acc + w * o
++        den = den + w
++    tl.store(OUT + (r * H + h) * LW + k, tl.where(den > 0.0, acc / tl.where(den > 0.0, den, 1.0), 0.0).to(tl.bfloat16))
++
++
++def merge_ranks_bf16(own: torch.Tensor, own_lse: torch.Tensor, got: torch.Tensor, got_lse: torch.Tensor, rank: int,
++                     out: torch.Tensor) -> torch.Tensor:
++    """``merge_ranks`` of bf16 partials without gathering them into one fp32 tensor: this rank's own partial of its
++    heads own [n, HP, LW] bf16 / own_lse [n, HP] fp32, the other ranks' got [G - 1, n, HP, LW] / got_lse [G - 1, n,
++    HP] (rank order, this rank left out) -> out [n, H, LW] bf16 (its first H <= HP heads: a rank's real heads), the
++    bits merge_ranks gives for the same partials (``got_o.float()``, rank order 0 .. G - 1)."""
++    n, HP, LW = own.shape
++    G = got.shape[0] + 1
++    H = out.shape[1]
++    if not all(t.is_contiguous() for t in (own, own_lse, got, got_lse, out)) or own.dtype != torch.bfloat16 \
++            or got.dtype != torch.bfloat16 or own_lse.dtype != torch.float32 or got_lse.dtype != torch.float32 \
++            or got.shape[1:] != own.shape or got_lse.shape != (G - 1, n, HP) or out.shape != (n, H, LW) or H > HP:
++        raise ValueError("merge_ranks_bf16: contiguous bf16 partials [n, HP, LW], fp32 lse, out [n, H <= HP, LW]")
++    if n and H:
++        _merge_ranks_bf16[(n, H)](own, own_lse, got, got_lse, out, n, RANK=int(rank), G=G, HP=HP, LW=LW,
++                                  num_warps=4)
++    return out
+diff --git tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+index 160ce2c..f5751fa 100644
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
+@@ -955,6 +955,8 @@ def dsa_full_cp(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, p
+     # or gather. Index keys are still written for later sparse rows.
+     within = ((host_pos + R <= c.index_topk) if host_pos is not None else sparse_np is None) and \
+         c.dense_limit <= c.index_topk
++    if b.prefill and CP_PIPE:
++        return cp_prompt(layer, w, lc, kr, pos_dev, b, R, keys, host_pos, sparse_np, qp, within)
+     if ix is not None and keys is not None and within:
+         with prof.timed("dsa: select tokens"):
+             b.topk = cp_all_visible(w, b, R, pos_dev, G, rank, c.index_topk)
+@@ -1068,6 +1070,208 @@ CP_PROMPT_MSA = os.environ.get("TF_GLM_CP_PROMPT_MSA", "1") != "0"
+ CP_PROMPT_ROWS = 512       # context parallelism: a prompt chunk's rows a query gather / partials exchange takes
+ 
+ 
++# TF_GLM_CP_PIPE (default 1): context-parallel prompt chunks through ``cp_prompt`` (no copies of the gathered queries
++# or partials, collectives on a second stream overlapped with the attention, the selection merged by row owners);
++# 0: the 0129 path inline in dsa_full_cp. Every row gets the same bits either way (MSA prompt path).
++CP_PIPE = os.environ.get("TF_GLM_CP_PIPE", "1") != "0"
++
++
++class _Side:
++    """The prompt path's collectives on a second CUDA stream (high priority: its NCCL blocks take SMs as the attention
++    frees them), ordered by events; on CPU tensors every call runs in place, in the same order."""
++
++    stream = None
++
++    def __init__(self, dev) -> None:
++        self.cuda = dev.type == "cuda"
++        if self.cuda:
++            if _Side.stream is None:
++                _Side.stream = torch.cuda.Stream(priority=-1)
++            self.main = torch.cuda.current_stream()
++            _Side.stream.wait_stream(self.main)
++
++    def run(self, fn):
++        """fn's collectives after the main stream's work so far; an event the main stream can wait for."""
++        if not self.cuda:
++            fn()
++            return None
++        side = _Side.stream
++        side.wait_stream(self.main)
++        with torch.cuda.stream(side):
++            fn()
++            ev = torch.cuda.Event()
++            ev.record(side)
++        return ev
++
++    def wait(self, ev) -> None:
++        if ev is not None:
++            self.main.wait_event(ev)
++
++    def join(self) -> None:
++        if self.cuda:
++            self.main.wait_stream(_Side.stream)
++
++
++def cp_prompt(layer: LayerW, w: Weights, lc: torch.Tensor, kr: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
++              R: int, keys: torch.Tensor | None, host_pos: int | None, sparse_np: int | None, qp: torch.Tensor,
++              within: bool) -> torch.Tensor:
++    """dsa_full_cp for a prompt chunk, after the projections, cache writes, rotary queries and index keys: the
++    selection and attention of dsa_full_cp's 0129 path with the same bits (every kernel the same on the same values),
++    in less time:
++
++    - the absorbed queries go straight from the rows into the all-gather's send block, laid out [qa (n, HP, 512),
++      qp (n, HP, 64)] a rank, so each rank's head group of the gathered block is two contiguous views Mia's sparse
++      attention reads in place; its bf16 output and log-sum-exp go straight into the exchange's send blocks, and the
++      received partials merge from bf16 into the attended latents (``dcp.merge_ranks_bf16``, merge_ranks' bits);
++      0129 copied the queries and partials ~9 times (padding, permutes, per-group copies, an fp32 widening);
++    - the collectives run on a second stream, parts of CP_PROMPT_ROWS rows in a ring of two buffers: the next parts'
++      queries gather and the last part's partials travel while a part attends; the first two parts' gathers are on the
++      wire during the selection's scoring;
++    - the selection's candidates go to the row owners only (``dcp.owner_rows``: each rank merges a third of the rows'
++      thresholds, ``select_threshold``, gathered back as one int64 a row, ``select_keep``): a third of the 0129
++      all-gather's bytes, the same lists (select_merge's threshold and keep, bit for bit)."""
++
++    from . import dcp, dsa_full
++
++    c = w.cfg
++    a = layer.dsa
++    HL = a.heads
++    G, rank = int(w.meta["cp"]), int(w.rank)
++    HP = int(w.meta["cp_heads"])
++    LW, RD = c.kv_lora, c.rope
++    QW = LW + RD
++    k = c.index_topk
++    freq = w.meta["rope_freq"]
++    ix = a.index
++    s = b.lat_s
++    with prof.timed("dsa: absorb"):
++        qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R], prompt=latent.PROMPT_MMA)
++    ol = s.ol[:R]
++    scale = c.qk_dim ** -0.5
++    dev = qa.device
++    side = _Side(dev)
++    step = min(R, CP_PROMPT_ROWS)
++    parts = [(r0, min(R, r0 + step)) for r0 in range(0, R, step)]
++    P = len(parts)
++    bf, f32 = torch.bfloat16, torch.float32
++    ring = [dict(mine=torch.empty((step * HP * QW,), dtype=bf, device=dev),
++                 q=torch.empty((G * step * HP * QW,), dtype=bf, device=dev),
++                 po=torch.empty((G * step * HP * LW,), dtype=bf, device=dev),
++                 pl=torch.empty((G * step * HP,), dtype=f32, device=dev),
++                 got=torch.empty(((G - 1) * step * HP * LW,), dtype=bf, device=dev),
++                 gl=torch.empty(((G - 1) * step * HP,), dtype=f32, device=dev)) for _ in range(min(P, 2))]
++    peers = [p for p in range(G) if p != rank]
++    slot = {p: p if p < rank else p - 1 for p in peers}
++    gather_all = getattr(w.comm, "nccl", w.comm).all_gather     # every collective here on NCCL, as 0129's
++
++    def views(i: int):
++        r0, r1 = parts[i]
++        n = r1 - r0
++        t = ring[i % 2]
++        return r0, r1, n, t
++
++    def qviews(block: torch.Tensor, n: int):
++        return block[:n * HP * LW].view(n, HP, LW), block[n * HP * LW:n * HP * QW].view(n, HP, RD)
++
++    evq: list = [None] * P
++    evx: list = [None] * P
++
++    def gather(i: int) -> None:
++        r0, r1, n, t = views(i)
++        mine = t["mine"][:n * HP * QW]
++        ma, mp = qviews(mine, n)
++        ma[:, :HL].copy_(qa[r0:r1])
++        mp[:, :HL].copy_(qp[r0:r1])
++        if HL < HP:                                   # a rank's pad head: zeros (its partials are never read)
++            ma[:, HL:].zero_()
++            mp[:, HL:].zero_()
++        allq = t["q"][:G * n * HP * QW]
++        evq[i] = side.run(lambda: gather_all(mine, allq))
++
++    gather(0)
++    if P > 1:
++        gather(1)
++    # the selection (while the first parts' queries are on the wire)
++    if ix is not None and keys is not None and within:
++        with prof.timed("dsa: select tokens"):
++            b.topk = cp_all_visible(w, b, R, pos_dev, G, rank, k)
++    elif ix is not None and keys is not None:
++        with prof.timed("dsa: select tokens"):
++            mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
++            dsa_full.index_q_rope(b.qi[:R], c.index_heads, pos_dev, freq)
++            if host_pos is not None:
++                cols = max(1, dcp.visible_local(host_pos + R - 1, rank, G))
++            elif sparse_np is not None:
++                cols = min(keys.shape[0], -(-int(sparse_np) // G) + 1)
++            else:
++                cols = min(keys.shape[0], -(-int(c.dense_limit) // G) + 1)
++            M = dcp.owner_rows(R, G)
++            cand = torch.empty((G * M, k), dtype=torch.int64, device=dev)
++            if G * M > R:
++                cand[R:].zero_()                      # pad rows: no candidates (their thresholds are never read)
++            dcp.select_local(b.qi[:R], b.ikr[:R, c.index_dim:], keys, rank, G, pos_dev, R, k=k, cols=cols,
++                             out=cand[:R])
++            every = torch.empty((G, M, k), dtype=torch.int64, device=dev)
++            every[rank].copy_(cand[rank * M:(rank + 1) * M])
++            ev = side.run(lambda: w.comm.exchange_all({p: [cand[p * M:(p + 1) * M]] for p in peers},
++                                                       {p: [every[p]] for p in peers}))
++            side.wait(ev)
++            th = torch.empty((M,), dtype=torch.int64, device=dev)
++            dcp.select_threshold(every, M, th)
++            th_all = torch.empty((G * M,), dtype=torch.int64, device=dev)
++            side.wait(side.run(lambda: gather_all(th, th_all)))
++            b.topk = dcp.select_keep(cand[:R], th_all, G)
++    elif b.topk is None:
++        raise RuntimeError(f"layer {layer.index}: a shared indexer layer without a full layer's top-k before it")
++    tokens, counts = b.topk
++    msa = None
++    if CP_PROMPT_MSA and qa.is_cuda:
++        from . import msa as msa_mod
++
++        probe = ring[0]["q"][:step * HP * LW].view(step, HP, LW)
++        msa = msa_mod if msa_mod.supported(probe, lc, kr) else None
++
++    def attend(i: int) -> None:
++        r0, r1, n, t = views(i)
++        side.wait(evq[i])
++        po = t["po"][:G * n * HP * LW].view(G, n, HP, LW)
++        pl = t["pl"][:G * n * HP].view(G, n, HP)
++        allq = t["q"][:G * n * HP * QW].view(G, n * HP * QW)
++        for g in range(G):                            # every rank's head group over this rank's tokens
++            qa_g, qp_g = qviews(allq[g], n)
++            if msa is not None:
++                msa.prompt_lse(qa_g, lc, tokens[r0:r1], counts[r0:r1], po[g], pl[g], scale, qp_g, kr)
++            else:
++                o, lse = dcp.attention_partial(qa_g, qp_g, lc, kr, tokens[r0:r1], counts[r0:r1], scale)
++                po[g].copy_(o)
++                pl[g].copy_(lse)
++        got = t["got"][:(G - 1) * n * HP * LW].view(G - 1, n, HP, LW)
++        gl = t["gl"][:(G - 1) * n * HP].view(G - 1, n, HP)
++        evx[i] = side.run(lambda: w.comm.exchange_all({p: [po[p], pl[p]] for p in peers},
++                                                      {p: [got[slot[p]], gl[slot[p]]] for p in peers}))
++
++    def merge(i: int) -> None:
++        r0, r1, n, t = views(i)
++        side.wait(evx[i])
++        dcp.merge_ranks_bf16(t["po"][:G * n * HP * LW].view(G, n, HP, LW)[rank],
++                             t["pl"][:G * n * HP].view(G, n, HP)[rank],
++                             t["got"][:(G - 1) * n * HP * LW].view(G - 1, n, HP, LW),
++                             t["gl"][:(G - 1) * n * HP].view(G - 1, n, HP), rank, ol[r0:r1])
++
++    with prof.timed("dsa: cp attention"):
++        for i in range(P):
++            attend(i)
++            if i + 2 < P:
++                gather(i + 2)
++            if i >= 1:
++                merge(i - 1)
++        merge(P - 1)
++        side.join()
++    with prof.timed("dsa: expand"):
++        o = latent.expand_v(ol, a.absorb, b.vn[:R], prompt=latent.PROMPT_MMA).view(R, HL * c.v_dim)
++    return out_proj(w, b, o, a.o, None, R, site=(layer.index, "a"))
++
++
+ def cp_all_visible(w: Weights, b: Buffers, R: int, pos_dev: torch.Tensor, G: int, rank: int, k: int):
+     """Context parallelism's lists for rows that see at most k tokens: every visible local slot of the rank,
+     ascending (slot t holds position t G + rank, visible to row r at pos + r when t G + rank <= pos + r), and their
