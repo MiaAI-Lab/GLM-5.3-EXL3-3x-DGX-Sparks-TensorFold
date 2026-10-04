@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact replies through the running server: every drafted reply (MTP and copy drafts, the default) must equal its
+"""Exact replies through the running server: every drafted reply (DSpark and copy drafts by default; MTP with DRAFTER=mtp) must equal its
 serial reference ("draft": false: one token a round, a fresh prefill), and sending the same requests at once (they
 queue: one request at a time) must not change any reply. Greedy and seeded sampling, thinking on and off, prose, code
 and a quote-and-edit task (copy drafts). Replies are compared by the server's token_sha (a hash of the reply's token

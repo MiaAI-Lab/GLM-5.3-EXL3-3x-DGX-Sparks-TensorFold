@@ -12,7 +12,7 @@
 #   ./start.sh restart                 # stop all three ranks (./stop.sh), then start them again, e.g. to apply changed
 #                                      # settings or patches; the new arguments are checked before stopping
 #   KV=fp4 CP=1 CONTEXT=499712 PREFILL_ROWS=3072 TF_GLM_CP_GRAPHS=1 ./start.sh restart
-#                                      # the long-context mode: a 499,712-token window (README "Results")
+#                                      # the long-context mode: a 499,712-token window (README "Performance")
 #   KV=fp4x CP=1 CONTEXT=618496 PREFILL_ROWS=3072 TF_GLM_CP_GRAPHS=1 ./start.sh restart
 #                                      # opt-in: ~24% more context than fp4 (README "More context")
 #   PARALLEL=2 CONTEXT=65536 ./start.sh restart   # two requests decoded together (up to 4; not with CP=1)

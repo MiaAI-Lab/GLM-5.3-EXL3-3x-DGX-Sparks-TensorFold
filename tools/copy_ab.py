@@ -1,11 +1,11 @@
 """Live A/B for copy drafts (TF_GLM_COPY_HYBRID): edit/quote-heavy prompts plus two controls, on :8888.
    python3 tools/copy_ab.py <label>          one line per request: tok/s, tokens/round, round kinds, reply sha
 Run once with the hybrid off and once on (two boots); greedy replies must have the same sha in both (exactness)."""
-import collections, json, pathlib, sys, urllib.request
-URL = "http://127.0.0.1:8888/v1/chat/completions"
+import collections, json, os, pathlib, sys, urllib.request
+URL = os.environ.get("URL", "http://127.0.0.1:8888") + "/v1/chat/completions"
 R = pathlib.Path(__file__).resolve().parents[1]
 code = "\n".join((R / "tools/quality.py").read_text().splitlines()[:140])
-prose = (R / "README.md").read_text().split("### Memory")[0].split("### Quality")[0][-3000:]
+prose = (R / "tools/copy_ab_prose.md").read_text()   # the README excerpt the published runs used (commit c38f68a)
 cfg = json.dumps({"server": {"host": "0.0.0.0", "port": 8888, "workers": 3, "timeout_s": 600},
                   "model": {"name": "GLM-5.3-EXL3", "context": 499712, "kv": "fp4", "prefill_rows": 3072},
                   "drafter": {"kind": "dspark", "block": 8, "copy": True},

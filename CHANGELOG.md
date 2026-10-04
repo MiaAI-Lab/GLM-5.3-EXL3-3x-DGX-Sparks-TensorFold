@@ -30,7 +30,7 @@
   cp655 (655,360 window, fp8, eager decode): prose 23.8-25.1, code 29.6-30.1 tok/s.
 - 4-bit latent cache (KV=fp4, 0115): e2m1 codes, an e4m3 scale per 16 values and a power-of-two row scale, 304 bytes
   a row (fp8: 528). First quality probe against fp8 (greedy): 30 short questions 29/30 (fp8 27/30), 27/30 replies
-  identical, 8-key recall 8/8 at 64k and 128k. Not the default yet: a larger evaluation is in progress.
+  identical, 8-key recall 8/8 at 64k and 128k. The full paired evaluation (README "Quality") found no measurable difference from fp8; fp4 is the long-context setting.
 - Draft costs measured on text, the verify profile fixed (0116, 0119); DSpark sampling filter (0117); static scratch
   for captured CP decode windows (0118); CP windows within the top-k skip selection (0120); a RoCE timeout inside a
   replayed graph is reported (0121).

@@ -49,7 +49,7 @@ SOCKET_IFNAME="${SOCKET_IFNAME:-}"
 MODEL_ID="${MODEL_ID:-Mia-AiLab/GLM-5.3-EXL3-2.75bpw-TensorFold}"
 MODEL_REVISION="${MODEL_REVISION-}"
 # DRAFTER: dspark (default: RedHatAI's DSpark speculator for GLM-5.3, glm-5.3 license, ~2.4 GiB download, ~0.3 GiB a
-# Spark as 4-bit copies; up to 7 drafts a round cut by its learned confidence; code 39.5-40.4 tok/s vs 37.1 with the
+# Spark as 4-bit copies; up to 8 drafts a round cut by its learned confidence; code 39.5-40.4 tok/s vs 37.1 with the
 # MTP head, prose the same, 3 runs each) or mtp (the checkpoint's MTP head drafts). Drafts only propose: replies are
 # the same either way.
 DRAFTER="${DRAFTER:-dspark}"
@@ -87,7 +87,9 @@ PARALLEL="${PARALLEL:-1}"
 # stay bf16, as DeepSeek's FP8 MLA cache keeps its rotary part): 56.1 KiB a token on every rank instead of bf16's
 # 94.4, so ~1.7x the window in the same memory. Lossy against bf16; drafted replies still equal serial ones under
 # either. bf16: the exact cache. fp4: e2m1 codes with an e4m3 scale a block of 16 (~0.58x fp8's latent bytes; more
-# lossy: see the README's quality numbers before using it).
+# lossy against bf16, yet no measurable difference from fp8 on the README's quality suite: the long-context setting).
+# fp4x: fp4's latent rows plus e4m3 rotary and indexer keys, ~24% more tokens than fp4 in the same memory (opt-in:
+# README "More context").
 KV="${KV:-fp8}"
 export TF_GLM_KV="$KV"
 # The non-expert BF16 weights: q4 (default: the projections as 4-bit groups of 64 with MSE-searched ranges, the head
@@ -108,7 +110,7 @@ export TF_GLM_PREFILL_ROWS="$PREFILL_ROWS"
 # PREFILL_SPLIT: 1 (default) or 0 (whole-partial all-gathers); PREFILL_OVERLAP: 1 (default; the exchanges on a second
 # CUDA stream in row pieces) or 0.
 # CP: context parallelism (1: each Spark keeps every third token's caches: ~3x the window; exact; one request at a
-# time, no kept prompt states, eager decode windows for now) or 0 (default: every Spark keeps every token).
+# time; captured decode windows with TF_GLM_CP_GRAPHS=1) or 0 (default: every Spark keeps every token).
 CP="${CP:-0}"
 export TF_GLM_CP="$CP"
 # CP prompt chunks send absorbed queries (0131); raw queries with every rank absorbing all heads (0135, +0.64 GiB a
@@ -128,7 +130,7 @@ MAX_TOKENS="${MAX_TOKENS:-32768}"
 COMM="${COMM:-roce}"
 export TF_GLM_COMM="$COMM"
 export TF_ROCE_MAX_KB="${TF_ROCE_MAX_KB:-512}"
-# Prompt-lookup ("copy") drafts verified ahead of the MTP head's when the reply repeats earlier text (exact).
+# Prompt-lookup ("copy") drafts verified ahead of the drafter's when the reply repeats earlier text (exact).
 COPY="${COPY:-1}"
 export TF_GLM_COPY_DRAFTS="$COPY"
 COPY_MAX="${COPY_MAX:-15}"
@@ -156,7 +158,7 @@ KV_POOL_GIB="${KV_POOL_GIB:-1}"
 export TF_GLM_CACHE_GIB="$KV_POOL_GIB"
 export TF_GLM_CACHE_ENTRIES="${TF_GLM_CACHE_ENTRIES:-8}"
 # Memory (README "Memory"). A GB10 that runs out of memory freezes instead of failing, so:
-#   FLOOR_GIB     the least MemAvailable any Spark may be left with under the largest prompt (10; at least 4, and
+#   FLOOR_GIB     the least MemAvailable any Spark may be left with under the largest prompt (4; at least 4, and
 #                 above GUARD_KILL_GIB: under 8 a spike may reach the guard, which stops that rank)
 #   OVERHEAD_GIB  what a rank uses past TensorFold's own startup estimate (CUDA context, NCCL, compiled kernels, the
 #                 Python process: ~7 GiB at idle, ~3 more during startup's graph capture and calibration; measured
