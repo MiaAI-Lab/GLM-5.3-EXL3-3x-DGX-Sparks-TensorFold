@@ -1,0 +1,252 @@
+diff --git tensorfold/cuda/exl3/experts.cu tensorfold/cuda/exl3/experts.cu
+index 8406505..fa43234 100644
+--- tensorfold/cuda/exl3/experts.cu
++++ tensorfold/cuda/exl3/experts.cu
+@@ -119,9 +119,11 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
+                                        int E, float limit, int act_mode) {
+     const int p = blockIdx.x, blk = blockIdx.y;
+     const int e = pick[p];
++    tf_exl3x::pdl_trigger();          // the down projection's programs may start their trellis prologue now
+     if (e < 0 || e >= E) return;
+     const int lane = threadIdx.x;
+     const int n = blk * 128 + 4 * lane;
++    tf_exl3x::pdl_wait();             // Z complete (the gate/up launch done and flushed)
+     float gv[4], uv[4];
+ #pragma unroll
+     for (int j = 0; j < 4; ++j) {
+@@ -249,6 +251,17 @@ extern template void dequant_launch<1>(const uint32_t*, half*, int, int, int, cu
+ extern template void dequant_launch<2>(const uint32_t*, half*, int, int, int, cudaStream_t);
+ }  // namespace tf_exl3x
+ 
++// Bit-neutral scheduling knobs (A/B without a rebuild): TF_EXL3X_L2D k steps of L2 prefetch ahead (default 4, 0 off),
++// TF_EXL3X_PDL 1 (default): gate/up after rot_in, its epilogue and down as programmatic dependent launches. Measured
++// on a real full GLM-5.3 layer (GB10): 1 / 3 / 5 / 9 rows 263 / 565 / 824 / 1577 -> 211 / 521 / 771 / 1523 us, bit
++// for bit the same outputs.
++static int env_int(const char* name, int dflt) {
++    const char* v = getenv(name);
++    return v && *v ? atoi(v) : dflt;
++}
++static const int kL2D = env_int("TF_EXL3X_L2D", 4);
++static const int kPDL = env_int("TF_EXL3X_PDL", 1);
++
+ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+                         const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
+                         const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
+@@ -270,6 +283,8 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
+     a.nexp_max = (int)uids.size(0);
+     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
+     a.mt = (int)mt;
++    a.l2d = kL2D;
++    a.pdl = kPDL;
+     auto stream = at::cuda::getCurrentCUDAStream();
+     if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
+     else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);
+@@ -326,10 +341,11 @@ void exl3x_gateup_epilogue_cuda(const at::Tensor& Z, const at::Tensor& pick, con
+                                 int64_t P, int64_t N, int64_t SK, int64_t slots, int64_t E, double limit,
+                                 int64_t act_mode) {
+     dim3 grid((unsigned)(rows * slots), (unsigned)(N / 128));
+-    gateup_epilogue_kernel<<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+-        Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_g.data_ptr()),
+-        reinterpret_cast<const half*>(svh_u.data_ptr()), reinterpret_cast<const half*>(suh_d.data_ptr()),
+-        reinterpret_cast<half*>(xd.data_ptr()), (int)P, (int)N, (int)SK, (int)E, (float)limit, (int)act_mode);
++    tf_exl3x::launch_ex(gateup_epilogue_kernel, grid, dim3(32), kPDL != 0, at::cuda::getCurrentCUDAStream(),
++        (const float*)Z.data_ptr<float>(), (const int*)pick.data_ptr<int>(),
++        reinterpret_cast<const half*>(svh_g.data_ptr()), reinterpret_cast<const half*>(svh_u.data_ptr()),
++        reinterpret_cast<const half*>(suh_d.data_ptr()), reinterpret_cast<half*>(xd.data_ptr()), (int)P, (int)N,
++        (int)SK, (int)E, (float)limit, (int)act_mode);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
+ 
+diff --git tensorfold/cuda/exl3/experts.py tensorfold/cuda/exl3/experts.py
+index 33cd95f..ae41c90 100644
+--- tensorfold/cuda/exl3/experts.py
++++ tensorfold/cuda/exl3/experts.py
+@@ -26,7 +26,7 @@ def _ext():
+ 
+     here = Path(__file__).parent
+     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
+-    return load(name="tensorfold_exl3_experts_v2", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
++    return load(name="tensorfold_exl3_experts_v3", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+                 verbose=False)
+ 
+ 
+diff --git tensorfold/cuda/exl3/experts_grouped.cuh tensorfold/cuda/exl3/experts_grouped.cuh
+index 8daa6c7..2bf2ba8 100644
+--- tensorfold/cuda/exl3/experts_grouped.cuh
++++ tensorfold/cuda/exl3/experts_grouped.cuh
+@@ -135,15 +135,36 @@ __device__ __forceinline__ void load_words(uint32_t (&dst)[Fmt<K2>::LW], const u
+     }
+ }
+ 
+-// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc, PF tiles in flight.
++// L2 prefetch of one 128-byte line (no register, no value: the bits of every output stay the same).
++__device__ __forceinline__ void prefetch_l2(const void* p) {
++    asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
++}
++
++// Programmatic dependent launch (sm_90+; no-ops when the grid was not launched with the attribute).
++__device__ __forceinline__ void pdl_trigger() {
++    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
++}
++__device__ __forceinline__ void pdl_wait() {
++    asm volatile("griddepcontrol.wait;" ::: "memory");
++}
++
++// One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc, PF tiles in flight in registers and the k steps
++// up to L2D ahead requested into L2 (a step's NT tiles are one contiguous run of NT * TW words: LINES 128-byte lines).
++// The X fragments (the previous kernel's output) are read only after pdl_wait; trellis bytes are constant.
+ template <int CB, int K2, int NT, int PF>
+ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
+-                                           const half* x0, const half* x1, bool ok0, bool ok1, int lane,
++                                           const half* x0, const half* x1, bool ok0, bool ok1, int lane, int l2d,
+                                            float (&acc)[NT][2][4]) {
+     constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
++    constexpr int LINES = (NT * TW + 31) / 32;
+     const LaneMap<K2> map(lane);
+     const size_t kstride = (size_t)NTILES * TW;
+-    const uint32_t* tp = T + ((size_t)kt0 * NTILES + nt0) * TW + lane;
++    const uint32_t* cb = T + ((size_t)kt0 * NTILES + nt0) * TW;     // this warp's first k step, its NT tiles
++    const uint32_t* tp = cb + lane;
++
++    // the first L2D steps' lines at once (a warp's whole window in flight before the first register load returns)
++    const int burst = (l2d < nkt ? l2d : nkt) * LINES;
++    for (int j = lane; j < burst; j += 32) prefetch_l2(cb + (size_t)(j / LINES) * kstride + (j % LINES) * 32);
+ 
+     uint32_t pf[PF][NT][LW];
+ #pragma unroll
+@@ -151,6 +172,7 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
+         if (d < nkt)
+ #pragma unroll
+             for (int i = 0; i < NT; ++i) load_words<K2>(pf[d][i], tp + d * kstride + i * TW, lane);
++    pdl_wait();
+ 
+     for (int ib = 0; ib < nkt; ib += PF) {
+ #pragma unroll
+@@ -166,6 +188,8 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
+ #pragma unroll
+                     for (int i = 0; i < NT; ++i)
+                         load_words<K2>(pf[d][i], tp + (size_t)(it + PF) * kstride + i * TW, lane);
++                if (l2d > 0 && it + l2d < nkt && lane < LINES)
++                    prefetch_l2(cb + (size_t)(it + l2d) * kstride + lane * 32);
+                 const int k = (kt0 + it) * 16;
+                 uint32_t a[4] = {load_pair(x0 + k, ok0), load_pair(x1 + k, ok1), load_pair(x0 + k + 8, ok0),
+                                  load_pair(x1 + k + 8, ok1)};
+@@ -186,21 +210,28 @@ __host__ __device__ constexpr bool k2_supported(int k2) {
+     return k2 >= 2 && k2 <= 16;
+ }
+ 
+-// Program (expert u, n block, split and member tile): up to 16 members times W_q over the split's K range; warps added in order.
++// Program (n block, split and member tile, expert u): up to 16 members times W_q over the split's K range; warps added
++// in order. u is the slowest grid index, so the columns past the distinct count (empty) are dispatched last, into the
++// slots the tail leaves idle; the metadata loads are issued together (u < gridDim.z keeps uids/members in bounds).
+ template <int CB, int NT, int W, int PF, int LO, int HI>
+ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
+-    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
+-    const int u = blockIdx.x;
+-    if (u >= ucount[0]) return;
++    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int l2d) {
++    const int u = blockIdx.z;
+     const int MT = (maxm + 15) / 16;
+-    const int mtile = blockIdx.z % MT;
+-    const int split = (blockIdx.z / MT) % SK;
+-    const int mat = blockIdx.z / MT / SK;
+-    const half* X = mat ? X1 : X0;
++    const int mtile = blockIdx.y % MT;
++    const int split = (blockIdx.y / MT) % SK;
++    const int mat = blockIdx.y / MT / SK;
++    const int cnt = ucount[0];
+     const int e = uids[u];
++    const int first = members[u * maxm + mtile * 16];       // members come first: < 0 means this tile is empty
++    const int m_own = mtile * 16 + (threadIdx.x & 15);
++    const int code = (threadIdx.x < 16 && m_own < maxm) ? members[u * maxm + m_own] : -1;
++    pdl_trigger();
++    if (u >= cnt || first < 0) return;
++    const half* X = mat ? X1 : X0;
+     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
+     const int k2 = mat ? K2_1[e] : K2_0[e];
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+@@ -208,20 +239,15 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+     const int KT = K >> 4, NTILES = N >> 4;
+ 
+     __shared__ int rows_sh[16];
+-    if (threadIdx.x < 16) {
+-        const int m = mtile * 16 + threadIdx.x;
+-        const int code = m < maxm ? members[u * maxm + m] : -1;
+-        rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
+-    }
++    if (threadIdx.x < 16) rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
+     __syncthreads();
+-    if (rows_sh[0] < 0) return;                           // members come first, so this tile is empty
+     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
+     const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
+     const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
+ 
+     const int per_split = KT / SK, per_warp = per_split / W;
+     const int kt0 = split * per_split + warp * per_warp;
+-    const int nt0 = blockIdx.y * NT;
++    const int nt0 = blockIdx.x * NT;
+ 
+     float acc[NT][2][4];
+ #pragma unroll
+@@ -235,7 +261,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
+ #define TF_EXL3X_CASE(K2_)                                                                                      \
+     case K2_:                                                                                                   \
+         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
+-            warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);    \
++            warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, l2d, acc); \
+         else                                                                                                    \
+             __trap();                                                                                           \
+         break;
+@@ -492,8 +518,26 @@ struct GroupedArgs {
+     int nexp_max;        // grid.x (upper bound of distinct experts)
+     int mats, nt, warps, pf, lo, hi;
+     int mt = 1;          // member tiles a program (> 1: grouped_mt_kernel, prompt chunks)
++    int l2d = 0;         // k steps a warp requests into L2 ahead of its register loads (0: none); never changes bits
++    int pdl = 0;         // launch as a programmatic dependent of the previous kernel (prologue overlaps its tail)
+ };
+ 
++// A launch, with the programmatic-stream-serialization attribute when pdl (the kernel waits in pdl_wait).
++template <typename... KArgs, typename... Args>
++void launch_ex(void (*kern)(KArgs...), dim3 grid, dim3 block, bool pdl, cudaStream_t stream, Args... args) {
++    cudaLaunchConfig_t cfg = {};
++    cfg.gridDim = grid;
++    cfg.blockDim = block;
++    cfg.dynamicSmemBytes = 0;
++    cfg.stream = stream;
++    cudaLaunchAttribute at[1];
++    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++    at[0].val.programmaticStreamSerializationAllowed = 1;
++    cfg.attrs = at;
++    cfg.numAttrs = pdl ? 1 : 0;
++    cudaLaunchKernelEx(&cfg, kern, static_cast<KArgs>(args)...);
++}
++
+ template <int CB, int MTL>
+ void grouped_mt_run(const GroupedArgs& a, cudaStream_t stream) {
+     const int MT = (a.maxm + 16 * MTL - 1) / (16 * MTL);
+@@ -523,17 +567,18 @@ template <int CB>
+ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
+     if (a.mt > 1) { grouped_mt_launch<CB>(a, stream); return; }
+     const int MT = (a.maxm + 15) / 16;
+-    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
++    dim3 grid((unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT), (unsigned)a.nexp_max);
+ #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
+-    grouped_kernel<CB, NT_, W_, PF_, LO_, HI_><<<grid, W_ * 32, 0, stream>>>(                                   \
+-        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
+-        a.slots)
++    launch_ex(grouped_kernel<CB, NT_, W_, PF_, LO_, HI_>, grid, dim3(W_ * 32), a.pdl != 0, stream, a.x0, a.x1,  \
++              a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm,      \
++              a.slots, a.l2d)
+ #define TF_RANGES(NT_, W_, PF_)                                                                                 \
+     if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8);                                                  \
+     else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, 2, 10);                                           \
+     else TF_LAUNCH(NT_, W_, PF_, 2, 16);
+     if (a.nt == 8 && a.warps == 4 && a.pf == 1) { TF_RANGES(8, 4, 1) }
+     else if (a.nt == 8 && a.warps == 4 && a.pf == 2) { TF_RANGES(8, 4, 2) }
++    else if (a.nt == 4 && a.warps == 4 && a.pf == 1) { TF_RANGES(4, 4, 1) }
+     else if (a.nt == 4 && a.warps == 4 && a.pf == 2) { TF_RANGES(4, 4, 2) }
+     else TORCH_CHECK(false, "unsupported tile setting nt=", a.nt, " warps=", a.warps, " pf=", a.pf);
+ #undef TF_RANGES

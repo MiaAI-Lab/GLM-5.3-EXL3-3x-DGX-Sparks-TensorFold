@@ -334,6 +334,7 @@ fail() {
   [[ -f "$GUARD_DIR/memguard.low" ]] && log "lowest MemAvailable here: $(cat "$GUARD_DIR/memguard.low")"
   die "$1"
 }
+for attempt in 1 2; do
 step 3 "Launch: memory guard, container $CONTAINER_NAME, ranks 2 and 1 on the workers, then rank 0 here"
 start_guards
 launch
@@ -341,9 +342,15 @@ launch
 step 4 "Loading: ~86 GiB of weights on each Spark (the workers over NFS; the very first start also compiles CUDA kernels)"
 docker logs -f "$CONTAINER_NAME" > >(grep --line-buffered -v -E "$NOISE" | sed -u "s/^/  ${D}│${R} /") 2>&1 &
 LOGS_PID=$!
-start=$SECONDS; next_beat=30
+start=$SECONDS; next_beat=30; refit=""
 until curl -sf --max-time 5 "$URL/v1/models" >/dev/null 2>&1; do
-  running_here || fail "rank 0 exited (code $(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
+  if ! running_here; then
+    # the memory at this start holds a smaller window than asked (a Spark's free memory drifts): once, start again
+    # with the largest one TensorFold names
+    refit=$(docker logs "$CONTAINER_NAME" 2>&1 | sed -n 's/.*largest fitting prompt-plus-reply window: \([0-9]*\) tokens.*/\1/p' | tail -1)
+    [[ -n "$refit" && $attempt == 1 && "$refit" -ge 4096 ]] && break
+    fail "rank 0 exited (code $(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
+  fi
   (( SECONDS - start < WAIT_TIMEOUT )) ||
     fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); the ranks are still running: docker logs -f $CONTAINER_NAME"
   if (( SECONDS - start >= next_beat )); then
@@ -358,6 +365,13 @@ until curl -sf --max-time 5 "$URL/v1/models" >/dev/null 2>&1; do
   sleep 3
 done
 kill $LOGS_PID 2>/dev/null || true
+[[ -z "$refit" ]] && break
+warn "this start's memory holds a ${refit}-token window, not ${CONTEXT}: starting again with CONTEXT=$refit"
+docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+for i in $(worker_ids); do worker "$i" "docker rm -f '$CONTAINER_NAME'" >/dev/null 2>&1 || true; done
+CONTEXT=$refit
+for i in "${!SERVE_ARGS[@]}"; do [[ "${SERVE_ARGS[$i]}" == --context ]] && SERVE_ARGS[$((i + 1))]=$refit; done
+done
 sleep 0.3
 log "Server answered after $((SECONDS - start))s"
 
