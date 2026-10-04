@@ -47,6 +47,9 @@ if [[ "$DRAFTER" == dspark ]]; then              # DSpark: its snapshot, the pin
   DRAFT_ARG="/root/.cache/huggingface/$DSPARK_SUB"
 fi
 SERVE_ARGS=(--context "$CONTEXT" --max-tokens "$MAX_TOKENS" --drafter "$DRAFT_ARG")
+[[ "$PARALLEL" =~ ^[1-4]$ ]] || die "PARALLEL is 1 to 4, not $PARALLEL"
+(( PARALLEL > 1 && CP == 1 )) && die "PARALLEL=$PARALLEL needs CP=0: context parallelism serves one request at a time"
+(( PARALLEL > 1 )) && SERVE_ARGS+=(--parallel "$PARALLEL")
 [[ "$DENSE" =~ ^(bf16|fp8|q4)$ ]] || die "DENSE is bf16, fp8 or q4, not $DENSE"
 [[ "$COMM" =~ ^(nccl|roce)$ ]] || die "COMM is nccl or roce, not $COMM"
 [[ "$KV" =~ ^(bf16|fp8|fp4|fp4x)$ ]] || die "KV is bf16, fp8, fp4 or fp4x, not $KV"

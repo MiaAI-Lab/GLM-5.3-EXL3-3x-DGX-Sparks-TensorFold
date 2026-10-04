@@ -80,8 +80,9 @@ PORT="${PORT:-8888}"
 # Prompt + reply window. Provisional default (see README "Memory"): start.sh asks scripts/memplan.py whether every
 # rank keeps FLOOR_GIB free with it, and refuses to start otherwise, naming what fits.
 CONTEXT="${CONTEXT:-163840}"
-# One request at a time (full GLM-5.3 on this engine serves --parallel 1); others queue.
-PARALLEL=1
+# Concurrent requests (patch 0134): 1 (default) decodes one request at a time, others queue; 2-4 decode that many
+# together, each with its own window of CONTEXT tokens (so the KV pool holds PARALLEL x CONTEXT). Not with CP=1.
+PARALLEL="${PARALLEL:-1}"
 # The DSA latent cache: fp8 (default: e4m3 rows with a power-of-two scale each; the rotary keys and the indexer's keys
 # stay bf16, as DeepSeek's FP8 MLA cache keeps its rotary part): 56.1 KiB a token on every rank instead of bf16's
 # 94.4, so ~1.7x the window in the same memory. Lossy against bf16; drafted replies still equal serial ones under

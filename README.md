@@ -78,6 +78,13 @@ greedy; its live gauge on a chat shows the sampled rate.
 Decode speed depends on the text: speculative drafts land more often on predictable text. On worked arithmetic
 (thinking on) the drafter's acceptance was 87% and a request averaged ~45 tok/s, with bursts above 70.
 
+### Concurrent requests (0134)
+
+`PARALLEL=2` (to 4; not with `CP=1`) decodes that many requests together, each with its own `CONTEXT` window. Boot par2
+(`PARALLEL=2 CONTEXT=65536`, FP8 KV, eager batched verify, no graphs yet): exact 12/12 with requests really concurrent
+(a request's reply hash alone equals its hash beside another); greedy decode 26.9 tok/s for one request, 35.5 / 35.9
+tok/s together for two (+33%; 17.7-19.1 each).
+
 ### Prompt cache on NVMe (0132)
 
 With `TF_GLM_DISK_CACHE=<dir>` every kept prompt state is also written, in the background, to each Spark's own NVMe
