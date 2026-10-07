@@ -2,10 +2,14 @@
 
 ## Unreleased
 
-- Prompt cache: the next request now lets a running save finish (`DISK_FENCE_MS`, default 15 s, sets
-  `TF_GLM_DISK_FENCE_MS`); before, it cancelled the save at once, so a long prompt followed by another request was never
-  kept. 0142 logs every queued, written, declined, dropped and cancelled save and puts rank 0's counters in `/health`
-  (`disk_cache_rank0`).
+- Prompt cache: `scripts/config.sh` now sets `TF_GLM_DISK_FENCE_MS` from `DISK_FENCE_MS` (default 15 s), so the next
+  request that conflicts with a running save waits for it before asking it to stop. With the engine's default of 0,
+  a ~479k-token save followed by a short request was cancelled on all three ranks; with 15 s it finished. Cancellation
+  is cooperative (checked between pieces), and the fence keeps waiting for the writer after asking. 0142 doesn't change
+  that policy: it logs a `pcache:` line when a save is queued, written, declined because the writer's queue is full,
+  dropped from the queue by a fence, or cancelled, and puts rank 0's counters in `/health` (`disk_cache_rank0`). A
+  save already queued for the same key is only counted (`pending_declines_total`); one already on disk is skipped
+  without a line.
 - Round profiler: 0143 flushes its reports, so `TF_GLM_MULTI_PROFILE` shows them while the server runs; it needs
   `PARALLEL` above 1 (documented).
 - Tests: `test_cp_kv_gather_prompt[fp8]` compares with a fixed 8-bf16-step tie rule instead of one row's argmax, with

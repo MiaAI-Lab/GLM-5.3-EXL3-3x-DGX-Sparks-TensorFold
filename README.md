@@ -87,10 +87,13 @@ DISK_CACHE=0 ./start.sh restart         # off: nothing is written to disk
   third as many. With `PARALLEL` above 1 the cache is not used.
 - **A long save and the next request:** a long prompt's state is written in the background after its prefill (a
   ~479k-token state is ~6 GB a Spark, ~3.3 s). The next request that changes the same cache rows waits up to
-  `DISK_FENCE_MS` (15 s by default) for a running save to finish; before 0142 that wait was 0 and the save was silently
-  cancelled. A save still waiting in the queue behind it is dropped regardless. Every queued, written, declined,
-  dropped and cancelled save is now logged (`pcache:` lines), and `/health` shows rank 0's counters as
-  `disk_cache_rank0` (0142).
+  `DISK_FENCE_MS` (15 s by default, set by `scripts/config.sh`) for a running save to finish, then asks it to stop and
+  waits for the writer; stopping is checked between pieces. With the engine's own default of 0, a ~479k-token save
+  followed by a short request was cancelled on all three ranks. A save still waiting in the queue behind it is
+  dropped regardless. Since 0142 a `pcache:` line is logged when a save is queued, written, declined because the
+  writer's queue is full, dropped by a fence, or cancelled; a repeat of a save already queued is only counted
+  (`pending_declines_total`), and one already on disk is skipped silently. `/health` shows rank 0's counters as
+  `disk_cache_rank0`.
 
 ## Performance
 
@@ -505,7 +508,7 @@ README names:
 | --- | --- | --- |
 | `TF_GLM_CP_GRAPHS` | `1` with `CP=1` | captured decode windows under `CP=1` (~2.9 GiB a Spark); `0`: eager |
 | `TF_GLM_DISK_CACHE` | `/cache/pcache` (set by `DISK_CACHE=1`) | the prompt cache's folder **inside the container**: `/cache` is `~/.cache/tensorfold-glm53-full/<image hash>` on each Spark; `TF_GLM_DISK_CACHE_GIB` (`DISK_CACHE_GIB`) and `TF_GLM_DISK_KEEP_FREE_GB` (100) bound it |
-| `TF_GLM_DISK_FENCE_MS` | `15000` (set from `DISK_FENCE_MS` by `scripts/config.sh`; the engine's own default is `0`) | how long the next request lets a running prompt-cache save finish before cancelling it; `0`: cancel at once (a long state is then lost when a request follows it) |
+| `TF_GLM_DISK_FENCE_MS` | `15000` (set from `DISK_FENCE_MS` by `scripts/config.sh`; the engine's own default is `0`) | how long the next request lets a running prompt-cache save finish before asking it to stop; `0`: ask at once (a ~479k-token save followed by a request was then cancelled on every rank) |
 | `TF_GLM_MULTI_PROFILE` | off | `N`: every N decode rounds, log where a round's time goes (`multi profile` lines). Only with `PARALLEL` above 1 (the one-request path has no round profiler; each reply's `tensorfold.stages_ms` covers it); printed as it happens since 0143 |
 | `TF_GLM_MULTI_GRAPHS` | on | CUDA graphs for the batched verify windows under `PARALLEL`; `top`: fewer graphs, less memory, the same bits; `0`: eager |
 | `TF_GLM_CP_KV_GATHER` | `1` | CP prompt chunks over the gathered rows (0141); `0`: the exchange of queries and partials before it |
@@ -551,7 +554,7 @@ recipe's:
 | KV formats | `0115-glm-full-kv-fp4` | `KV=fp4`: e2m1 codes, an e4m3 scale per 16 values and a power-of-two row scale, 304 bytes a row (FP8: 528) | the long-context window; no measured quality difference ([Quality](#quality-of-the-4-bit-kv-cache-kvfp4)) |
 | | `0133-glm-full-kv-fp4x`, `0137-glm-full-kv-fp4x-fix` | `KV=fp4x`: also the rotary and index keys as e4m3 codes, from one bit-exact encoder | ~24% more tokens a GiB than `fp4` |
 | Prompt cache | `0132-glm-full-prompt-disk-cache` | kept prompt states on each Spark's NVMe (`TF_GLM_DISK_CACHE`), and kept prompt states under CP | a 94k-token prompt resumed in 3.0 s after a restart (pcacheB) |
-| | `0142-glm-full-pcache-diagnostics` | a log line for every queued, written, declined, fence-dropped and cancelled save; rank 0's counters in `/health` (`disk_cache_rank0`); the write/cancel policy is unchanged (the grace is `TF_GLM_DISK_FENCE_MS`) | with grace 0 the logs showed a ~479k save cancelled on all three ranks; with 15 s it was kept (5.85 GiB in 3.3 s) |
+| | `0142-glm-full-pcache-diagnostics` | a log line when a save is queued, written, declined (writer queue full), fence-dropped or cancelled; rank 0's counters in `/health` (`disk_cache_rank0`); the write/cancel policy is unchanged (the grace is `TF_GLM_DISK_FENCE_MS`) | with grace 0 the logs showed a ~479k save cancelled on all three ranks; with 15 s it was kept (5.85 GiB in 3.3 s) |
 | Concurrent requests | `0130-glm-full-multi-verify`, `0134-glm-full-multi-serve`, `0138-glm-full-multi-kernels`, `0139-glm-full-multi-graphs` | several streams' verify windows in one forward; `PARALLEL` 2 to 4 with a DSpark context per stream; full GLM-5.3's attention for every stream's rows in one launch a piece; CUDA graphs for the batched windows (`TF_GLM_MULTI_GRAPHS`) | 37.8 tok/s for two, 48.2 for four (par2g / par4g); each reply equals its serial one |
 | Stopping | `0122-glm-full-serial-stop` | a stopped request (client gone, stop string) ends on every rank within a round instead of decoding to `max_tokens` (the Flash recipe's 0070, its issue #38) | |
 | Tooling | `0143-glm-full-profile-flush` | the round profiler (`TF_GLM_MULTI_PROFILE`) prints each report as it happens (before, a server without a TTY held them until it stopped) | |
