@@ -1,0 +1,106 @@
+diff --git tensorfold/families/glm5_next/cuda/pcache.py tensorfold/families/glm5_next/cuda/pcache.py
+--- tensorfold/families/glm5_next/cuda/pcache.py
++++ tensorfold/families/glm5_next/cuda/pcache.py
+@@ -521,6 +521,7 @@
+                 self.cache._write(job)
+             except Cancelled:
+                 self.cache.stats["cancelled"] += 1
++                self.cache.diag(f"write of a {job.n}-token state cancelled (key {job.key[:12]}): not on disk")
+             except Exception as err:         # a full disk, an I/O error: the state is just not kept on disk
+                 self.cache.stats["failed"] += 1
+                 self.cache.log(f"writing a prompt state failed: {err!r}")
+@@ -535,21 +536,31 @@
+         running one finish within ``wait_s`` or cancel it (between pieces). Returns the jobs given up."""
+ 
+         lost = 0
++        notes = []                                        # what the fence did, logged after the lock
+         with self.cv:
+             keep = [j for j in self.q if not conflicts(j)]
++            notes += [f"fence dropped a queued {j.n}-token state (key {j.key[:12]})" for j in self.q if conflicts(j)]
+             lost += len(self.q) - len(keep)
+             self.q = deque(keep)
+             job = self.current
+             if job is not None and conflicts(job):
+-                end = time.monotonic() + max(0.0, wait_s)
++                t0 = time.monotonic()
++                end = t0 + max(0.0, wait_s)
+                 while self.current is job and time.monotonic() < end:
+                     self.cv.wait(timeout=max(1e-3, end - time.monotonic()))
+                 if self.current is job:
+                     job.cancel = True
+                     lost += 1
++                    notes.append(f"fence requested cancellation of the running {job.n}-token write (key {job.key[:12]}) "
++                                 f"after {1e3 * (time.monotonic() - t0):.0f} ms of grace")
+                     while self.current is job:
+                         self.cv.wait()
++                else:
++                    notes.append(f"fence waited {1e3 * (time.monotonic() - t0):.0f} ms for the running {job.n}-token "
++                                 f"write (key {job.key[:12]}) to end (its outcome is logged by the writer)")
+         self.cache.stats["fenced"] += lost
++        for note in notes:
++            self.cache.diag(note)
+         return lost
+ 
+     def wait_key(self, key: str, timeout: float) -> bool:
+@@ -638,6 +649,13 @@
+         if self._log is not None:
+             self._log(text)
+ 
++    def diag(self, text: str) -> None:
++        """best-effort diagnostic line (never raises into the writer or the request)."""
++        try:
++            self.log(f"pcache: {text}")
++        except Exception:                                 # noqa: BLE001
++            pass
++
+     # -- names and the index
+     def key(self, ids: Sequence[int]) -> str:
+         return self.key_of(ids_digest(ids))
+@@ -766,6 +784,7 @@
+             self.touch(key)
+             return False
+         if self.writer.pending(key):
++            self.stats["pending_declines_total"] = self.stats.get("pending_declines_total", 0) + 1
+             return False
+         fields, tensors = snapshot_sections(e, snap, drafter)
+         meta = dict(fields, identity=self.identity, rank=self.rank, world=self.world, cp=self.cp, kv=self.kv,
+@@ -776,6 +795,9 @@
+         ok = self.writer.submit(job)
+         if not ok:
+             self.stats["skipped"] += 1
++            self.diag(f"a {job.n}-token state declined (key {key[:12]}): the writer's queue is full ({self.writer.depth})")
++        else:
++            self.diag(f"a {job.n}-token state queued for disk (key {key[:12]})")
+         return ok
+ 
+     def _write(self, job: Job) -> None:
+@@ -788,6 +810,7 @@
+                      f"({self.budget / 2 ** 30:.1f} GiB) or the free-space floor ({self.keep_free / 1e9:.0f} GB) "
+                      "leaves no room")
+             return
++        t0 = time.perf_counter()
+         total = write_file(job.path, job.meta, job.tensors, staging=self.write_staging, pool=self.write_pool,
+                            direct=self.direct, job=job, stream=self.stream)
+         with self.lock:
+@@ -795,6 +818,8 @@
+             self.entries[job.key] = dict(job.entry, bytes=total, used=self.tick)
+             self._save_index()
+         self.stats["written"] += 1
++        self.diag(f"a {job.n}-token state written and indexed (key {job.key[:12]}): {total / 2 ** 30:.2f} GiB in "
++                  f"{time.perf_counter() - t0:.1f} s")
+ 
+     def fence(self, cut: int, prompt: Sequence[int] | None = None) -> int:
+         """The live caches are about to change from position ``cut`` on: queued or running writes of states longer
+diff --git tensorfold/cuda/health.py tensorfold/cuda/health.py
+--- tensorfold/cuda/health.py
++++ tensorfold/cuda/health.py
+@@ -91,6 +91,9 @@
+                     extra = {}
+                 body["streams"].update(extra.pop("streams", {}))
+                 body.update(extra)
++        disk = getattr(getattr(app, "engine", None), "disk", None)       # rank 0's prompt-cache counters
++        if disk is not None and isinstance(getattr(disk, "stats", None), dict):
++            body["disk_cache_rank0"] = dict(disk.stats, fence_ms=round(1e3 * float(getattr(disk, "fence_s", 0.0))))
+         window = getattr(app, "effective_context_window", None)
+         if window:
+             body["context_length"] = int(window)

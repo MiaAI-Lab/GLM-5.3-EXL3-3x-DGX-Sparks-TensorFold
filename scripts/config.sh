@@ -165,8 +165,13 @@ export TF_GLM_COPY_HYBRID="$COPY_HYBRID"
 # prompt resumed in 3.0 s after a restart (boots pcacheA / pcacheB). PARALLEL > 1: unused. DISK_CACHE=0: off.
 DISK_CACHE="${DISK_CACHE:-1}"
 DISK_CACHE_GIB="${DISK_CACHE_GIB:-64}"
+# DISK_FENCE_MS: how long the next request lets a running save finish before cancelling it (TF_GLM_DISK_FENCE_MS; the
+# engine's default is 0). A ~479k-token state is ~6 GB a Spark and takes ~3.3 s to write; with 0 the next request
+# cancelled it every time (the save was lost), with 15000 it was kept and the next request waited 163-180 ms.
+DISK_FENCE_MS="${DISK_FENCE_MS:-15000}"
 if [[ "$DISK_CACHE" == 1 ]]; then
   export TF_GLM_DISK_CACHE="${TF_GLM_DISK_CACHE:-/cache/pcache}" TF_GLM_DISK_CACHE_GIB="${TF_GLM_DISK_CACHE_GIB:-$DISK_CACHE_GIB}"
+  export TF_GLM_DISK_FENCE_MS="${TF_GLM_DISK_FENCE_MS:-$DISK_FENCE_MS}"
 else
   unset TF_GLM_DISK_CACHE
 fi

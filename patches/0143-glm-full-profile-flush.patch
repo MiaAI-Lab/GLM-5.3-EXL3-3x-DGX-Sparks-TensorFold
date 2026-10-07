@@ -1,0 +1,15 @@
+diff --git tensorfold/families/glm5_next/cuda/multi_tune.py tensorfold/families/glm5_next/cuda/multi_tune.py
+--- tensorfold/families/glm5_next/cuda/multi_tune.py
++++ tensorfold/families/glm5_next/cuda/multi_tune.py
+@@ -241,8 +241,9 @@
+ 
+     STAGES = ("plan", "message", "propose", "verify", "sample", "accept", "commit", "taps", "emit")
+ 
+-    def __init__(self, every: int, log=print, label: str = "") -> None:
+-        self.every, self.log, self.label = every, log, label
++    def __init__(self, every: int, log=None, label: str = "") -> None:
++        # flush every report (stdout is block-buffered in a container without a TTY)
++        self.every, self.log, self.label = every, (log if log is not None else (lambda t: print(t, flush=True))), label
+         self.cuda = torch.cuda.is_available()
+         self.ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)] if self.cuda else None
+         self._reset()

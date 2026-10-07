@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Prompt cache: `scripts/config.sh` now sets `TF_GLM_DISK_FENCE_MS` from `DISK_FENCE_MS` (default 15 s), so the next
+  request that conflicts with a running save waits for it before asking it to stop. With the engine's default of 0,
+  a ~479k-token save followed by a short request was cancelled on all three ranks; with 15 s it finished. Cancellation
+  is cooperative (checked between pieces), and the fence keeps waiting for the writer after asking. 0142 doesn't change
+  that policy: it logs a `pcache:` line when a save is queued, written, declined because the writer's queue is full,
+  dropped from the queue by a fence, or cancelled, and puts rank 0's counters in `/health` (`disk_cache_rank0`). A
+  save already queued for the same key is only counted (`pending_declines_total`); one already on disk is skipped
+  without a line.
+- Round profiler: 0143 flushes its reports, so `TF_GLM_MULTI_PROFILE` shows them while the server runs; it needs
+  `PARALLEL` above 1 (documented).
+- Tests: `test_cp_kv_gather_prompt[fp8]` compares with a fixed 8-bf16-step tie rule instead of one row's argmax, with
+  a negative test; new `tests/cpu/test_cp_kvg_strong.py` checks the gathered cache planes byte for byte (fp8, bf16,
+  fp4) and six rows of logits; rank results cross the multiprocessing queue as plain bytes or lists
+  (`tests/cpu/mp_wire.py`, `test_full_forward.py`, `test_cp_kv_gather.py`), fixing EOFError / FileNotFoundError
+  crashes when a rank exits before the parent reads.
+
 ## v1.0 (2026-10-04)
 
 - Full GLM-5.3 (`glm_moe_dsa`) on TensorFold v0.6.0 across three DGX Sparks: the GLM-5.3-Flash recipe's v1.4 patches

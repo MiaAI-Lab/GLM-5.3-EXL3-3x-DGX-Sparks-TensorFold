@@ -15,6 +15,7 @@ import triton.language as tl
 
 from full_fakes import TEXT, Reference, _rb, install_fake_experts, write_checkpoint
 from test_full_forward import Rig, _rank_cp, agree_kv, tokens
+from mp_wire import unpack  # _rank_cp sends its results packed (mp_wire)
 
 from tensorfold.families.glm5_next.cuda import dcp, kv8, latent
 from tensorfold.families.glm5_next.cuda import dsa_full as F
@@ -542,7 +543,7 @@ def test_context_parallel_three_ranks(folder, fakes):
              for r in range(3)]
     for p in procs:
         p.start()
-    got = sorted((q.get(timeout=1500) for _ in procs), key=lambda x: x[0])
+    got = sorted((unpack(q.get(timeout=1500)) for _ in procs), key=lambda x: x[0])
     for p in procs:
         p.join(timeout=60)
     parts = torch.cat([g[1] for g in got], dim=1)
