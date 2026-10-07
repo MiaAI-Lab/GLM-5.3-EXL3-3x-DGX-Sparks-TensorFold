@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from full_fakes import LAYERS, TEXT, Reference, install_fake_experts, write_checkpoint
+from mp_wire import pack, unpack
 
 CAP = 128            # cache slots of the tests' engine (the reference's sparse rows start past index_topk = 16)
 
@@ -213,7 +214,7 @@ def _rank(folder, rank, world, port, prompt, steps, out_q):
     rows = [rig.prefill(prompt)]
     for t in steps:
         rows.append(rig.window([t])[0])
-    out_q.put((rank, torch.stack(rows), rig.w.vocab_offset))
+    out_q.put(pack((rank, torch.stack(rows), rig.w.vocab_offset)))     # plain bytes: see mp_wire
     dist.destroy_process_group()
 
 
@@ -230,7 +231,7 @@ def test_three_ranks_match_one(folder, fakes):
     procs = [ctx.Process(target=_rank, args=(folder, r, 3, port, prompt, steps, q)) for r in range(3)]
     for p in procs:
         p.start()
-    got = sorted((q.get(timeout=900) for _ in procs), key=lambda x: x[0])
+    got = sorted((unpack(q.get(timeout=900)) for _ in procs), key=lambda x: x[0])
     for p in procs:
         p.join(timeout=60)
     parts = torch.cat([g[1] for g in got], dim=1)
@@ -291,7 +292,7 @@ def _rank_split(folder, rank, world, port, prompt, steps, exchange, out_q):
         for t in steps:
             rows.append(rig.window([t])[0])
         out.append((torch.stack(rows), hidden))
-    out_q.put((rank, out))
+    out_q.put(pack((rank, out)))                                     # plain bytes: see mp_wire
     dist.destroy_process_group()
 
 
@@ -307,7 +308,7 @@ def test_three_ranks_row_split_prompt_is_bit_identical(folder, fakes, exchange):
     procs = [ctx.Process(target=_rank_split, args=(folder, r, 3, port, prompt, steps, exchange, q)) for r in range(3)]
     for p in procs:
         p.start()
-    got = sorted((q.get(timeout=900) for _ in procs), key=lambda x: x[0])
+    got = sorted((unpack(q.get(timeout=900)) for _ in procs), key=lambda x: x[0])
     for p in procs:
         p.join(timeout=60)
     for rank, ((plain, h0), (split, h1)) in got:
@@ -356,7 +357,7 @@ def _rank_cp(folder, rank, world, port, prompt, steps, window, out_q, kv="bf16")
     drafted = Rig(folder, rank, world, Comm(), kv=kv, cp=world)
     drafted.prefill(prompt)
     win = drafted.window(window)
-    out_q.put((rank, torch.stack(rows), win, serial.w.vocab_offset))
+    out_q.put(pack((rank, torch.stack(rows), win, serial.w.vocab_offset)))   # plain bytes: see mp_wire
     dist.destroy_process_group()
 
 
@@ -374,7 +375,7 @@ def test_context_parallel_three_ranks(folder, fakes, kv):
     procs = [ctx.Process(target=_rank_cp, args=(folder, r, 3, port, prompt, steps, steps, q, kv)) for r in range(3)]
     for p in procs:
         p.start()
-    got = sorted((q.get(timeout=1500) for _ in procs), key=lambda x: x[0])
+    got = sorted((unpack(q.get(timeout=1500)) for _ in procs), key=lambda x: x[0])
     for p in procs:
         p.join(timeout=60)
     parts = torch.cat([g[1] for g in got], dim=1)
