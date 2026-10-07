@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Prompt cache: the next request now lets a running save finish (`DISK_FENCE_MS`, default 15 s, sets
+  `TF_GLM_DISK_FENCE_MS`); before, it cancelled the save at once, so a long prompt followed by another request was never
+  kept. 0142 logs every queued, written, declined, dropped and cancelled save and puts rank 0's counters in `/health`
+  (`disk_cache_rank0`).
+- Round profiler: 0143 flushes its reports, so `TF_GLM_MULTI_PROFILE` shows them while the server runs; it needs
+  `PARALLEL` above 1 (documented).
+- Tests: `test_cp_kv_gather_prompt[fp8]` compares with a fixed 8-bf16-step tie rule instead of one row's argmax, with
+  a negative test; new `tests/cpu/test_cp_kvg_strong.py` checks the gathered cache planes byte for byte (fp8, bf16,
+  fp4) and six rows of logits; rank results cross the multiprocessing queue as plain bytes or lists
+  (`tests/cpu/mp_wire.py`, `test_full_forward.py`, `test_cp_kv_gather.py`), fixing EOFError / FileNotFoundError
+  crashes when a rank exits before the parent reads.
+
 ## v1.0 (2026-10-04)
 
 - Full GLM-5.3 (`glm_moe_dsa`) on TensorFold v0.6.0 across three DGX Sparks: the GLM-5.3-Flash recipe's v1.4 patches
